@@ -44,6 +44,11 @@ function svgEl(tag, attrs, ...children) {
   return el;
 }
 const ICONS = {
+  key: [["circle", { cx: 8, cy: 15, r: 4 }], ["path", { d: "M11 12l9-9M16 7l3 3" }]],
+  book: [["path", { d: "M4 5a2 2 0 012-2h13v16H6a2 2 0 00-2 2z" }], ["path", { d: "M4 19V5M9 3v16" }]],
+  dots: [["circle", { cx: 12, cy: 5, r: 1 }], ["circle", { cx: 12, cy: 12, r: 1 }], ["circle", { cx: 12, cy: 19, r: 1 }]],
+  plus: [["path", { d: "M12 5v14M5 12h14" }]],
+  x: [["path", { d: "M6 6l12 12M18 6L6 18" }]],
   home: [["path", { d: "M3 11l9-8 9 8" }], ["path", { d: "M5 10v10h5v-6h4v6h5V10" }]],
   table: [["rect", { x: 3, y: 4, width: 18, height: 16, rx: 2 }], ["path", { d: "M3 10h18M3 15h18M10 4v16" }]],
   terminal: [["rect", { x: 3, y: 4, width: 18, height: 16, rx: 2 }], ["path", { d: "M7 9l3 3-3 3M13 15h4" }]],
@@ -88,14 +93,17 @@ function toast(msg, kind = "") {
   setTimeout(() => t.remove(), kind === "bad" ? 7000 : 3500);
 }
 
-function dialog(title, build, { confirmLabel = "OK", danger = false, onSubmit } = {}) {
+function dialog(title, build, { confirmLabel = "OK", danger = false, onSubmit, sheet = false } = {}) {
   return new Promise((resolve) => {
     const err = h("div", { class: "notice bad", hidden: true });
-    const form = h("form", { method: "dialog" }, h("h2", null, title), build(), err);
+    const head = sheet
+      ? h("div", { class: "sheet-head" }, h("h2", null, title), h("button", { type: "button", class: "iconbtn", "aria-label": "Close", onclick: () => dlg.close() }, icon("x", 18)))
+      : h("h2", null, title);
+    const form = h("form", { method: "dialog" }, head, sheet ? h("div", { class: "sheet-body" }, build(), err) : [build(), err]);
     const ok = h("button", { class: danger ? "danger" : "primary", type: "submit" }, confirmLabel);
     const cancel = h("button", { type: "button", onclick: () => dlg.close() }, "Cancel");
     form.append(h("div", { class: "actions" }, cancel, ok));
-    const dlg = h("dialog", null, form);
+    const dlg = h("dialog", { class: sheet ? "sheet" : "" }, form);
     let result = null;
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -177,6 +185,22 @@ function logout() {
 // ---------- shell: top bar, icon rail, section sidebar ----------
 const LOGO = () => svgEl("svg", { viewBox: "0 0 24 24", width: 22, height: 22, fill: "currentColor", "aria-hidden": "true" }, svgEl("path", { d: "M13.4 2L4 13.6h6.2L9.4 22 20 9.6h-6.6z" }));
 
+/** A "⋮" button that opens a small menu of actions next to it. `items` is [[label, handler, { danger, action }]]. */
+function rowMenu(items) {
+  return h("button", { class: "iconbtn", "aria-label": "Row actions", title: "Actions", onclick: (e) => {
+    e.stopPropagation();
+    const open = document.querySelector(".menu.row-menu");
+    closeMenus();
+    if (open && open.dataset.owner === e.currentTarget.dataset.id) return;
+    const box = e.currentTarget.getBoundingClientRect();
+    const menu = h("div", { class: "menu row-menu", role: "menu" }, items.map(([label, run, o = {}]) =>
+      h("button", { role: "menuitem", class: o.danger ? "danger-item" : "", "data-action": o.action || "", onclick: () => { closeMenus(); run(); } }, label)));
+    menu.style.position = "fixed";
+    menu.style.top = `${Math.round(box.bottom + 4)}px`;
+    menu.style.right = `${Math.round(window.innerWidth - box.right)}px`;
+    document.body.append(menu);
+  } }, icon("dots", 16));
+}
 function closeMenus() { document.querySelectorAll(".menu").forEach((m) => m.remove()); }
 document.addEventListener("click", (e) => { if (!e.target.closest(".menu, .avatar")) closeMenus(); });
 
@@ -225,7 +249,7 @@ async function connectDialog(p) {
 function pageIndex(ref) {
   const out = [["Projects", "#/projects"]];
   for (const n of NAV) if (n.id && n.id !== "database") out.push([n.label, `#/p/${ref}/${n.id}`]);
-  for (const g of DB_MENU) for (const [id, label] of g.items) out.push([`Database › ${label}`, `#/p/${ref}/database/${id}`]);
+  for (const g of DB_MENU) for (const [id, label, tabId] of g.items) if (!tabId) out.push([`Database › ${label}`, `#/p/${ref}/database/${id}`]);
   return out;
 }
 function openPalette() {
@@ -330,8 +354,9 @@ const NAV = [
   { id: "settings", label: "Project settings", icon: "settings" },
 ];
 const DB_MENU = [
-  { title: "Database management", items: [["tables", "Tables"], ["functions", "Functions"], ["triggers", "Triggers"], ["enums", "Enumerated Types"], ["extensions", "Extensions"], ["indexes", "Indexes"]] },
+  { title: "Database management", items: [["schema", "Schema Visualizer"], ["tables", "Tables"], ["functions", "Functions"], ["triggers", "Triggers"], ["enums", "Enumerated Types"], ["extensions", "Extensions"], ["indexes", "Indexes"], ["publications", "Publications"]] },
   { title: "Access control", items: [["policies", "Policies"], ["roles", "Roles"]] },
+  { title: "Configuration", items: [["settings", "Settings", "settings"]] },
   { title: "Platform", items: [["backups", "Backups"], ["migrations", "Migrations"]] },
 ];
 const OLD_TABS = { backups: "database/backups" };
@@ -345,13 +370,13 @@ async function renderProject(ref, tab, page) {
   }
   const p = S.project;
   if (!NAV.some((n) => n.id === tab)) tab = "overview";
-  if (tab === "database" && !DB_MENU.some((g) => g.items.some(([id]) => id === page))) page = "tables";
+  if (tab === "database" && !DB_MENU.some((g) => g.items.some(([id]) => id === page))) page = "schema";
   const body = h("div", { id: "tab-body", "data-page": tab === "database" ? `database/${page}` : tab }, h("p", { class: "muted" }, "Loading…"));
   const rail = h("nav", { class: "rail", "aria-label": "Project sections" }, NAV.map((n) =>
     n.divider ? h("div", { class: "divider" }) : n.grow ? h("div", { class: "grow" })
-      : h("a", { href: `#/p/${ref}/${n.id === "database" ? "database/tables" : n.id}`, class: n.id === tab ? "on" : "", "data-tab": n.id, title: n.label, "aria-label": n.label }, icon(n.icon, 19))));
+      : h("a", { href: `#/p/${ref}/${n.id === "database" ? "database/schema" : n.id}`, class: n.id === tab ? "on" : "", "data-tab": n.id, title: n.label, "aria-label": n.label }, icon(n.icon, 19))));
   const sub = tab === "database" ? h("nav", { class: "sub", "aria-label": "Database" }, h("div", { class: "title" }, "Database"),
-    DB_MENU.map((g) => [h("div", { class: "group label" }, g.title), g.items.map(([id, label]) => h("a", { href: `#/p/${ref}/database/${id}`, class: id === page ? "on" : "", "data-dbpage": id }, label))])) : null;
+    DB_MENU.map((g) => [h("div", { class: "group label" }, g.title), g.items.map(([id, label, tabId]) => h("a", { href: tabId ? `#/p/${ref}/${tabId}` : `#/p/${ref}/database/${id}`, class: !tabId && id === page ? "on" : "", "data-dbpage": id }, label))])) : null;
   mount(h("div", null, appbar(p),
     h("div", { class: `frame ${sub ? "with-sub" : ""}` }, rail, sub,
       h("main", { class: "content" },
@@ -875,14 +900,16 @@ const ROLE_NOTES = {
 
 /** A searchable list page. `cfg.query(schema)` returns SQL; `cfg.cols` describe the columns; `cfg.actions(row, reload)` returns buttons. */
 async function listPage(body, p, cfg) {
-  const state = { schema: "public", q: "" };
+  const state = { schema: "public", q: "", filters: {} };
+  const ctx = { state, schemas: ["public"] };
   let schemas = ["public"];
   if (cfg.schemas !== false) schemas = (await catalog(`select nspname from pg_namespace where nspname !~ '^pg_' and nspname <> 'information_schema' order by (nspname = 'public') desc, nspname`)).map((r) => r.nspname);
+  ctx.schemas = schemas;
   const holder = h("div", { class: "tablewrap", id: "catalog-table" });
   const note = h("p", { class: "muted pagehint" }, cfg.hint || "");
   let rows = [];
   const cellFor = (c, r) => {
-    const v = c.cell ? c.cell(r) : r[c.key];
+    const v = c.cell ? c.cell(r, load, ctx) : r[c.key];
     const missing = v === null || v === undefined;
     const text = missing ? "—" : v instanceof Node ? v : truncate(String(v), c.max || 80);
     return h("td", { class: `${c.mono ? "mono-cell" : ""} ${missing ? "null" : ""}`, title: typeof v === "string" ? v.slice(0, 300) : "" }, text);
@@ -890,27 +917,38 @@ async function listPage(body, p, cfg) {
   const draw = () => {
     clear(holder);
     const q = state.q.toLowerCase();
-    const shown = rows.filter((r) => !q || Object.values(r).some((v) => String(v ?? "").toLowerCase().includes(q)));
+    const shown = rows.filter((r) => (!q || Object.values(r).some((v) => String(v ?? "").toLowerCase().includes(q)))
+      && (cfg.filters || []).every((f) => !state.filters[f.id] || f.test(r, state.filters[f.id])));
     if (!shown.length) { holder.append(h("div", { class: "empty" }, rows.length ? "No matches." : cfg.empty)); return; }
     const head = h("tr", null, cfg.cols.map((c) => h("th", null, c.label)), cfg.actions ? h("th") : null);
     const bodyRows = shown.map((r) => {
       const tr = h("tr", { "data-row": r.name ?? "" }, cfg.cols.map((c) => cellFor(c, r)));
-      if (cfg.actions) tr.append(h("td", null, h("div", { class: "row" }, cfg.actions(r, load))));
+      if (cfg.actions) tr.append(h("td", { class: "actions-cell" }, h("div", { class: "row" }, cfg.actions(r, load, ctx))));
       return tr;
     });
     holder.append(h("table", { class: "data" }, h("thead", null, head), h("tbody", null, bodyRows)));
   };
   const load = async () => {
-    try { rows = await catalog(cfg.query(state.schema, p)); draw(); }
+    try { rows = await catalog(cfg.query(state.schema, p)); fillFilters(); draw(); }
     catch (ex) { clear(holder); holder.append(h("div", { class: "empty" }, cfg.emptyOnError ? cfg.emptyOnError : ex.message)); }
   };
+  const filterEls = (cfg.filters || []).map((f) => h("select", { class: "filter", id: `filter-${f.id}`, "aria-label": f.label, onchange: (e) => { state.filters[f.id] = e.target.value; draw(); } }, h("option", { value: "" }, f.label)));
+  const fillFilters = () => (cfg.filters || []).forEach((f, i) => {
+    const el = filterEls[i], keep = state.filters[f.id] || "";
+    while (el.options.length > 1) el.remove(1);
+    for (const v of f.values(rows)) el.append(h("option", { value: v }, v));
+    el.value = [...el.options].some((o) => o.value === keep) ? keep : "";
+    state.filters[f.id] = el.value;
+  });
   const search = h("input", { id: "catalog-search", placeholder: cfg.searchPlaceholder || "Search", "aria-label": "Search", oninput: (e) => { state.q = e.target.value; draw(); } });
   const schemaSel = cfg.schemas === false ? null : h("select", { id: "catalog-schema", "aria-label": "Schema", onchange: (e) => { state.schema = e.target.value; load(); } }, schemas.map((s) => h("option", { value: s }, `schema ${s}`)));
   clear(body);
   body.append(h("div", null,
-    h("div", { class: "page-head" }, h("h1", null, cfg.title), cfg.headAction ? cfg.headAction(load) : null),
+    h("div", { class: "page-head" }, h("h1", null, cfg.title),
+      cfg.docs ? h("a", { class: "button docs", href: cfg.docs, target: "_blank", rel: "noopener noreferrer" }, icon("book", 15), " Docs") : null,
+      cfg.headAction ? cfg.headAction(load) : null),
     cfg.hint && note,
-    h("div", { class: "toolbar" }, schemaSel, search),
+    h("div", { class: "toolbar" }, schemaSel, search, filterEls, h("span", { class: "spacer" }), cfg.toolbarAction ? cfg.toolbarAction(load, ctx) : null),
     holder));
   await load();
 }
@@ -991,22 +1029,37 @@ const DB_PAGES = {
   },
   functions: {
     title: "Database Functions", hint: "Functions stored in the database (not Edge Functions). Call them from the API with rpc, or from policies and triggers.", searchPlaceholder: "Search for a function", empty: "No functions in this schema yet.",
-    headAction: (reload) => h("button", { class: "primary", id: "new-function", onclick: () => functionDialog(null, reload) }, "Create a new function"),
-    query: (s) => `select p.proname as name, pg_get_function_identity_arguments(p.oid) as arguments, pg_get_function_result(p.oid) as return_type, l.lanname as language,
-      p.prosecdef as security_definer, pg_get_functiondef(p.oid) as definition, n.nspname as schema
+    docs: "https://www.postgresql.org/docs/current/sql-createfunction.html",
+    toolbarAction: (reload, ctx) => h("button", { class: "primary", id: "new-function", onclick: () => functionSheet(null, reload, ctx) }, icon("plus", 15), " New function"),
+    filters: [
+      { id: "return", label: "Return Type", values: (rows) => [...new Set(rows.map((r) => r.return_type).filter(Boolean))].sort(), test: (r, v) => r.return_type === v },
+      { id: "security", label: "Security", values: () => ["Definer", "Invoker"], test: (r, v) => (r.security_definer ? "Definer" : "Invoker") === v },
+    ],
+    query: (s) => `select p.proname as name, pg_get_function_identity_arguments(p.oid) as arguments, pg_get_function_arguments(p.oid) as arguments_full, pg_get_function_result(p.oid) as return_type, l.lanname as language,
+      p.prosecdef as security_definer, p.prosrc as body, p.provolatile as volatility, p.proargmodes is null as plain_args, pg_get_functiondef(p.oid) as definition, n.nspname as schema,
+      (select coalesce(json_agg(json_build_object('name', u.nm, 'type', format_type(u.t, null)) order by u.ord), '[]'::json)
+         from unnest(coalesce(p.proargnames, array_fill(''::text, array[p.pronargs::int])), string_to_array(p.proargtypes::text, ' ')::oid[]) with ordinality as u(nm, t, ord)) as arg_list
       from pg_proc p join pg_namespace n on n.oid = p.pronamespace join pg_language l on l.oid = p.prolang
       where n.nspname = ${pgLit(s)} and p.prokind = 'f' and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e') order by p.proname, p.oid`,
-    cols: [{ label: "Name", cell: (r) => h("button", { class: "linkish", title: `Edit ${r.name}`, onclick: () => document.querySelector(`tr[data-row="${CSS.escape(r.name)}"] [data-action=edit-function]`)?.click() }, r.name) },
+    cols: [{ label: "Name", cell: (r, reload, ctx) => h("button", { class: "linkish", title: `Edit ${r.name}`, "data-action": "open-function", onclick: () => functionSheet(r, reload, ctx) }, r.name) },
       { label: "Type", cell: () => "Function" },
-      { label: "Arguments", mono: true, cell: (r) => r.arguments || "–" }, { key: "return_type", label: "Return type", mono: true, max: 40 },
-      { label: "Security", cell: (r) => (r.security_definer ? h("span", { class: "warn", title: "Runs with its owner's privileges" }, "Definer") : "Invoker") }],
-    actions: (r, reload) => [
-      h("button", { class: "small", "data-action": "edit-function", onclick: () => functionDialog(r, reload) }, "Edit"),
-      h("button", { class: "small danger", "data-action": "drop-function", onclick: async () => {
+      { label: "Arguments", mono: true, max: 40, cell: (r) => r.arguments || "–" },
+      { label: "Return type", mono: true, max: 40, cell: (r) => (r.return_type === "trigger" ? h("a", { href: `#/p/${S.project.ref}/database/triggers` }, "trigger") : r.return_type || "–") },
+      { label: "Security", cell: (r) => (r.security_definer ? h("span", { title: "Runs with its owner's privileges" }, "Definer") : "Invoker") }],
+    actions: (r, reload, ctx) => [rowMenu([
+      ["Edit function", () => functionSheet(r, reload, ctx), { action: "edit-function" }],
+      ["Delete function", async () => {
         if (!(await confirmBox("Delete function", `Delete ${r.schema}.${r.name}(${r.arguments})? Anything that calls it will fail.`, { typed: r.name, confirmLabel: "Delete function" }))) return;
         try { await sqlRun(`drop function ${JSON.stringify(r.schema)}.${JSON.stringify(r.name)}(${r.arguments})`); toast("Function deleted", "ok"); reload(); } catch (ex) { toast(ex.message, "bad"); }
-      } }, "Delete"),
-    ],
+      }, { danger: true, action: "drop-function" }],
+    ])],
+  },
+  publications: {
+    schemas: false, title: "Publications", hint: "Publications choose which tables stream their changes to subscribers, such as logical replication clients.", searchPlaceholder: "Search for a publication", empty: "No publications.",
+    query: () => `select p.pubname as name, p.puballtables as all_tables, p.pubinsert as ins, p.pubupdate as upd, p.pubdelete as del, p.pubtruncate as trunc,
+      (select count(*) from pg_publication_tables t where t.pubname = p.pubname) as tables from pg_publication p order by p.pubname`,
+    cols: [{ key: "name", label: "Name" }, { label: "Insert", cell: (r) => (r.ins ? "yes" : "no") }, { label: "Update", cell: (r) => (r.upd ? "yes" : "no") }, { label: "Delete", cell: (r) => (r.del ? "yes" : "no") },
+      { label: "Truncate", cell: (r) => (r.trunc ? "yes" : "no") }, { label: "Source", cell: (r) => (r.all_tables ? "All tables" : `${r.tables} table${Number(r.tables) === 1 ? "" : "s"}`) }],
   },
 };
 
@@ -1029,8 +1082,117 @@ async function functionDialog(fn, reload) {
   if (ok) { toast(fn ? "Function saved" : "Function created", "ok"); reload(); }
 }
 
+const SIMPLE_TYPES = ["void", "text", "integer", "bigint", "boolean", "uuid", "jsonb", "json", "numeric", "timestamptz", "date", "trigger", "record", "setof record"];
+const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const TYPE_TEXT = /^[\w\s.\[\]()",]+$/;
+
+/** The right-hand "Add a new function" panel. Editing fills the same form from the catalog; unusual functions fall back to raw SQL. */
+async function functionSheet(fn, reload, ctx) {
+  if (fn && (!fn.plain_args || /\bdefault\b/i.test(fn.arguments_full || "") || !["sql", "plpgsql"].includes(fn.language) || /^table\(/i.test(fn.return_type || ""))) return functionDialog(fn, reload);
+  let list = [];
+  if (fn) { try { list = typeof fn.arg_list === "string" ? JSON.parse(fn.arg_list) : fn.arg_list || []; } catch { return functionDialog(fn, reload); } }
+  const schemaSel = h("select", { id: "fn-schema", name: "schema", disabled: !!fn }, ctx.schemas.map((x) => h("option", { value: x }, `schema ${x}`)));
+  schemaSel.value = fn ? fn.schema : ctx.state.schema;
+  const name = h("input", { id: "fn-name", name: "name", placeholder: "Name of function", autocomplete: "off", readOnly: !!fn, value: fn ? fn.name : "" });
+  const ret = h("input", { id: "fn-return", name: "ret", list: "fn-types", autocomplete: "off", value: fn ? fn.return_type : "void" });
+  const types = h("datalist", { id: "fn-types" }, SIMPLE_TYPES.map((t) => h("option", { value: t })));
+  const argBox = h("div", { class: "args", id: "fn-args" });
+  const addArg = (a = { name: "", type: "" }) => {
+    const row = h("div", { class: "arg-row", "data-arg": "1" },
+      h("input", { placeholder: "name", "aria-label": "Argument name", "data-arg-name": "1", value: a.name, autocomplete: "off" }),
+      h("input", { placeholder: "type", "aria-label": "Argument type", "data-arg-type": "1", list: "fn-types", value: a.type, autocomplete: "off" }),
+      h("button", { type: "button", class: "iconbtn", "aria-label": "Remove argument", onclick: () => row.remove() }, icon("x", 15)));
+    argBox.append(row);
+  };
+  list.forEach(addArg);
+  const lang = h("select", { id: "fn-language" }, ["plpgsql", "sql"].map((l) => h("option", { value: l }, l)));
+  lang.value = fn ? fn.language : "plpgsql";
+  const vol = h("select", { id: "fn-volatility" }, ["VOLATILE", "STABLE", "IMMUTABLE"].map((v) => h("option", { value: v }, v)));
+  vol.value = fn ? ({ v: "VOLATILE", s: "STABLE", i: "IMMUTABLE" }[fn.volatility] || "VOLATILE") : "VOLATILE";
+  const sec = h("select", { id: "fn-security" }, [["invoker", "SECURITY INVOKER"], ["definer", "SECURITY DEFINER"]].map(([v, l]) => h("option", { value: v }, l)));
+  sec.value = fn && fn.security_definer ? "definer" : "invoker";
+  const body = h("textarea", { class: "code editor", id: "fn-body", rows: 12, spellcheck: "false" }, fn ? fn.body.replace(/^\n|\n$/g, "") : "BEGIN\n  \nEND;");
+  const field = (label, el, hint) => h("div", { class: "form-row" }, h("label", { for: el.id }, label), h("div", null, el, hint ? h("p", { class: "muted hint" }, hint) : null));
+  const ok = await dialog(fn ? `Edit ${fn.name}` : "Add a new function", () => h("div", { class: "stack" },
+    field("Schema", schemaSel, "Tables made in the table editor will be in public"),
+    field("Name of function", name, "Name will also be used for the function name in postgres"),
+    field("Type", h("select", { id: "fn-type", disabled: true }, h("option", null, "Function"))),
+    field("Return type", ret, "void returns nothing; setof … returns several rows; trigger is for trigger functions"), types,
+    h("div", { class: "form-section" }, h("h3", null, "Arguments"), h("p", { class: "muted" }, "Arguments can be referenced in the function body using either names or numbers."),
+      argBox, h("button", { type: "button", id: "add-arg", onclick: () => addArg() }, icon("plus", 14), " Add a new argument")),
+    h("div", { class: "form-section" }, h("h3", null, "Definition"), h("p", { class: "muted" }, "The language below should be written in ", h("code", null, "plpgsql"), ". Change the language in the advanced settings."), body),
+    h("details", { class: "form-section", id: "fn-advanced" }, h("summary", null, "Advanced settings"),
+      h("div", { class: "stack" }, field("Language", lang), field("Behavior", vol), field("Type of security", sec,
+        "Definer runs with the owner's privileges, which bypasses row-level security. Use it carefully and check who may call it."))),
+    fn && h("p", { class: "muted" }, "Changing an argument's type creates an overload; the old one stays until you delete it.")), {
+    sheet: true, confirmLabel: fn ? "Save function" : "Create function",
+    onSubmit: async () => {
+      if (!IDENT.test(name.value)) throw new Error("Give the function a name: letters, digits and underscores, not starting with a digit.");
+      const args = [...argBox.querySelectorAll("[data-arg]")].map((row) => {
+        const n = row.querySelector("[data-arg-name]").value.trim(), t = row.querySelector("[data-arg-type]").value.trim();
+        if (n && !IDENT.test(n)) throw new Error(`"${n}" is not a valid argument name.`);
+        if (!t || !TYPE_TEXT.test(t)) throw new Error(`Argument ${n || "(unnamed)"} needs a valid type.`);
+        return `${n ? `${JSON.stringify(n)} ` : ""}${t}`;
+      });
+      const r = ret.value.trim();
+      if (!r || !TYPE_TEXT.test(r)) throw new Error("Choose a return type.");
+      let tag = "$fn$", i = 1;
+      while (body.value.includes(tag)) tag = `$fn${i++}$`;
+      const defn = sec.value === "definer" ? " security definer" : "";
+      await sqlRun(`create or replace function ${JSON.stringify(schemaSel.value)}.${JSON.stringify(name.value)}(${args.join(", ")}) returns ${r} language ${lang.value} ${vol.value.toLowerCase()}${defn} as ${tag}\n${body.value}\n${tag};`);
+      return true;
+    },
+  });
+  if (ok) { toast(fn ? "Function saved" : "Function created", "ok"); reload(); }
+}
+
+/** Every table in a schema as a card of its columns, like the schema diagram in Supabase Studio (cards, no drawn relationship lines). */
+async function schemaVisualizer(body, p) {
+  const schemas = (await catalog(`select nspname from pg_namespace where nspname !~ '^pg_' and nspname <> 'information_schema' order by (nspname = 'public') desc, nspname`)).map((r) => r.nspname);
+  let schema = "public", tables = [], find = "", byLinks = false;
+  const canvas = h("div", { class: "schema-canvas", id: "schema-canvas" });
+  const load = async () => {
+    const rows = await catalog(`select c.relname as tbl, a.attname as col, format_type(a.atttypid, a.atttypmod) as type, a.attnotnull as notnull, a.attidentity <> '' as ident,
+      exists(select 1 from pg_constraint k where k.conrelid = c.oid and k.contype = 'p' and a.attnum = any(k.conkey)) as pk,
+      exists(select 1 from pg_constraint k where k.conrelid = c.oid and k.contype = 'u' and k.conkey = array[a.attnum]) as uniq,
+      (select cf.relname || '.' || af.attname from pg_constraint k join pg_class cf on cf.oid = k.confrelid join pg_attribute af on af.attrelid = k.confrelid and af.attnum = k.confkey[1]
+         where k.conrelid = c.oid and k.contype = 'f' and k.conkey[1] = a.attnum limit 1) as fk
+      from pg_class c join pg_namespace n on n.oid = c.relnamespace join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+      where n.nspname = ${pgLit(schema)} and c.relkind in ('r', 'p') order by c.relname, a.attnum`);
+    const map = new Map();
+    for (const r of rows) { if (!map.has(r.tbl)) map.set(r.tbl, []); map.get(r.tbl).push(r); }
+    tables = [...map].map(([name, cols]) => ({ name, cols, links: cols.filter((c) => c.fk).length }));
+    draw();
+  };
+  const marker = (c) => (c.pk ? h("span", { class: "mk pk", title: "Primary key" }, icon("key", 12)) : c.ident ? h("span", { class: "mk", title: "Identity" }, "#") : c.uniq ? h("span", { class: "mk", title: "Unique" }, "≡") : h("span", { class: `mk ${c.notnull ? "nn" : "nl"}`, title: c.notnull ? "Non-nullable" : "Nullable" }, c.notnull ? "◆" : "◇"));
+  const draw = () => {
+    clear(canvas);
+    const q = find.toLowerCase();
+    let list = tables.filter((t) => !q || t.name.toLowerCase().includes(q));
+    if (byLinks) list = [...list].sort((a, b) => b.links - a.links || a.name.localeCompare(b.name));
+    if (!list.length) { canvas.append(h("div", { class: "empty" }, tables.length ? "No matching tables." : "No tables in this schema.")); return; }
+    for (const t of list) canvas.append(h("div", { class: "schema-table", "data-table": t.name },
+      h("div", { class: "st-head" }, icon("table", 14), h("strong", null, t.name)),
+      t.cols.map((c) => h("div", { class: "st-col", "data-col": c.col, title: c.fk ? `References ${c.fk}` : "" }, marker(c), h("span", { class: "st-name" }, c.col), c.fk ? h("span", { class: "st-fk" }, `→ ${c.fk}`) : null, h("span", { class: "st-type" }, c.type)))));
+  };
+  const ddl = () => tables.map((t) => `create table ${JSON.stringify(schema)}.${JSON.stringify(t.name)} (\n${[...t.cols.map((c) => `  ${JSON.stringify(c.col)} ${c.type}${c.notnull ? " not null" : ""}`), ...(t.cols.some((c) => c.pk) ? [`  primary key (${t.cols.filter((c) => c.pk).map((c) => JSON.stringify(c.col)).join(", ")})`] : [])].join(",\n")}\n);`).join("\n\n");
+  const schemaSel = h("select", { id: "schema-schema", "aria-label": "Schema", onchange: (e) => { schema = e.target.value; load(); } }, schemas.map((x) => h("option", { value: x }, `schema ${x}`)));
+  const legend = [["key", "Primary key"], ["#", "Identity"], ["≡", "Unique"], ["◇", "Nullable"], ["◆", "Non-Nullable"]];
+  clear(body);
+  body.append(h("div", { class: "schema-page" },
+    h("div", { class: "toolbar" }, schemaSel,
+      h("input", { id: "schema-find", placeholder: "Find table...", "aria-label": "Find table", oninput: (e) => { find = e.target.value; draw(); } }),
+      h("span", { class: "spacer" }),
+      h("button", { id: "copy-sql", onclick: async () => { try { await navigator.clipboard.writeText(ddl()); toast("SQL copied", "ok"); } catch { openInSql(ddl()); } } }, "Copy as SQL"),
+      h("button", { id: "auto-layout", onclick: () => { byLinks = !byLinks; draw(); toast(byLinks ? "Related tables first" : "Alphabetical", "ok"); } }, "Auto layout")),
+    canvas,
+    h("div", { class: "legend" }, legend.map(([m, t]) => h("span", null, m === "key" ? icon("key", 13) : h("b", null, m), " ", t)))));
+  await load();
+}
+
 async function dbPage(body, p, page) {
   if (page === "backups") { await backups(body, p); return; }
+  if (page === "schema") { await schemaVisualizer(body, p); return; }
   await listPage(body, p, DB_PAGES[page]);
 }
 

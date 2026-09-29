@@ -68,7 +68,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     const subPage = id === "backups" ? "backups" : sub;
     await page.click(`nav.rail a[data-tab=${section}]`);
     if (section === "database" && subPage) await page.click(`nav.sub a[data-dbpage=${subPage}]`);
-    const want = section === "database" ? `database/${subPage ?? "tables"}` : section;
+    const want = section === "database" ? `database/${subPage ?? "schema"}` : section;
     await page.waitForFunction((w) => { const b = document.querySelector("#tab-body"); return b?.getAttribute("data-page") === w && !b.textContent?.startsWith("Loading"); }, want);
   };
   const rest = async (path: string, init: any = {}, key = anon) =>
@@ -233,8 +233,16 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
 
   step("explores the database section: tables, policies, roles, extensions, indexes and more", async () => {
     await tab("database");
+    await page.waitForSelector(".schema-table[data-table=notes]");
+    assert.match((await page.textContent(".schema-table[data-table=notes]"))!, /id\s*bigint[\s\S]*body\s*text[\s\S]*pinned\s*boolean/);
+    assert.match((await page.textContent(".legend"))!, /Primary key[\s\S]*Identity[\s\S]*Unique[\s\S]*Nullable[\s\S]*Non-Nullable/);
+    await page.fill("#schema-find", "zzz");
+    assert.match((await page.textContent("#schema-canvas"))!, /No matching tables/);
+    await page.fill("#schema-find", "");
+    await shot("06d-db-schema");
+    await tab("database", "tables");
     await page.waitForSelector("#catalog-table tr[data-row=notes]");
-    assert.match((await page.textContent("nav.sub"))!, /Database management[\s\S]*Tables[\s\S]*Functions[\s\S]*Triggers[\s\S]*Enumerated Types[\s\S]*Extensions[\s\S]*Indexes[\s\S]*Access control[\s\S]*Policies[\s\S]*Roles[\s\S]*Platform[\s\S]*Backups/);
+    assert.match((await page.textContent("nav.sub"))!, /Database management[\s\S]*Schema Visualizer[\s\S]*Tables[\s\S]*Functions[\s\S]*Triggers[\s\S]*Enumerated Types[\s\S]*Extensions[\s\S]*Indexes[\s\S]*Publications[\s\S]*Access control[\s\S]*Policies[\s\S]*Roles[\s\S]*Configuration[\s\S]*Settings[\s\S]*Platform[\s\S]*Backups/);
     assert.match((await page.textContent("tr[data-row=notes]"))!, /table\s*3\s*on/);
     await shot("06d-db-tables");
     await page.locator("tr[data-row=notes] button:has-text('Columns')").click();
@@ -283,13 +291,34 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
   step("creates, edits, calls and deletes a database function", async () => {
     await tab("database", "functions");
     await page.waitForSelector("#catalog-table .empty");
+    assert.match((await page.textContent(".toolbar"))!, /Return Type[\s\S]*Security[\s\S]*New function/);
+    assert.equal(await page.locator("a.docs").count(), 1);
     await page.click("#new-function");
-    assert.match(await page.inputValue("#function-sql"), /hello_world/);
-    await page.fill("#function-sql", "create or replace function public.add_numbers(a int, b int) returns int language sql as $$ select a + b; $$;\ngrant execute on function public.add_numbers(int, int) to anon;");
+    await page.waitForSelector("dialog.sheet");
+    assert.match((await page.textContent("dialog.sheet"))!, /Add a new function[\s\S]*Schema[\s\S]*Name of function[\s\S]*Return type[\s\S]*Arguments[\s\S]*Definition[\s\S]*Advanced settings/);
+    await shot("06e-db-function-sheet");
+
+    // A bad name is refused inside the panel, which stays open.
+    await page.fill("#fn-name", "1 bad name");
+    await page.click("dialog button[type=submit]");
+    await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+    assert.match((await page.textContent("dialog .notice.bad"))!, /name/);
+
+    await page.fill("#fn-name", "add_numbers");
+    await page.fill("#fn-return", "integer");
+    await page.click("#add-arg");
+    await page.click("#add-arg");
+    const names = page.locator("[data-arg-name]"), types = page.locator("[data-arg-type]");
+    await names.nth(0).fill("a"); await types.nth(0).fill("integer");
+    await names.nth(1).fill("b"); await types.nth(1).fill("integer");
+    await page.click("#fn-advanced summary");
+    await page.selectOption("#fn-language", "sql");
+    await page.fill("#fn-body", "select a + b;");
     await page.click("dialog button[type=submit]");
     await toast("Function created");
     await page.waitForSelector("tr[data-row=add_numbers]");
     const row = (await page.textContent("tr[data-row=add_numbers]"))!;
+    assert.match(row, /Function/);
     assert.match(row, /a integer, b integer/);
     assert.match(row, /integer/);
     assert.match(row, /Invoker/);
@@ -297,32 +326,50 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     const call = async (a: number, b: number) => (await (await rest("/rest/v1/rpc/add_numbers", { method: "POST", body: JSON.stringify({ a, b }) })).json());
     assert.equal(await call(2, 3), 5, "callable through the API");
 
-    // Editing applies create or replace, so grants survive.
-    await page.locator("tr[data-row=add_numbers] [data-action=edit-function]").click();
-    assert.match(await page.inputValue("#function-sql"), /select a \+ b/);
-    await page.fill("#function-sql", (await page.inputValue("#function-sql")).replace("select a + b", "select a * b"));
+    // The name opens the same form, filled from the catalog. Saving uses create or replace.
+    await page.locator("tr[data-row=add_numbers] .linkish").click();
+    await page.waitForSelector("dialog.sheet");
+    assert.equal(await page.inputValue("#fn-name"), "add_numbers");
+    assert.equal(await page.inputValue("#fn-return"), "integer");
+    assert.equal(await page.locator("[data-arg]").count(), 2);
+    assert.equal(await page.inputValue("[data-arg-name] >> nth=1"), "b");
+    assert.match(await page.inputValue("#fn-body"), /select a \+ b/);
+    await page.fill("#fn-body", "select a * b;");
     await page.click("dialog button[type=submit]");
     await toast("Function saved");
     assert.equal(await call(2, 3), 6);
 
-    // A mistake is reported in the dialog, which stays open, and changes nothing.
-    await page.locator("tr[data-row=add_numbers] [data-action=edit-function]").click();
-    await page.fill("#function-sql", "create or replace function public.add_numbers(a int, b int) returns int language sql as $$ select nope; $$;");
+    // A mistake is reported in the panel, which stays open, and changes nothing.
+    await page.locator("tr[data-row=add_numbers] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=edit-function]");
+    await page.fill("#fn-body", "select nope;");
     await page.click("dialog button[type=submit]");
     await page.locator("dialog .notice.bad:not([hidden])").waitFor();
     assert.match((await page.textContent("dialog .notice.bad"))!, /nope/);
     await page.click("dialog button:has-text('Cancel')");
     assert.equal(await call(2, 3), 6);
 
-    // Security definer is called out.
+    // Security definer is called out, and the filters find it.
     await page.click("#new-function");
-    await page.fill("#function-sql", "create or replace function public.secret_sum() returns int language sql security definer as $$ select 42; $$;");
+    await page.fill("#fn-name", "secret_sum");
+    await page.fill("#fn-return", "integer");
+    await page.click("#fn-advanced summary");
+    await page.selectOption("#fn-language", "sql");
+    await page.selectOption("#fn-security", "definer");
+    await page.fill("#fn-body", "select 42;");
     await page.click("dialog button[type=submit]");
     await toast("Function created");
     assert.match((await page.textContent("tr[data-row=secret_sum]"))!, /Definer/);
+    await page.selectOption("#filter-security", "Definer");
+    assert.equal(await page.locator("#catalog-table tbody tr").count(), 1);
+    await page.selectOption("#filter-security", "");
+    await page.selectOption("#filter-return", "integer");
+    assert.equal(await page.locator("#catalog-table tbody tr").count(), 2);
+    await page.selectOption("#filter-return", "");
 
     // Deleting needs the name typed.
-    await page.locator("tr[data-row=add_numbers] [data-action=drop-function]").click();
+    await page.locator("tr[data-row=add_numbers] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=drop-function]");
     await page.click("dialog button[type=submit]");
     await page.locator("dialog .notice.bad:not([hidden])").waitFor();
     await page.fill("dialog input[name=typed]", "add_numbers");
