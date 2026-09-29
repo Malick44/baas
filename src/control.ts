@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import pg from "pg";
+import { checkSyntax } from "./sandbox.js";
 import { dbNameOf, dropProject, newRef, provisionProject, setProjectAccess, type Project } from "./provision.js";
 import type { Vault } from "./vault.js";
 
@@ -218,6 +219,52 @@ export class ControlPlane {
     const r = await this.pool.query(`UPDATE project_settings SET settings = settings || $2::jsonb WHERE ref = $1 RETURNING settings`, [ref, JSON.stringify(patch)]);
     await this.audit(p.tokenId, p.orgId, "project.settings", ref, { keys: Object.keys(patch) });
     return r.rows[0].settings;
+  }
+
+  // ---- functions ----
+
+  async deployFunction(p: Principal, ref: string, name: string, source: string, verifyJwt = true) {
+    ControlPlane.require(p, "admin");
+    await this.getProject(p, ref);
+    if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(name)) throw new HttpError(400, "function name must be 1-40 chars of a-z, 0-9, -");
+    if (typeof source !== "string" || !source.trim() || Buffer.byteLength(source) > 256 * 1024) throw new HttpError(400, "source must be a non-empty string up to 256 KB");
+    const syntax = await checkSyntax(source);
+    if (syntax) throw new HttpError(400, `syntax error: ${syntax}`);
+    const n = Number((await this.pool.query(`SELECT count(*)::int AS n FROM functions WHERE ref = $1 AND name <> $2`, [ref, name])).rows[0].n);
+    if (n >= 50) throw new HttpError(409, "function limit reached (50 per project)");
+    const r = await this.pool.query(
+      `INSERT INTO functions (ref, name, source, verify_jwt) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (ref, name) DO UPDATE SET source = EXCLUDED.source, verify_jwt = EXCLUDED.verify_jwt, version = functions.version + 1, updated_at = now()
+       RETURNING name, version, verify_jwt, updated_at`,
+      [ref, name, source, verifyJwt],
+    );
+    await this.audit(p.tokenId, p.orgId, "function.deploy", ref, { name, version: r.rows[0].version });
+    return r.rows[0];
+  }
+
+  async listFunctions(p: Principal, ref: string) {
+    await this.getProject(p, ref);
+    return (await this.pool.query(`SELECT name, version, verify_jwt, updated_at, length(source) AS size FROM functions WHERE ref = $1 ORDER BY name`, [ref])).rows;
+  }
+
+  async getFunction(p: Principal, ref: string, name: string) {
+    await this.getProject(p, ref);
+    const r = (await this.pool.query(`SELECT name, version, verify_jwt, updated_at, source FROM functions WHERE ref = $1 AND name = $2`, [ref, name])).rows[0];
+    if (!r) throw new HttpError(404, "function not found");
+    return r;
+  }
+
+  async deleteFunction(p: Principal, ref: string, name: string) {
+    ControlPlane.require(p, "admin");
+    await this.getProject(p, ref);
+    const r = await this.pool.query(`DELETE FROM functions WHERE ref = $1 AND name = $2`, [ref, name]);
+    if (!r.rowCount) throw new HttpError(404, "function not found");
+    await this.audit(p.tokenId, p.orgId, "function.delete", ref, { name });
+  }
+
+  /** For the gateway: the deployed source, no principal involved. */
+  async functionSource(ref: string, name: string) {
+    return (await this.pool.query<{ source: string; version: number; verify_jwt: boolean }>(`SELECT source, version, verify_jwt FROM functions WHERE ref = $1 AND name = $2`, [ref, name])).rows[0] ?? null;
   }
 
   async auditLog(p: Principal, limit = 50) {

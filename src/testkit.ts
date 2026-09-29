@@ -29,8 +29,10 @@ export async function makeHarness(
 ) {
   const ctlDb = `baas_ctl_${randomBytes(4).toString("hex")}`;
   const admin = new pg.Pool({ connectionString: adminUrl });
+  admin.on("error", () => {});
   await admin.query(`CREATE DATABASE "${ctlDb}"`);
   const pool = new pg.Pool({ connectionString: urlFor(adminUrl, ctlDb) });
+  pool.on("error", () => {});
   await migrate(pool);
   const control = new ControlPlane(pool, adminUrl, new Vault("ab".repeat(32)));
   const dir = new Directory(control, 0);
@@ -72,6 +74,7 @@ export async function makeHarness(
 
   async function sql<T = any>(p: TestProject, text: string, params?: unknown[]): Promise<T[]> {
     const c = new pg.Client({ connectionString: p.dbUrl });
+    c.on("error", () => {});
     await c.connect();
     try {
       return (await c.query(text, params)).rows as T[];
@@ -80,14 +83,20 @@ export async function makeHarness(
     }
   }
 
+  /** Start a real HTTP listener (needed for WebSockets). Returns the port. */
+  async function listen(): Promise<number> {
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    return (app.server.address() as { port: number }).port;
+  }
+
   async function close() {
+    await app.close(); // stops realtime feeds before their databases are dropped
     await pm.end();
     for (const ref of created) await dropProject(adminUrl, ref).catch(() => {});
     await pool.end();
     await admin.query(`DROP DATABASE IF EXISTS "${ctlDb}" WITH (FORCE)`);
     await admin.end();
-    await app.close();
   }
 
-  return { app, control, pm, dir, owner, project, call, sql, close, adminUrl, pool };
+  return { app, control, pm, dir, owner, project, call, sql, listen, close, adminUrl, pool };
 }

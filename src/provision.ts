@@ -132,6 +132,7 @@ export function urlFor(adminUrl: string, dbName: string, creds?: { user: string;
 
 async function withClient<T>(url: string, fn: (c: pg.Client) => Promise<T>): Promise<T> {
   const c = new pg.Client({ connectionString: url });
+  c.on("error", () => {}); // a killed backend must not become an uncaught exception
   await c.connect();
   try {
     return await fn(c);

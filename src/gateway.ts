@@ -23,11 +23,20 @@ export interface GatewayHooks {
 }
 
 /** Modules mounted under /<service>/v1. Each is handed the resolved project and caller. */
+export type Helpers = {
+  authenticate(req: FastifyRequest, o?: { anonymous?: boolean }): Promise<ProjectCtx>;
+  withCtx(req: FastifyRequest, reply: FastifyReply, fn: (ctx: ProjectCtx) => Promise<unknown>, o?: { anonymous?: boolean }): Promise<unknown>;
+};
+
+export interface Mountable {
+  mount(app: FastifyInstance, h: Helpers): void;
+}
+
 export interface GatewayServices {
   auth: AuthService;
-  storage?: import("./storage.js").StorageRoutes;
-  functions?: import("./functions.js").FunctionRoutes;
-  realtime?: import("./realtime.js").RealtimeHub;
+  storage?: Mountable;
+  functions?: Mountable;
+  realtime?: Mountable;
 }
 
 export type GatewayOptions = { domain: string; hooks?: GatewayHooks };
@@ -83,8 +92,9 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
     (req as unknown as { t0: number }).t0 = Date.now();
   });
 
-  app.addHook("onSend", async (req, _reply, payload) => {
-    (req as unknown as { bytes: number }).bytes = typeof payload === "string" || Buffer.isBuffer(payload) ? Buffer.byteLength(payload) : 0;
+  app.addHook("onSend", async (req, reply, payload) => {
+    (req as unknown as { bytes: number }).bytes =
+      typeof payload === "string" || Buffer.isBuffer(payload) ? Buffer.byteLength(payload) : Number(reply.getHeader("content-length") ?? 0);
     return payload;
   });
 
@@ -94,6 +104,8 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
   });
 
   app.get("/healthz", async () => ({ ok: true }));
+  // Lets non-HTTP handlers (WebSocket upgrades) resolve the project the same way.
+  app.decorate("refFromHost", (h?: string) => refFromHost(h, opts.domain));
 
   /** Resolve the project and who is calling. Throws 404/503 for the project and 401 for bad credentials. */
   async function authenticate(req: FastifyRequest, opts2: { anonymous?: boolean } = {}): Promise<ProjectCtx> {
@@ -110,8 +122,10 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
     } else if (apikey) {
       claims = verifyJwt(apikey, secret);
       if (!claims) throw new HttpError(401, "invalid API key");
-    } else if (!opts2.anonymous) throw new HttpError(401, "No API key found in request");
-    if (!claims) throw new HttpError(401, "No API key found in request");
+    } else if (opts2.anonymous) {
+      // Public routes (public buckets, signed URLs) work without credentials; they never act as a database role.
+      claims = { role: "anon", exp: Math.floor(Date.now() / 1000) + 60 };
+    } else throw new HttpError(401, "No API key found in request");
     if (!API_ROLES.has(claims.role)) throw new HttpError(401, "unsupported role in JWT");
     if (claims.role === "authenticated" && (typeof claims.sub !== "string" || !/^[0-9a-f-]{36}$/.test(claims.sub))) throw new HttpError(401, "user JWT is missing sub");
     return { ref, project, who: { role: claims.role as ApiRole, claims } };
@@ -187,9 +201,10 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
   });
 
   // ---- optional services ----
-  services.storage?.mount(app, { authenticate, withCtx });
-  services.functions?.mount(app, { authenticate, withCtx });
-  services.realtime?.attach(app, { authenticate });
+  const helpers: Helpers = { authenticate, withCtx };
+  services.storage?.mount(app, helpers);
+  services.functions?.mount(app, helpers);
+  services.realtime?.mount(app, helpers);
 
   return app;
 }

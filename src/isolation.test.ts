@@ -12,6 +12,7 @@ async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   role?: string,
 ): Promise<T[]> {
   const c = new pg.Client({ connectionString: url });
+  c.on("error", () => {});
   await c.connect();
   try {
     if (role) await c.query(`SET ROLE ${role}`);
