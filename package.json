@@ -12,6 +12,7 @@
     "e2e": "node --import tsx --test --test-timeout=300000 e2e/dashboard.e2e.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.129.0",
     "fastify": "^5.12.5",
     "pg": "^8.13.0",
     "ws": "^8.22.0"

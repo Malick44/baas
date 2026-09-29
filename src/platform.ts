@@ -2,6 +2,8 @@ import { fileURLToPath } from "node:url";
 import type { FastifyInstance } from "fastify";
 import pg from "pg";
 import { ProjectAdmin } from "./admin-sql.js";
+import { AiAssistant } from "./ai/assistant.js";
+import { AnthropicLlm, type LlmClient } from "./ai/llm.js";
 import { buildApi } from "./api.js";
 import { AuthService } from "./authsvc.js";
 import { BackupService } from "./backup.js";
@@ -35,6 +37,15 @@ export type PlatformConfig = {
   realtimeCheckMs?: number;
   /** Server-side cap on any single data-plane query (default 20 s). Users cannot raise it with SET statement_timeout. */
   queryTimeoutMs?: number;
+  /** Omit to leave the AI assistant unavailable. Give `llm` to supply your own model client (tests do), or `model` to use Anthropic. */
+  ai?: {
+    llm?: LlmClient;
+    model?: string;
+    effort?: "low" | "medium" | "high" | "xhigh" | "max";
+    serverFallbacks?: boolean;
+    queryTimeoutMs?: number;
+    totalTimeoutMs?: number;
+  };
 };
 
 export const defaultDashboardDir = fileURLToPath(new URL("../dashboard", import.meta.url));
@@ -65,10 +76,12 @@ export async function createPlatform(cfg: PlatformConfig) {
   const realtime = new RealtimeHub(pm, cfg.pgAdminUrl, { checkMs: cfg.realtimeCheckMs });
   const backups = new BackupService(control, { dir: cfg.backupDir, pgBinDir: cfg.pgBinDir });
   const admin = new ProjectAdmin(pm);
+  const llm = cfg.ai?.llm ?? (cfg.ai?.model ? new AnthropicLlm({ model: cfg.ai.model, effort: cfg.ai.effort, serverFallbacks: cfg.ai.serverFallbacks }) : undefined);
+  const ai = new AiAssistant(control, pm, llm, { queryTimeoutMs: cfg.ai?.queryTimeoutMs, totalTimeoutMs: cfg.ai?.totalTimeoutMs });
 
   const gateway: FastifyInstance = buildGateway(pm, { auth: new AuthService(pm), storage, functions, realtime }, { domain: cfg.gatewayDomain, hooks: usage.hooks() });
   const api: FastifyInstance = buildApi(control, cfg.bootstrapToken, {
-    admin, usage, backups, functions,
+    admin, usage, backups, functions, ai,
     gateway: { domain: cfg.gatewayDomain, scheme: cfg.publicScheme, port: cfg.publicPort },
     dashboardDir: cfg.dashboardDir ?? defaultDashboardDir,
   });
@@ -102,7 +115,7 @@ export async function createPlatform(cfg: PlatformConfig) {
   }
 
   return {
-    cfg, pool, control, pm, dir, storage, usage, functions, realtime, backups, admin, gateway, api, migrations, housekeep,
+    cfg, pool, control, pm, dir, storage, usage, functions, realtime, backups, admin, ai, gateway, api, migrations, housekeep,
 
     start(intervalMs = 10 * 60_000) {
       usage.start();

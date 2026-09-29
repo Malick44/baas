@@ -17,6 +17,7 @@ Self-hosted, multi-project Supabase-style platform. All six phases of the origin
 | MinIO for storage | Files on a volume, keyed by object id | Simpler; an S3 backend can sit behind `StorageService` later. Object names never touch the filesystem |
 | Deno edge functions | Node child process under the permission model | No Deno dependency. Network egress is **not** restricted (Node 22 limitation) |
 | WAL-based Realtime | Trigger → `realtime.changes` + `NOTIFY`, one `LISTEN` per project | Payload-size safe; lets each event be re-checked under the subscriber's role |
+| — | **Ask AI** (added after the plan): LLM tool loop with a database-enforced read-only reader role and human-approved proposals | Requested feature; see README for the safety model |
 | Supavisor pooling | One small `pg.Pool` per project, LRU-evicted | Enough for one node |
 | PITR | Not built | Logical backups only; documented |
 
@@ -49,6 +50,10 @@ Housekeeping: reconcile stuck provisioning, purge deleted (+files, backups), idl
 ## Things the tests found (kept as regression tests)
 
 Concurrent provisioning race on shared roles; realtime handled `access_token` and `subscribe` out of order; SQL-editor users could not create schemas or storage policies; new tables were writable by `anon` (now secure by default); object names were percent-decoded twice (500 on `100%.txt`); duplicate `Host` headers were silently accepted; password hashing could starve other projects; and in the dashboard, integer-like object keys reordered the column-default menu, two `pattern` attributes were invalid regexes, and a long key overflowed its card.
+
+## Ask AI design notes
+
+`src/ai/`: `llm.ts` (a small model interface plus the Anthropic adapter, so tests can script the model), `setup.ts` (the `baas_ai_reader` role: SELECT on `public` only, granted per project on opt-in), `risk.ts` (statement splitter and SQL-derived risk labels), `assistant.ts` (schema summary, `run_query` / `propose_change` tools, bounded loop, quotas). The trust boundary is deliberately not the model: reads are constrained by Postgres (read-only transaction, extended protocol, restricted role, server watchdog), writes are never executed by the assistant, and the person running a proposal sees the SQL and a label derived from it. Assistant turns, including thinking blocks, are sent back unchanged so history stays append-only.
 
 ## Open work
 

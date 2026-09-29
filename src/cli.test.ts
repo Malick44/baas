@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { runCli } from "./cli.js";
+import { Scripted, propose, query, text } from "./ai-testkit.js";
 import { makePlatform, PG_BIN } from "./platform-testkit.js";
 
 const ADMIN = process.env.BAAS_TEST_PG_URL;
@@ -15,6 +16,7 @@ describe("cli", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
   let cwd: string;
   let cfg: string;
 
+  const fake = new Scripted();
   const run = async (...argv: string[]) => {
     const out: string[] = [];
     const err: string[] = [];
@@ -23,7 +25,7 @@ describe("cli", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
   };
 
   before(async () => {
-    t = await makePlatform(ADMIN!);
+    t = await makePlatform(ADMIN!, { ai: { llm: fake } });
     const ports = await t.platform.listen({ api: 0, gateway: 0, host: "127.0.0.1" });
     apiUrl = `http://127.0.0.1:${ports.api}`;
     owner = await t.org();
@@ -115,6 +117,26 @@ describe("cli", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     await writeFile(join(cwd, "broken.mjs"), "export default (");
     assert.match((await run("functions", "deploy", "broken", "broken.mjs")).err, /syntax error/);
     assert.match((await run("functions", "delete", "hello")).out, /Deleted hello/);
+  });
+
+  it("asks the AI assistant and shows proposals without running them", async () => {
+    assert.match((await run("ai", "status")).out, /off/);
+    assert.match((await run("ask", "how", "many", "people?")).err, /not enabled/);
+    const en = await run("ai", "enable");
+    assert.match(en.out, /enabled\.\nWhen you ask a question.*sent to Anthropic/);
+    fake.script([query("select count(*) as n from public.people", "count people")], [text("There are 0 people.")]);
+    const a = await run("ask", "how", "many", "people?");
+    assert.equal(a.code, 0);
+    assert.match(a.out, /^There are 0 people\./);
+    assert.match(a.out, /ran \(read-only\): select count\(\*\) as n from public.people/);
+    assert.deepEqual(fake.requests[0]!.messages, [{ role: "user", content: "how many people?" }]);
+    fake.script([propose("DELETE FROM public.people", "Removes everyone.")], [text("Review this.")]);
+    const d = await run("ask", "remove everyone");
+    assert.match(d.out, /Proposed change — NOT run\. DESTRUCTIVE: deletes EVERY row \(no WHERE\)/);
+    assert.match(d.out, /DELETE FROM public.people\nReview it/);
+    assert.match((await run("ai", "status")).out, /on \(scripted-model\), 2\/20/);
+    assert.match((await run("ai", "disable")).out, /disabled/);
+    assert.equal((await run("ask")).code, 1);
   });
 
   it("shows usage", async () => {

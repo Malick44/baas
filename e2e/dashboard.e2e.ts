@@ -7,7 +7,30 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { Agent, fetch as ufetch } from "undici";
+import { text, use } from "../src/ai-testkit.js";
+import type { LlmClient, LlmRequest, LlmResponse } from "../src/ai/llm.js";
 import { makePlatform } from "../src/platform-testkit.js";
+
+/** A tiny rule-based stand-in for the model, so the dashboard's AI tab can be driven end to end. */
+class RuleLlm implements LlmClient {
+  model = "e2e-model";
+  async complete(req: LlmRequest): Promise<LlmResponse> {
+    const last = req.messages.at(-1)!.content;
+    let content: Array<Record<string, any>>;
+    if (typeof last === "string") {
+      const q = last.toLowerCase();
+      if (q.includes("how many notes")) content = [use("run_query", { sql: "select count(*) as n from public.notes", purpose: "Count the notes" })];
+      else if (q.includes("add a note")) content = [use("propose_change", { sql: "INSERT INTO public.notes (body) VALUES ('added by AI')", explanation: "Adds one note." })];
+      else if (q.includes("delete every note")) content = [use("propose_change", { sql: "DELETE FROM public.notes", explanation: "Just tidying up, completely safe." })];
+      else if (q.includes("remove the ai note")) content = [use("propose_change", { sql: "DELETE FROM public.notes WHERE body = 'added by AI'", explanation: "Removes the note the assistant added." })];
+      else content = [text("I don't know how to answer that.")];
+    } else {
+      const r = JSON.parse((last as any[])[0].content);
+      content = [text(r.status ? "I prepared a change for you to review." : `The notes table has ${r.rows[0][0]} row(s).`)];
+    }
+    return { content, stopReason: content.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn", model: this.model, usage: { inputTokens: 50, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+  }
+}
 
 const ADMIN = process.env.BAAS_TEST_PG_URL;
 const CHROME = process.env.CHROMIUM_PATH ?? "/opt/pw-browsers/chromium-1194/chrome-linux/chrome";
@@ -63,7 +86,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
   before(async () => {
     await mkdir(SHOTS, { recursive: true });
     [apiPort, gwPort] = [await freePort(), await freePort()];
-    t = await makePlatform(ADMIN!, { publicPort: gwPort });
+    t = await makePlatform(ADMIN!, { publicPort: gwPort, ai: { llm: new RuleLlm() } });
     await t.platform.listen({ api: apiPort, gateway: gwPort, host: "127.0.0.1" });
     owner = await t.org("e2e-org");
     browser = await chromium.launch({ executablePath: CHROME, args: ["--no-sandbox"] });
@@ -190,6 +213,84 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     // Snippet menu fills the editor.
     await page.selectOption("select[aria-label=Snippets]", "Owner-only policy");
     assert.match(await page.inputValue("#sql-input"), /auth\.uid\(\)/);
+  });
+
+  step("asks the AI assistant in plain language; it answers, and can only propose changes", async () => {
+    const notes = async () => (await (await rest("/rest/v1/notes?select=body&order=id", {}, svc)).json()).map((r: any) => r.body);
+    const svc = (await t.api("GET", `/v1/projects/${ref}/api-keys`, { token: owner })).json.service_role;
+    const ask = async (q: string) => {
+      await page.fill("#ai-input", q);
+      await page.click("#ai-send");
+      await page.waitForFunction(() => !document.querySelector("[data-pending]") && !(document.querySelector("#ai-send") as HTMLButtonElement).disabled);
+    };
+    await tab("ai");
+    await page.waitForSelector("#ai-off");
+    assert.match((await page.textContent("#ai-notice"))!, /sent to Anthropic/);
+    await shot("06b-ai-off");
+    await page.click("#ai-enable");
+    assert.match((await page.textContent("dialog"))!, /sent to Anthropic/);
+    await page.click("dialog button[type=submit]");
+    await toast("AI assistant enabled");
+    await page.waitForSelector("#ai-input");
+
+    // A question is answered from a query the person can inspect.
+    await ask("How many notes are there?");
+    assert.match((await page.textContent("[data-answer]"))!, /The notes table has 1 row\(s\)\./);
+    await page.click("details.step summary");
+    assert.match((await page.textContent("details.step pre.sql"))!, /select count\(\*\) as n from public\.notes/);
+    assert.match((await page.textContent("details.step table"))!, /n\s*1/);
+    assert.match((await page.textContent("#ai-quota"))!, /1 of 20 questions used today/);
+    await shot("06b-ai-answer");
+
+    // A change is only proposed. Nothing happens until a person runs it.
+    await ask("Please add a note");
+    await page.waitForSelector("[data-proposal]");
+    assert.match((await page.textContent("[data-proposal]"))!, /not run yet/);
+    assert.equal(await page.locator("[data-proposal] [data-risk]").first().textContent(), "adds rows");
+    assert.deepEqual(await notes(), ["edited note"], "a proposal changes nothing");
+    await page.click("[data-proposal] [data-action=run-proposal]");
+    assert.match((await page.textContent("dialog"))!, /written by an AI model/);
+    await page.click("dialog button[type=submit]");
+    await toast("Change applied");
+    assert.deepEqual(await notes(), ["edited note", "added by AI"]);
+
+    // A destructive proposal is labelled from its SQL, not from the assistant's reassurance, and needs a typed confirmation.
+    await ask("Delete every note");
+    const card = page.locator("[data-proposal]").last();
+    assert.match((await card.textContent())!, /Just tidying up, completely safe\./);
+    assert.match((await card.locator("[data-risk]").first().textContent())!, /deletes EVERY row \(no WHERE\)/);
+    assert.ok((await card.locator("[data-risk]").first().getAttribute("class"))!.includes("failed"), "destructive proposals are shown in red");
+    await shot("06c-ai-destructive");
+    await card.locator("[data-action=run-proposal]").click();
+    await page.click("dialog button[type=submit]");
+    await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+    await page.fill("#confirm-run", "sure");
+    await page.click("dialog button[type=submit]");
+    await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+    await page.click("dialog button:has-text('Cancel')");
+    assert.deepEqual(await notes(), ["edited note", "added by AI"], "an unconfirmed destructive change does nothing");
+    await card.locator("button:has-text('Dismiss')").click();
+    assert.match((await card.textContent())!, /Dismissed\. Nothing was run\./);
+
+    // A scoped change goes through the same confirmation path and cleans up after itself.
+    await ask("Remove the AI note");
+    const scoped = page.locator("[data-proposal]").last();
+    assert.match((await scoped.locator("[data-risk]").first().textContent())!, /^deletes rows$/);
+    await scoped.locator("[data-action=run-proposal]").click();
+    await page.click("dialog button[type=submit]");
+    await toast("Change applied");
+    assert.deepEqual(await notes(), ["edited note"]);
+
+    await ask("Tell me a joke");
+    assert.match((await page.locator("[data-answer]").last().textContent())!, /don't know/);
+    assert.equal(await page.locator("#ai-chat [data-ai-error]").count(), 0);
+
+    // Turning it off removes the assistant's access again.
+    await page.click("#ai-disable");
+    await page.click("dialog button[type=submit]");
+    await page.waitForSelector("#ai-off");
+    const audit = (await t.api("GET", "/v1/audit-log", { token: owner })).json.map((e: any) => e.action);
+    assert.ok(audit.includes("ai.enable") && audit.includes("ai.disable") && audit.includes("ai.ask"));
   });
 
   step("manages users", async () => {
@@ -364,6 +465,9 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await p2.click(".project-card");
     await p2.waitForSelector("#connect");
     assert.match((await p2.textContent("#connect"))!, /Requires the admin role/);
+    await p2.click("nav.tabs a[data-tab=ai]");
+    await p2.waitForSelector("#ai-off");
+    assert.equal(await p2.isDisabled("#ai-enable"), true);
     await p2.click("nav.tabs a[data-tab=sql]");
     await p2.fill("#sql-input", "select 1");
     await p2.click("#run-sql");

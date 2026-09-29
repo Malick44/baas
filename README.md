@@ -34,7 +34,8 @@ Without Docker: `npm ci && npm run build`, set the variables in `.env.example`, 
 | **Realtime** | Row changes over WebSocket, delivered only if the subscriber's own role can read the row | `src/realtime.ts` |
 | **Storage** | Buckets and objects governed by RLS policies, signed URLs, public buckets, size/type/quota limits | `src/storage.ts` |
 | **Functions** | Your JavaScript in an isolated Node process with a timeout, memory cap and no filesystem/subprocess access | `src/functions.ts`, `src/sandbox.ts` |
-| **Dashboard** | Projects, table editor, SQL editor, users, storage, functions, realtime inspector, logs, backups, settings | `dashboard/` |
+| **Ask AI** | Ask questions about your data in plain language; the assistant runs read-only SQL to answer and *proposes* changes for you to review and run | `src/ai/`, dashboard tab, `baas ask` |
+| **Dashboard** | Projects, table editor, SQL editor, Ask AI, users, storage, functions, realtime inspector, logs, backups, settings | `dashboard/` |
 | **Ops** | Usage metering, plan quotas, idle auto-pause, `pg_dump` backups with integrity-checked restore, housekeeping | `src/usage.ts`, `src/backup.ts`, `src/platform.ts` |
 | **CLI** | `baas` — projects, SQL, checksummed atomic migrations, functions, backups | `src/cli.ts` |
 | **SDK** | `createClient(url, key)` shaped like supabase-js | `src/client.ts` |
@@ -48,6 +49,23 @@ Without Docker: `npm ci && npm run build`, set the variables in `.env.example`, 
 - **Limits per project:** connection cap, a server-side query watchdog users cannot lift with `SET statement_timeout`, token-bucket rate limits, daily request and size quotas by plan, bounded password hashing and function concurrency.
 
 `src/hardening.test.ts` attacks this from outside: every service with another tenant's credentials, every management route with a foreign organisation's token, protocol tricks (duplicate `Host`, absolute-form requests), oversized input, seeded fuzzing, and noisy-neighbour scenarios.
+
+## Ask AI: questions in plain language
+
+Set `ANTHROPIC_API_KEY` on the server and an admin can turn the assistant on per project (dashboard → **Ask AI**, or `baas ai enable`). Then:
+
+- "Which customers spent the most this month?" → the assistant writes SQL, runs it read-only, and answers from the results. The queries it ran are shown so you can check them.
+- "Cancel all pending orders" → it checks what would be affected, then **proposes** the SQL. Nothing runs until you click *Run* (destructive statements also ask you to type `run`).
+
+How it stays safe — none of this depends on the model behaving:
+
+- **Reads are enforced by the database.** Queries run in a `READ ONLY` transaction, over the extended protocol (so `COMMIT; DROP …` cannot be smuggled in), as a dedicated role that can `SELECT` only from your `public` schema. It cannot see `auth` (password hashes, refresh tokens), storage or realtime internals, and has no file, role or server-control privileges. A server-side watchdog cancels slow queries even if the SQL tries to remove its own timeout.
+- **The model cannot change anything.** It can only *propose*. Each proposal is planned with `EXPLAIN` where possible, and a risk label ("deletes EVERY row (no WHERE)", "turns row-level security OFF"…) is computed from the SQL itself and shown beside the model's own description, so a description that plays a change down does not hide it. Running a proposal uses the normal, audited SQL endpoint.
+- **Instructions hidden in your data cannot make it act.** Rows are passed to the model as data and marked untrusted; and even a model that obeyed them could only propose.
+- **Opt-in, with a notice.** Off by default per project. When on, your question, the structure of your public tables, and the rows the assistant's queries return (at most 50 rows, long values shortened) are sent to Anthropic. Use it only where that is acceptable for your data.
+- **Bounded:** 8 steps and 90 s per question, 2 concurrent per project, a daily question limit by plan (20 free / 500 pro), token use recorded per day. The audit log records who asked what, never the results.
+
+Configuration: `BAAS_AI_MODEL` (default `claude-opus-5-5`; a smaller model such as `claude-sonnet-5-5` is cheaper), `BAAS_AI_EFFORT` (`low`…`max`, default `medium`), and `BAAS_AI_FALLBACKS=off` if you run on a platform without the server-side refusal-fallback beta (it is on by default). Tables created outside the SQL editor by another owner need `GRANT SELECT … TO baas_ai_reader` before the assistant can see them.
 
 ## Using a project
 
@@ -95,6 +113,8 @@ Editing a migration after it was applied is refused, and a failing migration rol
 | `PORT` / `GATEWAY_PORT` | Management API + dashboard (8080), data plane (8081) |
 | `BAAS_STORAGE_DIR`, `BAAS_BACKUP_DIR` | Where object files and backups live |
 | `BAAS_PG_BIN_DIR` | Directory with `pg_dump`/`pg_restore` (must match the server's major version) |
+| `ANTHROPIC_API_KEY` | Optional. Turns the Ask AI assistant on for the server (projects still opt in) |
+| `BAAS_AI_MODEL` / `BAAS_AI_EFFORT` / `BAAS_AI_FALLBACKS` | Model (default `claude-opus-5-5`), reasoning effort (default `medium`), and `off` to disable server-side refusal fallbacks |
 | `BAAS_PURGE_RETENTION_DAYS` | Days a deleted project's data is kept before purge (default 7) |
 
 Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's plan needs the owner role; there is no billing.
@@ -109,6 +129,7 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 ## Known limitations — read before relying on it
 
 - **Functions can reach the network.** Node 22 cannot restrict outbound connections, so function code can call anything the host can (including internal services). Filesystem, subprocess and worker access are blocked and tested, but this is defence in depth, not a hardened multi-tenant sandbox. Only run code from people you trust, or run the platform where egress is firewalled, or replace `src/sandbox.ts` with a Deno/gVisor/Firecracker runner.
+- **The assistant is only as good as the model, and has only been tested against a scripted one.** The safety properties above are enforced by the database and server and are tested adversarially, but the live call to Anthropic (request shape is tested against the SDK's types and a stubbed client) had no API key available to run against. Try it on a non-critical project first. Its answers can be wrong: check the queries it shows before relying on a number. It reads through `BYPASSRLS` like the SQL editor, so it sees all rows of the admin's own tables.
 - **No email or OAuth.** Password auth only; sign-ups are auto-confirmed, and password recovery, magic links and OTP return 501.
 - **REST subset.** No embedded resources (joins in `select`), JSON-path operators, casts, or full-text operators. Unfiltered `PATCH`/`DELETE` are rejected.
 - **No point-in-time recovery.** Backups are logical dumps; enable WAL archiving on the cluster if you need PITR. Stored files are not part of backups.
@@ -124,7 +145,7 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 ```bash
 npm ci
 export BAAS_TEST_PG_URL=postgres://postgres:…@localhost:5432/postgres   # a superuser on a throwaway Postgres
-npm test            # 150+ tests: isolation, control plane, REST/Auth, Storage, Functions, Realtime, ops, SDK, CLI, hardening
+npm test            # 180+ tests: isolation, control plane, REST/Auth, Storage, Functions, Realtime, ops, SDK, CLI, hardening, AI assistant
 npm run e2e         # drives the dashboard in headless Chromium (needs a Chromium; set CHROMIUM_PATH)
 npx tsx scripts/load.ts 8 32     # throughput and latency per workload
 ```

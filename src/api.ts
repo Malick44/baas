@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import type { ProjectAdmin } from "./admin-sql.js";
+import type { AiAssistant } from "./ai/assistant.js";
 import type { BackupService } from "./backup.js";
 import { ControlPlane, HttpError, type Principal, type ProjectRow, type Role } from "./control.js";
 import type { FunctionService } from "./functions.js";
@@ -14,6 +15,7 @@ export type ApiOps = {
   usage?: UsageService;
   backups?: BackupService;
   functions?: FunctionService;
+  ai?: AiAssistant;
   /** Where the data plane listens, so clients can build <ref>.<domain> URLs. */
   gateway?: { domain: string; scheme: string; port: number | null };
   /** Directory holding the dashboard's static files. */
@@ -148,6 +150,18 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
       return { results };
     });
     app.get<{ Params: { ref: string } }>("/v1/projects/:ref/tables", async (req) => ops.admin!.tables((await owned(req)).ref));
+  }
+
+  // ---- AI assistant ----
+  if (ops.ai) {
+    const ai = ops.ai;
+    app.get<{ Params: { ref: string } }>("/v1/projects/:ref/ai", async (req) => ai.status(await principal(req), refParam(req)));
+    app.post<{ Params: { ref: string } }>("/v1/projects/:ref/ai/enable", async (req) => ai.setEnabled(await principal(req), refParam(req), true));
+    app.post<{ Params: { ref: string } }>("/v1/projects/:ref/ai/disable", async (req) => ai.setEnabled(await principal(req), refParam(req), false));
+    app.post<{ Params: { ref: string } }>("/v1/projects/:ref/ai/ask", async (req) => {
+      const b = body(req);
+      return ai.ask(await principal(req), refParam(req), b.question, b.history);
+    });
   }
 
   // ---- usage and logs ----

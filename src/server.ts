@@ -19,6 +19,10 @@ const platform = await createPlatform({
   gatewayDomain: process.env.BAAS_GATEWAY_DOMAIN ?? "localhost",
   publicScheme: process.env.BAAS_PUBLIC_SCHEME ?? "http",
   publicPort: process.env.BAAS_PUBLIC_PORT ? Number(process.env.BAAS_PUBLIC_PORT) : gatewayPort,
+  // The assistant is offered only when the operator has given the server Anthropic credentials.
+  ai: process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN
+    ? { model: process.env.BAAS_AI_MODEL ?? "claude-opus-5-5", effort: (process.env.BAAS_AI_EFFORT as "low" | "medium" | "high" | "xhigh" | "max" | undefined) ?? "medium", serverFallbacks: process.env.BAAS_AI_FALLBACKS !== "off" }
+    : undefined,
   purgeRetentionMs: Number(process.env.BAAS_PURGE_RETENTION_DAYS ?? 7) * 86_400_000,
 });
 if (platform.migrations.length) console.log(`applied migrations: ${platform.migrations.join(", ")}`);
@@ -26,6 +30,7 @@ if (platform.migrations.length) console.log(`applied migrations: ${platform.migr
 console.log("housekeeping:", JSON.stringify(await platform.housekeep()));
 platform.start();
 const ports = await platform.listen({ api: Number(process.env.PORT ?? 8080), gateway: gatewayPort });
+console.log(platform.ai.available ? `AI assistant on (${process.env.BAAS_AI_MODEL ?? "claude-opus-5-5"})` : "AI assistant off (set ANTHROPIC_API_KEY to enable)");
 console.log(`management API + dashboard on :${ports.api}, data plane on :${ports.gateway} (<ref>.${process.env.BAAS_GATEWAY_DOMAIN ?? "localhost"})`);
 
 for (const sig of ["SIGINT", "SIGTERM"] as const)

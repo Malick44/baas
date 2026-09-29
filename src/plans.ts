@@ -9,14 +9,16 @@ export type Plan = {
   idlePauseDays: number | null;
   backupsKept: number;
   scheduledBackups: boolean;
+  /** Questions per day the AI SQL assistant will answer for one project. */
+  aiQuestionsPerDay: number;
 };
 
 const MB = 1024 * 1024;
 const GB = 1024 * MB;
 
 export const PLANS: Record<string, Plan> = {
-  free: { requestsPerDay: 50_000, rps: 20, burst: 40, dbBytes: 500 * MB, storageBytes: 1 * GB, fileSizeBytes: 50 * MB, idlePauseDays: 7, backupsKept: 3, scheduledBackups: false },
-  pro: { requestsPerDay: 5_000_000, rps: 200, burst: 400, dbBytes: 8 * GB, storageBytes: 100 * GB, fileSizeBytes: 50 * MB, idlePauseDays: null, backupsKept: 14, scheduledBackups: true },
+  free: { requestsPerDay: 50_000, rps: 20, burst: 40, dbBytes: 500 * MB, storageBytes: 1 * GB, fileSizeBytes: 50 * MB, idlePauseDays: 7, backupsKept: 3, scheduledBackups: false, aiQuestionsPerDay: 20 },
+  pro: { requestsPerDay: 5_000_000, rps: 200, burst: 400, dbBytes: 8 * GB, storageBytes: 100 * GB, fileSizeBytes: 50 * MB, idlePauseDays: null, backupsKept: 14, scheduledBackups: true, aiQuestionsPerDay: 500 },
 };
 
 export const planOf = (name: string): Plan => PLANS[name] ?? PLANS.free!;

@@ -114,3 +114,18 @@ main, .card, .stack, .split > * { min-width: 0; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 button, .btn, header.top .who { white-space: nowrap; }
 @media (max-width: 600px) { header.top { padding: 10px 12px; gap: 8px; } header.top .who { display: none; } }
+
+.chat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-height: 240px; max-height: 60vh; overflow: auto; display: grid; gap: 14px; align-content: start; }
+.entry { display: grid; gap: 8px; }
+.bubble { padding: 9px 13px; border-radius: 12px; max-width: 88%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.bubble.user { background: var(--brand); color: var(--brand-ink); justify-self: end; border-bottom-right-radius: 3px; }
+.bubble.ai { background: var(--panel-2); justify-self: start; border-bottom-left-radius: 3px; }
+.steps { display: grid; gap: 6px; }
+details.step { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; background: var(--panel); }
+details.step summary { cursor: pointer; }
+details.step[open] > * + * { margin-top: 8px; }
+pre.sql { white-space: pre-wrap; overflow-wrap: anywhere; }
+.proposal { border: 1px solid var(--warn); border-radius: 10px; padding: 12px; display: grid; gap: 8px; background: var(--panel); }
+.proposal.destructive { border-color: var(--bad); }
+.proposal .badge { margin: 2px 4px 2px 0; }
+ul.bad { margin: 0; padding-left: 20px; }

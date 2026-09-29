@@ -196,7 +196,7 @@ async function newProject() {
 
 // ---------- project shell ----------
 const TABS = [
-  ["overview", "Overview"], ["tables", "Table editor"], ["sql", "SQL editor"], ["auth", "Authentication"], ["storage", "Storage"],
+  ["overview", "Overview"], ["tables", "Table editor"], ["sql", "SQL editor"], ["ai", "Ask AI"], ["auth", "Authentication"], ["storage", "Storage"],
   ["functions", "Functions"], ["realtime", "Realtime"], ["logs", "Logs"], ["backups", "Backups"], ["settings", "Settings"],
 ];
 
@@ -215,7 +215,7 @@ async function renderProject(ref, tab) {
     h("nav", { class: "tabs" }, TABS.map(([id, label]) => h("a", { href: `#/p/${ref}/${id}`, class: id === tab ? "on" : "", "data-tab": id }, label))),
     p.status === "paused" && h("div", { class: "notice warn" }, "This project is paused: its API is offline. Resume it in Settings."),
     body));
-  const fn = { overview, tables, sql, auth, storage, functions, realtime, logs, backups, settings }[tab] || overview;
+  const fn = { overview, tables, sql, ai, auth, storage, functions, realtime, logs, backups, settings }[tab] || overview;
   try {
     await fn(body, p);
   } catch (ex) {
@@ -489,6 +489,119 @@ async function sql(body) {
     h("p", { class: "muted" }, "Runs as the project's service_role in one transaction. Nothing is exposed through the API until you grant it to anon or authenticated."),
     editor, out,
     hist.length > 1 && h("details", null, h("summary", null, "History"), hist.slice(1).map((q) => h("pre", { class: "clickable", onclick: () => { editor.value = q; } }, truncate(q, 300))))));
+}
+
+// ---------- Ask AI ----------
+// Conversation state per project, kept while the page stays open.
+let AI = { ref: null, entries: [] };
+
+function proposalCard(pr, entry) {
+  const state = h("div", { class: "muted" });
+  const run = h("button", { class: pr.risk.destructive ? "danger" : "primary", "data-action": "run-proposal" }, "Run this SQL");
+  const done = (msg, kind) => { run.disabled = true; state.textContent = msg; state.className = kind; };
+  run.addEventListener("click", async () => {
+    const ok = await dialog("Run AI-proposed SQL?", () => h("div", { class: "stack" },
+      h("p", null, "This SQL was written by an AI model. Read it before running; it changes your database."),
+      h("pre", null, pr.sql),
+      pr.risk.flags.length && h("ul", { class: pr.risk.destructive ? "bad" : "" }, pr.risk.flags.map((f) => h("li", null, f))),
+      pr.risk.destructive && h("label", { class: "field" }, 'Type "run" to confirm', h("input", { name: "typed", autocomplete: "off", id: "confirm-run" }))), {
+      confirmLabel: "Run it", danger: pr.risk.destructive,
+      onSubmit: (fd) => { if (pr.risk.destructive && String(fd.get("typed")).trim().toLowerCase() !== "run") throw new Error('Type "run" to confirm.'); return true; },
+    });
+    if (!ok) return;
+    try {
+      const results = await sqlRun(pr.sql);
+      S.tables = null;
+      done(`Ran. ${results.map((r) => `${r.command}${r.rowCount ? ` ${r.rowCount}` : ""}`).join(", ")}`, "ok");
+      toast("Change applied", "ok");
+    } catch (ex) { state.textContent = ex.message; state.className = "bad"; toast(ex.message, "bad"); }
+  });
+  const dismiss = h("button", { onclick: () => { done("Dismissed. Nothing was run.", "muted"); } }, "Dismiss");
+  const v = pr.validation;
+  return h("div", { class: `proposal ${pr.risk.destructive ? "destructive" : ""}`, "data-proposal": "1" },
+    h("div", { class: "row between" }, h("strong", null, "Proposed change — not run yet"), h("span", { class: `badge ${v.status === "invalid" ? "failed" : ""}` }, v.status === "ok" ? "checked by the database" : v.status === "unchecked" ? `not pre-checked: ${v.message || ""}` : "invalid")),
+    h("div", null, h("span", { class: "muted" }, "What it will do (detected from the SQL): "), pr.risk.flags.map((f, i) => h("span", { class: `badge ${pr.risk.destructive ? "failed" : ""}`, "data-risk": "1" }, f))),
+    pr.explanation && h("p", null, h("span", { class: "muted" }, "The assistant says: "), pr.explanation),
+    h("pre", { class: "sql" }, pr.sql),
+    h("div", { class: "row" }, run, h("button", { onclick: async () => { await navigator.clipboard?.writeText(pr.sql).catch(() => {}); toast("Copied"); } }, "Copy"), dismiss, state));
+}
+
+function stepView(st) {
+  return h("details", { class: "step", "data-step": st.tool },
+    h("summary", null, st.tool === "run_query" ? (st.purpose || "Query") : "Proposed change", " ", st.ok ? h("span", { class: "muted" }, st.tool === "run_query" ? `· ${st.rowCount} row${st.rowCount === 1 ? "" : "s"}${st.moreRows ? "+" : ""} · ${st.ms} ms` : "") : h("span", { class: "bad" }, "· failed")),
+    h("pre", { class: "sql" }, st.sql),
+    st.error && h("div", { class: "notice bad" }, st.error),
+    st.ok && st.columns && (st.rows.length ? h("div", { class: "tablewrap" }, h("table", { class: "data" }, h("thead", null, h("tr", null, st.columns.map((c) => h("th", null, c)))), h("tbody", null, st.rows.map((r) => h("tr", null, r.map((v) => h("td", { class: v === null ? "null" : "" }, truncate(cellText(v), 80)))))))) : h("p", { class: "muted" }, "No rows.")));
+}
+
+function entryView(e) {
+  const box = h("div", { class: "entry" }, h("div", { class: "bubble user" }, e.question));
+  if (e.pending) box.append(h("div", { class: "bubble ai muted", "data-pending": "1" }, "Thinking…"));
+  else if (e.error) box.append(h("div", { class: "notice bad", "data-ai-error": "1" }, e.error));
+  else {
+    const r = e.result;
+    box.append(h("div", { class: "bubble ai", "data-answer": "1" }, r.answer));
+    if (r.steps.length) box.append(h("div", { class: "steps" }, r.steps.filter((s) => s.tool === "run_query").length ? h("p", { class: "muted" }, "Queries the assistant ran (read-only):") : null, r.steps.filter((s) => s.tool === "run_query").map(stepView)));
+    r.proposals.forEach((pr) => box.append(proposalCard(pr, e)));
+  }
+  return box;
+}
+
+async function ai(body, p) {
+  if (AI.ref !== p.ref) AI = { ref: p.ref, entries: [] };
+  const st = await api("GET", `/v1/projects/${p.ref}/ai`);
+  clear(body);
+  if (!st.available) {
+    body.append(h("div", { class: "notice", id: "ai-unavailable" }, "The assistant is not available: this server has no AI provider configured. The server operator can enable it by setting ANTHROPIC_API_KEY."));
+    return;
+  }
+  const canAdmin = S.me.role !== "developer";
+  if (!st.enabled) {
+    body.append(h("div", { class: "card stack", id: "ai-off" },
+      h("h2", null, "Ask questions about your data in plain language"),
+      h("p", null, "The assistant writes and runs read-only SQL to answer, and can propose changes that you review and run yourself. It never changes anything on its own."),
+      h("div", { class: "notice warn", id: "ai-notice" }, st.notice),
+      h("p", { class: "muted" }, "It can read the tables in your public schema (including rows protected by row-level security, like the SQL editor), but not users, sessions, files or other internals."),
+      h("button", { class: "primary", id: "ai-enable", disabled: !canAdmin, title: canAdmin ? "" : "Requires the admin role", onclick: async () => {
+        if (!(await confirmBox("Enable the AI assistant?", st.notice, { danger: false, confirmLabel: "Enable" }))) return;
+        try { await api("POST", `/v1/projects/${p.ref}/ai/enable`); toast("AI assistant enabled", "ok"); ai(body, p); } catch (ex) { toast(ex.message, "bad"); }
+      } }, "Enable for this project")));
+    return;
+  }
+  const list = h("div", { class: "chat", id: "ai-chat" });
+  const input = h("textarea", { id: "ai-input", rows: 2, placeholder: "e.g. Which customers spent the most this month?", maxlength: 2000 });
+  const send = h("button", { class: "primary", id: "ai-send" }, "Ask");
+  const counter = h("span", { class: "muted", id: "ai-quota" }, `${st.questionsToday} of ${st.questionsPerDay} questions used today · ${st.model}`);
+  const draw = () => { clear(list); if (!AI.entries.length) list.append(h("p", { class: "muted" }, "Ask about your tables. Try “How many rows are in each table?”")); AI.entries.forEach((e) => list.append(entryView(e))); list.scrollTop = list.scrollHeight; };
+  const submit = async () => {
+    const q = input.value.trim();
+    if (!q || send.disabled) return;
+    const history = [];
+    for (const e of AI.entries.slice(-5)) if (e.result) { history.push({ role: "user", content: e.question }, { role: "assistant", content: e.result.answer }); }
+    const entry = { question: q, pending: true };
+    AI.entries.push(entry);
+    input.value = "";
+    send.disabled = true;
+    draw();
+    try {
+      entry.result = await api("POST", `/v1/projects/${p.ref}/ai/ask`, { question: q, history });
+      const st2 = await api("GET", `/v1/projects/${p.ref}/ai`);
+      counter.textContent = `${st2.questionsToday} of ${st2.questionsPerDay} questions used today · ${st2.model}`;
+    } catch (ex) { entry.error = ex.message; }
+    entry.pending = false;
+    send.disabled = false;
+    draw();
+    input.focus();
+  };
+  send.addEventListener("click", submit);
+  input.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); submit(); } });
+  body.append(h("div", { class: "stack" },
+    h("div", { class: "row between" }, h("h2", null, "Ask AI"), h("div", { class: "row" }, counter,
+      h("button", { class: "small", onclick: () => { AI.entries = []; draw(); } }, "Clear chat"),
+      h("button", { class: "small", id: "ai-disable", disabled: !canAdmin, onclick: async () => { if (await confirmBox("Turn off the assistant?", "The assistant loses its read access to this database.", { danger: false, confirmLabel: "Turn off" })) { await api("POST", `/v1/projects/${p.ref}/ai/disable`); AI.entries = []; ai(body, p); } } }, "Turn off"))),
+    list,
+    h("div", { class: "stack" }, input, h("div", { class: "row between" }, h("span", { class: "muted" }, "Your question, the table structure and query results are sent to Anthropic. Ctrl/⌘+Enter to send."), send))));
+  draw();
 }
 
 // ---------- authentication ----------

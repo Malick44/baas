@@ -24,8 +24,12 @@ export class Directory {
   }
 }
 
+/** Roles the database layer may switch to. API roles come from verified JWTs; the AI reader is only ever chosen by platform code. */
+export type DbRole = ApiRole | "baas_ai_reader";
+export const DB_ROLES: ReadonlySet<string> = new Set<DbRole>(["anon", "authenticated", "service_role", "baas_ai_reader"]);
+
 export type RoleContext = {
-  role: ApiRole;
+  role: DbRole;
   claims: Record<string, unknown>;
   readOnly?: boolean;
   timeoutMs?: number;
@@ -94,7 +98,7 @@ export class PoolManager {
   }
 
   async withRole<T>(ref: string, ctx: RoleContext, fn: (c: pg.PoolClient, project: Resolved) => Promise<T>): Promise<T> {
-    if (!API_ROLES.has(ctx.role)) throw new HttpError(403, "invalid role");
+    if (!DB_ROLES.has(ctx.role)) throw new HttpError(403, "invalid role");
     const { pool, url, project } = await this.pool(ref);
     let c: pg.PoolClient;
     try {

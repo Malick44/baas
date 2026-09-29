@@ -21,6 +21,8 @@ const USAGE = `baas <command>
   db status [--dir baas/migrations]
   functions list | deploy <name> <file> [--no-verify-jwt] | delete <name> | logs <name>
   backups list | create [--note <text>] | restore <id>
+  ai status | enable | disable             the plain-language SQL assistant (needs a server-side Anthropic key)
+  ask "<question>"                        ask about your data; changes are only ever proposed, never run
   usage
 
 Project: --ref <ref>, or BAAS_PROJECT, or the link made by "baas link".`;
@@ -227,6 +229,31 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           await api("POST", `/v1/projects/${ref}/backups/${rest[0]}/restore`);
           io.out(`Restored ${ref} from ${rest[0]}.`);
         } else throw new CliError("usage: baas backups list | create [--note <text>] | restore <id>");
+        return 0;
+      }
+      case "ai": {
+        const ref = await projectRef();
+        if (sub === "enable" || sub === "disable") {
+          const st = await api("POST", `/v1/projects/${ref}/ai/${sub}`);
+          io.out(`AI assistant ${st.enabled ? "enabled" : "disabled"}.${st.enabled ? `\n${st.notice}` : ""}`);
+        } else if (sub === "status" || sub === undefined) {
+          const st = await api("GET", `/v1/projects/${ref}/ai`);
+          io.out(st.available ? `AI assistant: ${st.enabled ? "on" : "off"} (${st.model}), ${st.questionsToday}/${st.questionsPerDay} questions today` : "AI assistant: not configured on this server");
+        } else throw new CliError("usage: baas ai status | enable | disable");
+        return 0;
+      }
+      case "ask": {
+        const ref = await projectRef();
+        const question = [sub, ...rest].filter(Boolean).join(" ");
+        if (!question.trim()) throw new CliError('usage: baas ask "<question>"');
+        const r = await api("POST", `/v1/projects/${ref}/ai/ask`, { question });
+        io.out(r.answer);
+        for (const st of r.steps.filter((x: any) => x.tool === "run_query")) io.out(`\n  ${st.ok ? "ran" : "failed"} (read-only): ${st.sql.replace(/\s+/g, " ")}${st.error ? `\n    ${st.error}` : ""}`);
+        for (const pr of r.proposals) {
+          io.out(`\nProposed change — NOT run.${pr.risk.destructive ? " DESTRUCTIVE:" : " It would:"} ${pr.risk.flags.join("; ")}`);
+          if (pr.explanation) io.out(`The assistant says: ${pr.explanation}`);
+          io.out(`${pr.sql}\nReview it, then apply it yourself: save it to a file and run "baas sql --file <file>".`);
+        }
         return 0;
       }
       case "usage": {

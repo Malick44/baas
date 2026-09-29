@@ -32,6 +32,11 @@ services:
       BAAS_GATEWAY_DOMAIN: ${BAAS_GATEWAY_DOMAIN:-localhost}
       BAAS_PUBLIC_SCHEME: ${BAAS_PUBLIC_SCHEME:-http}
       BAAS_PUBLIC_PORT: ${BAAS_PUBLIC_PORT:-8081}
+      # Optional: offer the Ask AI assistant (projects opt in individually).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      BAAS_AI_MODEL: ${BAAS_AI_MODEL:-claude-opus-5-5}
+      BAAS_AI_EFFORT: ${BAAS_AI_EFFORT:-medium}
+      BAAS_AI_FALLBACKS: ${BAAS_AI_FALLBACKS:-on}
       GATEWAY_PORT: "8081"
       PORT: "8080"
     ports:

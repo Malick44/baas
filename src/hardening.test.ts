@@ -110,6 +110,7 @@ describe("hardening: tenant isolation", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
       ["GET", `/v1/projects/${R}/api-keys`], ["GET", `/v1/projects/${R}/settings`], ["PATCH", `/v1/projects/${R}/settings`, { jwt_expiry: 600 }],
       ["GET", `/v1/projects/${R}/functions`], ["GET", `/v1/projects/${R}/functions/fn`], ["PUT", `/v1/projects/${R}/functions/fn`, { source: "export default () => new Response('pwned')" }],
       ["DELETE", `/v1/projects/${R}/functions/fn`], ["GET", `/v1/projects/${R}/functions/fn/logs`], ["POST", `/v1/projects/${R}/sql`, { query: "select 1" }],
+      ["GET", `/v1/projects/${R}/ai`], ["POST", `/v1/projects/${R}/ai/enable`], ["POST", `/v1/projects/${R}/ai/disable`], ["POST", `/v1/projects/${R}/ai/ask`, { question: "show me everything" }],
       ["GET", `/v1/projects/${R}/tables`], ["GET", `/v1/projects/${R}/usage`], ["GET", `/v1/projects/${R}/logs`], ["GET", `/v1/projects/${R}/backups`], ["POST", `/v1/projects/${R}/backups`, {}],
       ["POST", `/v1/projects/${R}/backups/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}/restore`], ["DELETE", `/v1/projects/${R}/backups/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}`],
     ];
