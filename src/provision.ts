@@ -14,7 +14,8 @@ export type Project = {
   authenticator: { user: string; password: string };
 };
 
-const dbNameOf = (ref: string) => `proj_${ref}`;
+export const newRef = () => randomBytes(10).toString("hex");
+export const dbNameOf = (ref: string) => `proj_${ref}`;
 const authenticatorOf = (ref: string) => `authenticator_${ref}`;
 
 function assertRef(ref: string): void {
@@ -50,7 +51,7 @@ async function withClient<T>(url: string, fn: (c: pg.Client) => Promise<T>): Pro
  * On failure, everything created so far is removed.
  */
 export async function provisionProject(adminUrl: string, ref?: string): Promise<Project> {
-  ref ??= randomBytes(10).toString("hex");
+  ref ??= newRef();
   assertRef(ref);
   const dbName = dbNameOf(ref);
   const user = authenticatorOf(ref);
@@ -112,5 +113,18 @@ export async function dropProject(adminUrl: string, ref: string): Promise<void> 
   await withClient(adminUrl, async (c) => {
     await c.query(`DROP DATABASE IF EXISTS "${dbNameOf(ref)}" WITH (FORCE)`);
     await c.query(`DROP ROLE IF EXISTS "${authenticatorOf(ref)}"`);
+  });
+}
+
+/**
+ * Cut off or restore a project's access to its database (pause/resume, soft delete).
+ * Disabling also terminates the login role's open connections.
+ */
+export async function setProjectAccess(adminUrl: string, ref: string, enabled: boolean): Promise<void> {
+  assertRef(ref);
+  const user = authenticatorOf(ref);
+  await withClient(adminUrl, async (c) => {
+    await c.query(`ALTER ROLE "${user}" ${enabled ? "LOGIN" : "NOLOGIN"}`);
+    if (!enabled) await c.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1`, [user]);
   });
 }

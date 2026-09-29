@@ -8,6 +8,7 @@
     "test": "node --import tsx --test src/*.test.ts"
   },
   "dependencies": {
+    "fastify": "^5.12.5",
     "pg": "^8.13.0"
   },
   "devDependencies": {
