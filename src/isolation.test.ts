@@ -36,7 +36,7 @@ describe("multi-project isolation", { skip: !ADMIN && "set BAAS_TEST_PG_URL to a
         `CREATE TABLE public.notes (id serial PRIMARY KEY, owner uuid, body text);
          ALTER TABLE public.notes ENABLE ROW LEVEL SECURITY;
          CREATE POLICY own ON public.notes FOR SELECT TO authenticated USING (owner = auth.uid());
-         GRANT SELECT ON public.notes TO anon;
+         GRANT SELECT ON public.notes TO anon, authenticated, service_role;
          INSERT INTO public.notes (owner, body) VALUES ('11111111-1111-1111-1111-111111111111', 'secret of ${p.ref}')`,
       );
     }

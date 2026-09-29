@@ -91,6 +91,8 @@ describe("realtime", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
         CREATE POLICY own ON public.msgs FOR ALL TO authenticated USING (owner = auth.uid()) WITH CHECK (owner = auth.uid());
         CREATE TABLE public.open (id serial PRIMARY KEY, v text);
         GRANT SELECT ON public.open TO anon;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON public.msgs, public.open TO authenticated, service_role;
+        GRANT USAGE ON SEQUENCE public.msgs_id_seq, public.open_id_seq TO authenticated, service_role;
         CREATE TABLE public.nopk (v text);
         GRANT SELECT ON public.nopk TO anon, authenticated;`);
     const su = async (email: string) => (await h.call(a, "POST", "/auth/v1/signup", { key: a.anon, body: { email, password: "secret123" } })).json;

@@ -1,11 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
 import pg from "pg";
+import { PLANS } from "./plans.js";
 import { checkSyntax } from "./sandbox.js";
 import { dbNameOf, dropProject, newRef, provisionProject, setProjectAccess, type Project } from "./provision.js";
 import type { Vault } from "./vault.js";
 
 export class HttpError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(readonly status: number, message: string, readonly headers?: Record<string, string>) {
     super(message);
   }
 }
@@ -65,7 +66,7 @@ export class ControlPlane {
     if (RANK[p.role] < RANK[min]) throw new HttpError(403, `requires ${min} role`);
   }
 
-  private async audit(actor: string, orgId: string | null, action: string, target: string | null, meta: object = {}) {
+  async audit(actor: string, orgId: string | null, action: string, target: string | null, meta: object = {}) {
     await this.pool.query(`INSERT INTO audit_log (org_id, actor, action, target, meta) VALUES ($1, $2, $3, $4, $5)`, [
       orgId, actor, action, target, meta,
     ]);
@@ -187,6 +188,39 @@ export class ControlPlane {
     }
     await this.audit(p.tokenId, p.orgId, `project.${action}`, ref);
     return row;
+  }
+
+  async setPlan(p: Principal, ref: string, plan: string) {
+    ControlPlane.require(p, "owner");
+    if (!Object.hasOwn(PLANS, plan)) throw new HttpError(400, `plan must be one of ${Object.keys(PLANS).join(", ")}`);
+    await this.getProject(p, ref);
+    const r = await this.pool.query<ProjectRow>(`UPDATE projects SET plan = $2, updated_at = now() WHERE ref = $1 RETURNING *`, [ref, plan]);
+    await this.audit(p.tokenId, p.orgId, "project.plan", ref, { plan });
+    return r.rows[0]!;
+  }
+
+  /** Housekeeping pause (no caller): same effect as pauseProject, recorded as done by the system. */
+  async systemPause(ref: string, reason: string): Promise<boolean> {
+    const row = await this.setStatus(ref, ["active"], "paused");
+    if (!row) return false;
+    await setProjectAccess(this.adminUrl, ref, false);
+    await this.audit("system", row.org_id, "project.pause", ref, { reason });
+    return true;
+  }
+
+  /** Active projects on plans with an idle limit that have had no requests for that long. */
+  async autoPauseIdle(): Promise<string[]> {
+    const paused: string[] = [];
+    for (const [name, plan] of Object.entries(PLANS)) {
+      if (plan.idlePauseDays === null) continue;
+      const due = await this.pool.query<{ ref: string }>(
+        `SELECT ref FROM projects WHERE status = 'active' AND plan = $1
+         AND coalesce(last_request_at, created_at) < now() - ($2 || ' days')::interval`,
+        [name, plan.idlePauseDays],
+      );
+      for (const { ref } of due.rows) if (await this.systemPause(ref, `no requests for ${plan.idlePauseDays} days`)) paused.push(ref);
+    }
+    return paused;
   }
 
   pauseProject = (p: Principal, ref: string) => this.transition(p, ref, "admin", ["active"], "paused", false, "pause");
@@ -316,16 +350,16 @@ export class ControlPlane {
 
   /** Permanently drop the databases of projects deleted longer than `retentionMs` ago. Returns the refs purged. */
   async purgeDeleted(retentionMs: number): Promise<string[]> {
-    const due = (await this.pool.query<{ ref: string }>(
-      `SELECT ref FROM projects WHERE status = 'deleted' AND deleted_at <= now() - ($1 || ' milliseconds')::interval`,
+    const due = (await this.pool.query<{ ref: string; org_id: string }>(
+      `SELECT ref, org_id FROM projects WHERE status = 'deleted' AND deleted_at <= now() - ($1 || ' milliseconds')::interval`,
       [retentionMs],
     )).rows;
     const purged: string[] = [];
-    for (const { ref } of due) {
+    for (const { ref, org_id } of due) {
       await dropProject(this.adminUrl, ref);
       await this.pool.query(`DELETE FROM project_secrets WHERE ref = $1`, [ref]);
       if (await this.setStatus(ref, ["deleted"], "purged")) {
-        await this.audit("system", null, "project.purge", ref);
+        await this.audit("system", org_id, "project.purge", ref);
         purged.push(ref);
       }
     }
@@ -334,14 +368,14 @@ export class ControlPlane {
 
   /** Clean up after a crash mid-provision: stuck rows become failed and any leftover database or role is dropped. */
   async reconcile(stuckForMs = 10 * 60_000): Promise<string[]> {
-    const stuck = (await this.pool.query<{ ref: string }>(
-      `SELECT ref FROM projects WHERE status = 'provisioning' AND updated_at <= now() - ($1 || ' milliseconds')::interval`,
+    const stuck = (await this.pool.query<{ ref: string; org_id: string }>(
+      `SELECT ref, org_id FROM projects WHERE status = 'provisioning' AND updated_at <= now() - ($1 || ' milliseconds')::interval`,
       [stuckForMs],
     )).rows;
-    for (const { ref } of stuck) {
+    for (const { ref, org_id } of stuck) {
       await dropProject(this.adminUrl, ref);
       await this.setStatus(ref, ["provisioning"], "failed");
-      await this.audit("system", null, "project.reconcile", ref);
+      await this.audit("system", org_id, "project.reconcile", ref);
     }
     return stuck.map((r) => r.ref);
   }

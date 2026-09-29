@@ -77,7 +77,7 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
   app.setErrorHandler((err: Error & { statusCode?: number }, _req, reply) => {
     reply.headers(CORS);
     if (err instanceof AuthError) return reply.code(err.status).send({ code: err.status, error_code: err.errorCode, msg: err.message });
-    if (err instanceof HttpError) return reply.code(err.status).send({ message: err.message });
+    if (err instanceof HttpError) return reply.headers(err.headers ?? {}).code(err.status).send({ message: err.message });
     if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ message: err.message });
     return reply.code(500).send({ message: "internal error" });
   });

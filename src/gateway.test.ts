@@ -25,6 +25,8 @@ describe("data plane: rest + auth", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, 
         CREATE TABLE public.notes (id int PRIMARY KEY, body text);
         INSERT INTO public.notes VALUES (1,'alpha'),(2,'beta'),(3,'gamma'),(4,'delta');
         GRANT SELECT ON public.notes TO anon;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON public.notes, public.todos TO authenticated, service_role;
+        GRANT USAGE ON SEQUENCE public.todos_id_seq TO authenticated, service_role;
         CREATE FUNCTION public.add(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT a + b';
         CREATE FUNCTION public.notes_like(pat text) RETURNS SETOF public.notes LANGUAGE sql AS 'SELECT * FROM public.notes WHERE body LIKE pat';`);
     }

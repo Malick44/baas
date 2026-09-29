@@ -1,8 +1,5 @@
-import pg from "pg";
-import { buildApi } from "./api.js";
-import { ControlPlane } from "./control.js";
-import { migrate } from "./migrate.js";
-import { Vault } from "./vault.js";
+import { resolve } from "node:path";
+import { createPlatform } from "./platform.js";
 
 function need(name: string): string {
   const v = process.env[name];
@@ -10,19 +7,26 @@ function need(name: string): string {
   return v;
 }
 
-const pool = new pg.Pool({ connectionString: need("BAAS_CONTROL_URL") });
-const applied = await migrate(pool);
-if (applied.length) console.log(`applied migrations: ${applied.join(", ")}`);
+const gatewayPort = Number(process.env.GATEWAY_PORT ?? 8081);
+const platform = await createPlatform({
+  controlUrl: need("BAAS_CONTROL_URL"),
+  pgAdminUrl: need("BAAS_PG_ADMIN_URL"),
+  masterKey: need("BAAS_MASTER_KEY"),
+  bootstrapToken: need("BAAS_BOOTSTRAP_TOKEN"),
+  storageDir: resolve(process.env.BAAS_STORAGE_DIR ?? "./data/storage"),
+  backupDir: resolve(process.env.BAAS_BACKUP_DIR ?? "./data/backups"),
+  pgBinDir: process.env.BAAS_PG_BIN_DIR,
+  gatewayDomain: process.env.BAAS_GATEWAY_DOMAIN ?? "localhost",
+  publicScheme: process.env.BAAS_PUBLIC_SCHEME ?? "http",
+  publicPort: process.env.BAAS_PUBLIC_PORT ? Number(process.env.BAAS_PUBLIC_PORT) : gatewayPort,
+  purgeRetentionMs: Number(process.env.BAAS_PURGE_RETENTION_DAYS ?? 7) * 86_400_000,
+});
+if (platform.migrations.length) console.log(`applied migrations: ${platform.migrations.join(", ")}`);
 
-const control = new ControlPlane(pool, need("BAAS_PG_ADMIN_URL"), new Vault(need("BAAS_MASTER_KEY")));
-const app = buildApi(control, need("BAAS_BOOTSTRAP_TOKEN"));
+console.log("housekeeping:", JSON.stringify(await platform.housekeep()));
+platform.start();
+const ports = await platform.listen({ api: Number(process.env.PORT ?? 8080), gateway: gatewayPort });
+console.log(`management API + dashboard on :${ports.api}, data plane on :${ports.gateway} (<ref>.${process.env.BAAS_GATEWAY_DOMAIN ?? "localhost"})`);
 
-const RETENTION_MS = Number(process.env.BAAS_PURGE_RETENTION_DAYS ?? 7) * 86_400_000;
-const sweep = async () => {
-  const gone = [...(await control.reconcile()), ...(await control.purgeDeleted(RETENTION_MS))];
-  if (gone.length) console.log(`housekeeping touched: ${gone.join(", ")}`);
-};
-await sweep();
-setInterval(() => sweep().catch((e) => console.error("housekeeping failed", e)), 10 * 60_000).unref();
-
-await app.listen({ host: "0.0.0.0", port: Number(process.env.PORT ?? 8080) });
+for (const sig of ["SIGINT", "SIGTERM"] as const)
+  process.once(sig, () => void platform.stop().finally(() => process.exit(0)));
