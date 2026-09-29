@@ -329,3 +329,18 @@ kbd.key { font-family: var(--mono); font-size: 12px; border: 1px solid var(--lin
 .level { font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; border-radius: 999px; padding: 0 8px; line-height: 18px; border: 1px solid var(--line-strong); }
 .level.error { color: var(--bad); border-color: var(--bad); } .level.warn { color: var(--warn); border-color: var(--warn); }
 @media (max-width: 900px) { header.appbar .extra { display: none; } }
+
+/* ---- pipelines and integrations ---- */
+.chip.healthy { color: var(--ok); border-color: var(--ok); }
+.chip.failing { color: var(--bad); border-color: var(--bad); }
+.checks { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.checks .check { min-width: 150px; }
+.stack-lg { display: grid; gap: 34px; }
+.integ-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+.integ-card { display: grid; gap: 8px; align-content: start; border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; background: var(--panel); color: var(--text); min-width: 0; }
+a.integ-card:hover { border-color: var(--line-strong); text-decoration: none; }
+.integ-card p { margin: 0; font-size: 13px; }
+.integ-card.on { border-color: var(--brand); }
+.integ-card .mono { overflow: hidden; text-overflow: ellipsis; }
+
+.ext-card.na { opacity: .6; }

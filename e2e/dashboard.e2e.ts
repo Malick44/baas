@@ -1,3 +1,4 @@
+import http from "node:http";
 // Browser end-to-end test: drives the dashboard in headless Chromium against a real platform instance.
 // Run with: BAAS_TEST_PG_URL=postgres://... npm run e2e
 import assert from "node:assert/strict";
@@ -91,7 +92,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
   before(async () => {
     await mkdir(SHOTS, { recursive: true });
     [apiPort, gwPort] = [await freePort(), await freePort()];
-    t = await makePlatform(ADMIN!, { publicPort: gwPort, ai: { llm: new RuleLlm() } });
+    t = await makePlatform(ADMIN!, { publicPort: gwPort, ai: { llm: new RuleLlm() }, pipelines: { allowPrivateTargets: true, tickMs: 60_000, backoffBaseMs: 10 } });
     await t.platform.listen({ api: apiPort, gateway: gwPort, host: "127.0.0.1" });
     owner = await t.org("e2e-org");
     browser = await chromium.launch({ executablePath: CHROME, args: ["--no-sandbox"] });
@@ -749,6 +750,144 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await shot("06g-reports");
   });
 
+  step("sends row changes to a webhook with a pipeline", async () => {
+    const got: { sig: string; raw: string }[] = [];
+    let answer = 200;
+    const hook = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (d) => chunks.push(d));
+      req.on("end", () => { got.push({ sig: String(req.headers["x-baas-signature"]), raw: Buffer.concat(chunks).toString() }); res.statusCode = answer; res.end(answer === 200 ? "ok" : "nope"); });
+    });
+    await new Promise<void>((r) => hook.listen(0, "127.0.0.1", r));
+    const hookUrl = `http://127.0.0.1:${(hook.address() as any).port}/hook`;
+    try {
+      await tab("database", "pipelines");
+      assert.match((await page.textContent("nav.sub a[data-dbpage=pipelines]"))!, /Pipelines\s*NEW/);
+      await page.waitForSelector("#pipeline-empty");
+      await shot("06h-pipelines-empty");
+
+      await page.click("#new-pipeline");
+      await page.waitForSelector("dialog.sheet");
+      await page.fill("#pl-name", "notes to my server");
+      await page.fill("#pl-url", hookUrl);
+      await page.click("dialog button[type=submit]");
+      await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+      assert.match((await page.textContent("dialog .notice.bad"))!, /at least one table/);
+      await page.check("#pl-tables input[data-table=notes]");
+      await page.uncheck("#pl-events input[data-event=DELETE]");
+      await page.click("dialog button[type=submit]");
+      await toast("Pipeline created");
+      await page.waitForSelector("#verify-snippet");
+      const secret = (await page.locator("dialog .kv code").first().textContent()) ?? "";
+      assert.equal(secret.includes("•"), true, "the secret starts hidden");
+      await page.locator("dialog button:has-text('Reveal')").click();
+      const shown = (await page.locator("dialog .kv code").first().textContent())!;
+      assert.match(shown, /^whsec_/);
+      await page.click("dialog button[type=submit]");
+      const row = "tr[data-row='notes to my server']";
+      await page.waitForSelector(row);
+      assert.equal(await page.getAttribute(`${row} .chip`, "data-status"), "healthy");
+      assert.match((await page.textContent(row))!, /notes/);
+
+      // A real change, delivered on demand, signed with the secret that was shown.
+      await t.sql(owner, ref, "insert into public.notes (body) values ('from the pipeline test')");
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=run]");
+      await page.waitForFunction((r) => document.querySelector(`${r} td[data-delivered]`)?.getAttribute("data-delivered") === "1", row);
+      assert.equal(got.length, 1);
+      const parsed = JSON.parse(got[0]!.raw);
+      assert.equal(parsed.events[0].record.body, "from the pipeline test");
+      const m = /t=(\d+),v1=(\w+)/.exec(got[0]!.sig)!;
+      const expected = (await import("node:crypto")).createHmac("sha256", shown).update(`${m[1]}.${got[0]!.raw}`).digest("hex");
+      assert.equal(m[2], expected, "the signature verifies with the secret from the dialog");
+      await shot("06h-pipelines");
+
+      // The delivery log, and a test event.
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=test]");
+      await toast("Test event delivered");
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=deliveries]");
+      await page.waitForSelector("#delivery-table");
+      const kinds = await page.locator("#delivery-table tbody tr td:nth-child(2)").allTextContents();
+      assert.deepEqual(kinds, ["Test", "Changes"]);
+      await page.click("dialog button[type=submit]");
+
+      // A failing destination shows as failing, with the reason on hover, and recovers.
+      answer = 500;
+      await t.sql(owner, ref, "insert into public.notes (body) values ('will fail first')");
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=run]");
+      await page.waitForFunction((r) => document.querySelector(`${r} .chip`)?.getAttribute("data-status") === "failing", row);
+      assert.match((await page.getAttribute(`${row} .chip`, "title"))!, /500/);
+      answer = 200;
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=run]");
+      await page.waitForFunction((r) => document.querySelector(`${r} .chip`)?.getAttribute("data-status") === "healthy", row);
+
+      // Pause, resume, rotate.
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=toggle]");
+      await page.waitForFunction((r) => document.querySelector(`${r} .chip`)?.getAttribute("data-status") === "paused", row);
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=toggle]");
+      await page.waitForFunction((r) => document.querySelector(`${r} .chip`)?.getAttribute("data-status") === "healthy", row);
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=rotate]");
+      await page.click("dialog button[type=submit]");
+      await page.waitForSelector("#verify-snippet");
+      await page.locator("dialog button:has-text('Reveal')").click();
+      assert.notEqual((await page.locator("dialog .kv code").first().textContent())!, shown);
+      await page.click("dialog button[type=submit]");
+
+      // Delete needs the name typed.
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=delete]");
+      await page.click("dialog button[type=submit]");
+      await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+      await page.fill("dialog input[name=typed]", "notes to my server");
+      await page.click("dialog button[type=submit]");
+      await page.waitForSelector("#pipeline-empty");
+    } finally {
+      hook.close();
+    }
+  });
+
+  step("shows what the project connects to and installs Postgres extensions", async () => {
+    await tab("integrations");
+    await page.waitForSelector(".service-card[data-service=pipelines]");
+    assert.deepEqual(await page.locator(".service-card strong").allTextContents(), ["Ask AI", "Pipelines", "Edge Functions", "Realtime", "Storage"]);
+    assert.match((await page.textContent(".service-card[data-service=pipelines]"))!, /None/);
+    await page.click(".service-card[data-service=pipelines]");
+    await page.waitForFunction(() => document.querySelector("#tab-body")?.getAttribute("data-page") === "database/pipelines");
+    await tab("integrations");
+    await page.waitForSelector(".ext-card[data-ext=pg_trgm]");
+    await shot("06i-integrations");
+    assert.match((await page.textContent(".ext-card[data-ext=pgcrypto]"))!, /Installed/);
+    assert.equal(await page.isDisabled(".ext-card[data-ext=pgcrypto] button"), true, "the platform's own extension cannot be removed");
+
+    await page.fill("#ext-search", "trigram");
+    assert.equal(await page.locator(".ext-card").count(), 1);
+    await page.click(".ext-card[data-ext=pg_trgm] [data-action=install]");
+    await toast("pg_trgm installed");
+    assert.match((await page.textContent(".ext-card[data-ext=pg_trgm]"))!, /Installed[\s\S]*extensions/);
+    assert.equal((await t.sql(owner, ref, "select extensions.similarity('abc', 'abd')")).status, 200);
+    await page.fill("#ext-search", "");
+    await page.selectOption("#ext-filter", "installed");
+    assert.equal(await page.locator(".ext-card[data-ext=pg_trgm]").count(), 1);
+    assert.equal(await page.locator(".ext-card:not(.on)").count(), 0);
+    await page.selectOption("#ext-filter", "all");
+
+    await page.fill("#ext-search", "pg_trgm");
+    await page.click(".ext-card[data-ext=pg_trgm] [data-action=remove]");
+    await page.click("dialog button[type=submit]");
+    await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+    await page.fill("dialog input[name=typed]", "pg_trgm");
+    await page.click("dialog button[type=submit]");
+    await toast("pg_trgm removed");
+    await page.waitForSelector(".ext-card[data-ext=pg_trgm] [data-action=install]");
+  });
+
   step("lists request logs and activity", async () => {
     await tab("logs");
     await page.waitForSelector("#request-log tbody tr");
@@ -858,9 +997,9 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     const overflow = () => p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     assert.ok((await overflow()) <= 1, `project list scrolls horizontally by ${await overflow()}px`);
     await p.screenshot({ path: join(SHOTS, "15-mobile.png"), fullPage: true });
-    for (const tabName of ["overview", "tables", "sql", "settings"]) {
+    for (const tabName of ["overview", "tables", "sql", "settings", "database/pipelines", "integrations", "advisors"]) {
       await p.goto(`http://127.0.0.1:${apiPort}/#/p/${ref}/${tabName}`);
-      await p.waitForFunction((n) => document.querySelector(`nav.rail a[data-tab=${n}]`)?.classList.contains("on") && !document.querySelector("#tab-body")?.textContent?.startsWith("Loading"), tabName);
+      await p.waitForFunction((n) => document.querySelector(`nav.rail a[data-tab=${n.split("/")[0]}]`)?.classList.contains("on") && !document.querySelector("#tab-body")?.textContent?.startsWith("Loading"), tabName);
       assert.ok((await overflow()) <= 1, `${tabName} scrolls horizontally by ${await overflow()}px`);
       if (tabName === "overview") await p.screenshot({ path: join(SHOTS, "16-mobile-overview.png"), fullPage: true });
     }

@@ -49,6 +49,8 @@ const ICONS = {
   chart: [["path", { d: "M4 20V10M10 20V4M16 20v-8M22 20H2" }]],
   panel: [["rect", { x: 3, y: 4, width: 18, height: 16, rx: 2 }], ["path", { d: "M9 4v16" }]],
   diamond: [["path", { d: "M12 3l9 9-9 9-9-9z" }], ["circle", { cx: 12, cy: 12, r: 2.5 }]],
+  grid: [["rect", { x: 4, y: 4, width: 7, height: 7, rx: 1 }], ["rect", { x: 13, y: 4, width: 7, height: 7, rx: 1 }], ["rect", { x: 4, y: 13, width: 7, height: 7, rx: 1 }], ["rect", { x: 13, y: 13, width: 7, height: 7, rx: 1 }]],
+  send: [["path", { d: "M4 12l16-8-6 16-3-7z" }]],
   copy: [["rect", { x: 9, y: 9, width: 11, height: 11, rx: 2 }], ["path", { d: "M5 15V6a2 2 0 012-2h9" }]],
   key: [["circle", { cx: 8, cy: 15, r: 4 }], ["path", { d: "M11 12l9-9M16 7l3 3" }]],
   book: [["path", { d: "M4 5a2 2 0 012-2h13v16H6a2 2 0 00-2 2z" }], ["path", { d: "M4 19V5M9 3v16" }]],
@@ -430,6 +432,7 @@ const NAV = [
   { divider: true },
   { id: "advisors", label: "Advisors", icon: "bulb" },
   { id: "reports", label: "Reports", icon: "chart" },
+  { id: "integrations", label: "Integrations", icon: "grid" },
   { id: "logs", label: "Logs", icon: "list" },
   { grow: true },
   { id: "settings", label: "Project settings", icon: "settings" },
@@ -438,7 +441,7 @@ const DB_MENU = [
   { title: "Database management", items: [["schema", "Schema Visualizer"], ["tables", "Tables"], ["functions", "Functions"], ["triggers", "Triggers"], ["enums", "Enumerated Types"], ["extensions", "Extensions"], ["indexes", "Indexes"], ["publications", "Publications"]] },
   { title: "Access control", items: [["policies", "Policies"], ["roles", "Roles"]] },
   { title: "Configuration", items: [["settings", "Settings", "settings"]] },
-  { title: "Platform", items: [["backups", "Backups"], ["migrations", "Migrations"]] },
+  { title: "Platform", items: [["pipelines", "Pipelines", null, true], ["backups", "Backups"], ["migrations", "Migrations"]] },
 ];
 const OLD_TABS = { backups: "database/backups" };
 
@@ -457,7 +460,7 @@ async function renderProject(ref, tab, page) {
     n.divider ? h("div", { class: "divider" }) : n.grow ? h("div", { class: "grow" })
       : h("a", { href: `#/p/${ref}/${n.id === "database" ? "database/schema" : n.id}`, class: n.id === tab ? "on" : "", "data-tab": n.id, title: n.label, "aria-label": n.label }, icon(n.icon, 19))));
   const sub = tab === "database" ? h("nav", { class: "sub", "aria-label": "Database" }, h("div", { class: "title" }, "Database"),
-    DB_MENU.map((g) => [h("div", { class: "group label" }, g.title), g.items.map(([id, label, tabId]) => h("a", { href: tabId ? `#/p/${ref}/${tabId}` : `#/p/${ref}/database/${id}`, class: !tabId && id === page ? "on" : "", "data-dbpage": id }, label))])) : null;
+    DB_MENU.map((g) => [h("div", { class: "group label" }, g.title), g.items.map(([id, label, tabId, isNew]) => h("a", { href: tabId ? `#/p/${ref}/${tabId}` : `#/p/${ref}/database/${id}`, class: !tabId && id === page ? "on" : "", "data-dbpage": id }, label, isNew ? h("span", { class: "new" }, "NEW") : null))])) : null;
   let hidden = false;
   try { hidden = localStorage.getItem("baas.sub.hidden") === "1"; } catch { /* ignore */ }
   const frame = h("div", { class: `frame ${sub ? "with-sub" : ""} ${sub && hidden ? "sub-hidden" : ""}` });
@@ -472,7 +475,7 @@ async function renderProject(ref, tab, page) {
     h("main", { class: "content" },
       p.status === "paused" && h("div", { class: "notice warn", id: "paused-note" }, "This project is paused: its API is offline. Resume it in Project settings."),
       body)].filter(Boolean));
-  const fn = { overview, tables, sql, ai, advisors, reports, auth, storage, functions, realtime, logs, settings }[tab];
+  const fn = { overview, tables, sql, ai, advisors, reports, integrations, auth, storage, functions, realtime, logs, settings }[tab];
   try {
     if (tab === "database") await dbPage(body, p, page);
     else await fn(body, p);
@@ -1421,6 +1424,7 @@ async function schemaVisualizer(body, p) {
 async function dbPage(body, p, page) {
   if (page === "backups") { await backups(body, p); return; }
   if (page === "schema") { await schemaVisualizer(body, p); return; }
+  if (page === "pipelines") { await pipelinesPage(body, p); return; }
   await listPage(body, p, DB_PAGES[page]);
 }
 
@@ -1516,6 +1520,162 @@ async function reports(body, p) {
   body.append(h("div", null, h("div", { class: "page-head" }, h("h1", null, "Reports"), range),
     h("p", { class: "muted pagehint" }, "Requests through this project's API, by service. Counted per hour; warnings are client errors (4xx) and errors are server errors (5xx)."), slot));
   await load();
+}
+
+// ---------- pipelines ----------
+const PIPELINE_STATUS = { healthy: "Healthy", failing: "Failing", paused: "Paused" };
+const hostOf = (u) => { try { const x = new URL(u); return `${x.host}${x.pathname === "/" ? "" : x.pathname}`; } catch { return u; } };
+
+async function pipelinesPage(body, p) {
+  const base = `/v1/projects/${p.ref}/pipelines`;
+  const slot = h("div", { id: "pipeline-slot" });
+  let rows = [];
+  const load = async () => { rows = await api("GET", base); draw(); };
+
+  const showSecret = (name, secret) => dialog("Signing secret", () => h("div", { class: "stack" },
+    h("p", null, `Copy the signing secret for “${name}” now. It is shown only once; if you lose it, rotate it.`),
+    h("div", { class: "kv" }, h("span", { class: "k" }, "Secret"), ...copyable(secret, { secret: true })),
+    h("h3", null, "Verify a delivery"),
+    h("pre", { id: "verify-snippet" }, 'const [t, v1] = req.headers["x-baas-signature"].match(/t=(\\d+),v1=(\\w+)/).slice(1);\nconst expected = crypto.createHmac("sha256", SECRET).update(`${t}.${rawBody}`).digest("hex");\nif (expected !== v1) throw new Error("bad signature");')), { confirmLabel: "Done" });
+
+  const editor = async (pl) => {
+    const tabs = (await api("GET", `/v1/projects/${p.ref}/tables`)).map((t) => t.name);
+    const name = h("input", { id: "pl-name", name: "name", placeholder: "e.g. orders to billing", value: pl ? pl.name : "", autocomplete: "off", required: true });
+    const url = h("input", { id: "pl-url", name: "url", type: "url", placeholder: "https://example.com/hooks/baas", value: pl ? pl.url : "", autocomplete: "off", required: true });
+    const tableBoxes = tabs.map((t) => h("label", { class: "check" }, h("input", { type: "checkbox", "data-table": t, checked: pl ? pl.tables.includes(t) : false }), h("span", { class: "mono" }, t)));
+    const eventBoxes = ["INSERT", "UPDATE", "DELETE"].map((e) => h("label", { class: "check" }, h("input", { type: "checkbox", "data-event": e, checked: pl ? pl.events.includes(e) : true }), e.charAt(0) + e.slice(1).toLowerCase() + "s"));
+    const rowsBox = h("input", { type: "checkbox", id: "pl-rows", checked: pl ? pl.include_rows : true });
+    const field = (label, el, hint) => h("div", { class: "form-row" }, h("label", null, label), h("div", null, el, hint ? h("p", { class: "muted hint" }, hint) : null));
+    return dialog(pl ? `Edit ${pl.name}` : "New pipeline", () => h("div", { class: "stack" },
+      field("Name", name),
+      field("Tables", tabs.length ? h("div", { class: "checks", id: "pl-tables" }, tableBoxes) : h("p", { class: "muted" }, "No tables yet. Create one first."), "Changes to these tables are sent. Only new changes: nothing already in the table is replayed."),
+      field("Events", h("div", { class: "checks", id: "pl-events" }, eventBoxes)),
+      field("Destination URL", url, "Must be reachable from this server. Addresses on private networks are refused unless the operator allows them."),
+      field("Row data", h("label", { class: "check" }, rowsBox, "Include the row in each event"), "Rows are read with full access, ignoring row-level security, and are the row as it is at delivery time. Turn this off to send only the primary key."),
+    ), {
+      sheet: true, confirmLabel: pl ? "Save pipeline" : "Create pipeline",
+      onSubmit: async () => {
+        const tablesSel = tableBoxes.map((l) => l.querySelector("input")).filter((i) => i.checked).map((i) => i.dataset.table);
+        const eventsSel = eventBoxes.map((l) => l.querySelector("input")).filter((i) => i.checked).map((i) => i.dataset.event);
+        if (!name.value.trim()) throw new Error("Give the pipeline a name.");
+        if (!tablesSel.length) throw new Error("Choose at least one table.");
+        if (!eventsSel.length) throw new Error("Choose at least one event.");
+        const payload = { name: name.value.trim(), tables: tablesSel, events: eventsSel, url: url.value.trim(), include_rows: rowsBox.checked };
+        return pl ? { saved: await api("PATCH", `${base}/${pl.id}`, payload) } : { created: await api("POST", base, payload) };
+      },
+    });
+  };
+
+  const deliveriesDialog = async (pl) => {
+    const log = await api("GET", `${base}/${pl.id}/deliveries`);
+    return dialog(`Deliveries for ${pl.name}`, () => log.length
+      ? h("div", { class: "tablewrap" }, h("table", { class: "data", id: "delivery-table" },
+        h("thead", null, h("tr", null, ["When", "Kind", "Result", "Events", "Time"].map((x) => h("th", null, x)))),
+        h("tbody", null, log.map((d) => h("tr", { "data-ok": String(d.ok) },
+          h("td", { title: fmtDate(d.at) }, ago(d.at)), h("td", null, d.kind === "test" ? "Test" : "Changes"),
+          h("td", { class: d.ok ? "ok" : "bad", title: d.error || "" }, d.ok ? `OK ${d.status}` : (d.error || "Failed")),
+          h("td", null, String(d.events)), h("td", null, `${d.ms} ms`))))))
+      : h("p", { class: "muted" }, "Nothing has been sent yet. Deliveries appear here after the first change or test event."), { confirmLabel: "Close" });
+  };
+
+  const act = async (fn, msg) => { try { const r = await fn(); if (msg) toast(msg, "ok"); await load(); return r; } catch (ex) { toast(ex.message, "bad"); await load().catch(() => {}); } };
+
+  const menuFor = (pl) => rowMenu([
+    ["View deliveries", () => deliveriesDialog(pl), { action: "deliveries" }],
+    ["Send test event", () => act(async () => { const r = await api("POST", `${base}/${pl.id}/test`); if (!r.ok) throw new Error(`Test failed: ${r.error || r.status}`); return r; }, "Test event delivered"), { action: "test" }],
+    ["Deliver pending changes now", () => act(() => api("POST", `${base}/${pl.id}/run`), "Checked for changes"), { action: "run" }],
+    [pl.enabled ? "Pause" : "Resume", () => act(() => api("PATCH", `${base}/${pl.id}`, { enabled: !pl.enabled }), pl.enabled ? "Pipeline paused" : "Pipeline resumed"), { action: "toggle" }],
+    ["Edit", async () => { const r = await editor(pl); if (r) { toast("Pipeline saved", "ok"); await load(); } }, { action: "edit" }],
+    ["Rotate secret", async () => {
+      if (!(await confirmBox("Rotate the signing secret?", "Deliveries are signed with the new secret straight away. Update your receiver first or right after, or it will reject them.", { danger: false, confirmLabel: "Rotate secret" }))) return;
+      try { const r = await api("POST", `${base}/${pl.id}/rotate-secret`); await showSecret(pl.name, r.secret); } catch (ex) { toast(ex.message, "bad"); }
+    }, { action: "rotate" }],
+    ["Delete", async () => {
+      if (!(await confirmBox("Delete pipeline", `Delete “${pl.name}”? Changes not yet delivered are dropped.`, { typed: pl.name, confirmLabel: "Delete pipeline" }))) return;
+      await act(() => api("DELETE", base + `/${pl.id}`), "Pipeline deleted");
+    }, { danger: true, action: "delete" }],
+  ]);
+
+  function draw() {
+    clear(slot);
+    if (!rows.length) {
+      slot.append(h("div", { class: "empty card", id: "pipeline-empty" }, h("strong", null, "No pipelines yet"),
+        h("p", { class: "muted" }, "A pipeline sends the changes to your tables (inserts, updates and deletes) to a URL you control, signed so you can trust them. Use it to keep another system in sync, or to react to changes.")));
+      return;
+    }
+    slot.append(h("div", { class: "tablewrap" }, h("table", { class: "data", id: "pipeline-table" },
+      h("thead", null, h("tr", null, ["Name", "Tables", "Destination", "Status", "Delivered", "Last delivery", ""].map((x) => h("th", null, x)))),
+      h("tbody", null, rows.map((pl) => h("tr", { "data-row": pl.name },
+        h("td", null, pl.name), h("td", { class: "mono-cell", title: pl.tables.join(", ") }, pl.tables.join(", ")), h("td", { class: "mono-cell", title: hostOf(pl.url) }, hostOf(pl.url)),
+        h("td", null, h("span", { class: `chip ${pl.status}`, "data-status": pl.status, title: pl.disabled_reason || pl.last_error || "" }, PIPELINE_STATUS[pl.status])),
+        h("td", { "data-delivered": String(pl.delivered) }, pl.delivered.toLocaleString()), h("td", { title: pl.last_error || "" }, pl.last_success_at ? ago(pl.last_success_at) : (pl.last_attempt_at ? `failed ${ago(pl.last_attempt_at)}` : "never")),
+        h("td", { class: "actions-cell" }, h("div", { class: "row" }, menuFor(pl)))))))));
+  }
+
+  clear(body);
+  body.append(h("div", null,
+    h("div", { class: "page-head" }, h("h1", null, "Pipelines"),
+      h("button", { class: "primary", id: "new-pipeline", onclick: async () => {
+        const r = await editor(null);
+        if (r?.created) { toast("Pipeline created", "ok"); await load(); await showSecret(r.created.name, r.created.secret); }
+      } }, icon("plus", 15), " New pipeline")),
+    h("p", { class: "muted pagehint" }, "Send row changes to a webhook. Delivery is at least once and in order, retried with a growing delay, and a pipeline pauses itself after repeated failures."),
+    slot));
+  await load();
+  const timer = setInterval(() => { if (!body.isConnected) return clearInterval(timer); load().catch(() => {}); }, 5000);
+}
+
+// ---------- integrations ----------
+async function integrations(body, p) {
+  const base = `/v1/projects/${p.ref}`;
+  const services = h("div", { class: "integ-grid", id: "integration-services" });
+  const extGrid = h("div", { class: "integ-grid", id: "extension-grid" });
+  const cards = [];
+  const add = (key, title, text, status, href) => services.append(h("a", { class: "integ-card service-card", href, "data-service": key },
+    h("div", { class: "row between" }, h("strong", null, title), status ? h("span", { class: `chip ${status.kind}` }, status.text) : null), h("p", { class: "muted" }, text)));
+  const [ai, pls, fns] = await Promise.all([api("GET", `${base}/ai`).catch(() => null), api("GET", `${base}/pipelines`).catch(() => null), api("GET", `${base}/functions`).catch(() => null)]);
+  add("ai", "Ask AI", "Ask questions about your data in plain language; changes are proposed, never run for you.", ai ? { kind: ai.enabled ? "healthy" : "paused", text: ai.enabled ? "On" : ai.available === false ? "Not configured" : "Off" } : null, `#/p/${p.ref}/ai`);
+  add("pipelines", "Pipelines", "Send row changes to a webhook, signed and retried.", pls ? { kind: pls.some((x) => x.status === "failing") ? "failing" : pls.length ? "healthy" : "paused", text: pls.length ? `${pls.length} active` : "None" } : null, `#/p/${p.ref}/database/pipelines`);
+  add("functions", "Edge Functions", "Run your own code next to your data, called over HTTPS.", fns ? { kind: fns.length ? "healthy" : "paused", text: fns.length ? `${fns.length} deployed` : "None" } : null, `#/p/${p.ref}/functions`);
+  add("realtime", "Realtime", "Stream row changes to browsers over a WebSocket, respecting row-level security.", null, `#/p/${p.ref}/realtime`);
+  add("storage", "Storage", "Files in buckets, with access rules and signed URLs.", null, `#/p/${p.ref}/storage`);
+
+  let exts = [], forbidden = null, q = "", show = "all";
+  const drawExt = () => {
+    clear(extGrid);
+    if (forbidden) { extGrid.append(h("div", { class: "notice warn" }, forbidden)); return; }
+    const list = exts.filter((e) => (!q || `${e.name} ${e.comment || ""}`.toLowerCase().includes(q.toLowerCase())) && (show === "all" || (show === "installed") === e.installed));
+    if (!list.length) { extGrid.append(h("div", { class: "empty" }, "No matching extensions.")); return; }
+    const rank = (e) => (e.installed ? 0 : e.installable ? 1 : 2);
+    list.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+    for (const e of list) {
+      const why = e.protected ? "Used by the platform" : !e.installable && !e.installed ? "Needs the server operator" : "";
+      const btn = e.installed
+        ? h("button", { class: "small", "data-action": "remove", disabled: e.protected, title: why, onclick: () => toggle(e, false) }, "Remove")
+        : h("button", { class: "small primary", "data-action": "install", disabled: !e.installable, title: why, onclick: () => toggle(e, true) }, "Install");
+      extGrid.append(h("div", { class: `integ-card ext-card ${e.installed ? "on" : ""} ${!e.installed && !e.installable ? "na" : ""}`, "data-ext": e.name },
+        h("div", { class: "row between" }, h("strong", { class: "mono" }, e.name), e.installed ? h("span", { class: "chip healthy" }, "Installed") : null),
+        h("p", { class: "muted" }, e.comment || "No description."),
+        h("div", { class: "row between" }, h("span", { class: "muted mono" }, `v${e.installed_version || e.version}${e.installed && e.schema ? ` · ${e.schema}` : ""}`), btn)));
+    }
+  };
+  const toggle = async (e, install) => {
+    if (!install && !(await confirmBox("Remove extension", `Remove ${e.name}? Anything that uses it will stop working.`, { typed: e.name, confirmLabel: "Remove extension" }))) return;
+    try { const r = await api("POST", `${base}/extensions`, { name: e.name, install }); Object.assign(e, r); toast(install ? `${e.name} installed` : `${e.name} removed`, "ok"); drawExt(); } catch (ex) { toast(ex.message, "bad"); }
+  };
+  try { exts = await api("GET", `${base}/extensions`); } catch (ex) { forbidden = /requires/.test(ex.message) ? "Installing extensions needs the admin role." : ex.message; }
+  drawExt();
+
+  clear(body);
+  body.append(h("div", { class: "stack-lg" },
+    h("div", null, h("div", { class: "page-head" }, h("h1", null, "Integrations")),
+      h("p", { class: "muted pagehint" }, "What this project connects to, and the Postgres extensions you can turn on."), h("h2", null, "Built in"), services),
+    h("div", null, h("h2", null, "Postgres extensions"),
+      h("p", { class: "muted pagehint" }, "Extensions install into the extensions schema, so call their functions as extensions.name(). Only extensions Postgres marks as safe for database owners can be installed here."),
+      h("div", { class: "toolbar" },
+        h("input", { id: "ext-search", placeholder: "Search extensions", "aria-label": "Search extensions", oninput: (e) => { q = e.target.value; drawExt(); } }),
+        h("select", { id: "ext-filter", "aria-label": "Show", onchange: (e) => { show = e.target.value; drawExt(); } }, [["all", "All"], ["installed", "Installed"], ["available", "Not installed"]].map(([v, l]) => h("option", { value: v }, l)))),
+      extGrid)));
 }
 
 // ---------- authentication ----------

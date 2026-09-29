@@ -35,7 +35,7 @@ Without Docker: `npm ci && npm run build`, set the variables in `.env.example`, 
 | **Storage** | Buckets and objects governed by RLS policies, signed URLs, public buckets, size/type/quota limits | `src/storage.ts` |
 | **Functions** | Your JavaScript in an isolated Node process with a timeout, memory cap and no filesystem/subprocess access | `src/functions.ts`, `src/sandbox.ts` |
 | **Ask AI** | Ask questions about your data in plain language; the assistant runs read-only SQL to answer and *proposes* changes for you to review and run | `src/ai/`, dashboard tab, `baas ask` |
-| **Dashboard** | Supabase-style workspace: project overview with live per-service request charts (`GET /v1/projects/:ref/metrics`), table and SQL editors, a Schema Visualizer with foreign-key lines, a Database section (tables, database functions, triggers, enums, extensions, indexes, policies, roles, backups, migrations), Ask AI, Advisors (security and performance checks), Reports, users, storage, edge functions, realtime inspector, logs, settings, project/organisation switchers and a Ctrl/⌘+K page switcher | `dashboard/` |
+| **Dashboard** | Supabase-style workspace: project overview with live per-service request charts (`GET /v1/projects/:ref/metrics`), table and SQL editors, a Schema Visualizer with foreign-key lines, a Database section (tables, database functions, triggers, enums, extensions, indexes, policies, roles, backups, migrations), Ask AI, Advisors (security and performance checks), Reports, Pipelines (signed webhook delivery of row changes), Integrations (Postgres extensions and connected services), users, storage, edge functions, realtime inspector, logs, settings, project/organisation switchers and a Ctrl/⌘+K page switcher | `dashboard/` |
 | **Ops** | Usage metering, plan quotas, idle auto-pause, `pg_dump` backups with integrity-checked restore, housekeeping | `src/usage.ts`, `src/backup.ts`, `src/platform.ts` |
 | **CLI** | `baas` — projects, SQL, checksummed atomic migrations, functions, backups | `src/cli.ts` |
 | **SDK** | `createClient(url, key)` shaped like supabase-js | `src/client.ts` |
@@ -164,3 +164,15 @@ Tests create and drop their own databases. Without `BAAS_TEST_PG_URL` the databa
 Rough numbers from `scripts/load.ts` on one small machine with Postgres and the platform side by side (32 connections): REST reads 7–9k req/s (p95 5–10 ms), inserts with an RLS check ~7k req/s, public file download ~7k req/s, password login ~130/s (scrypt-bound), function calls ~30/s (a fresh process each). Treat these as an order of magnitude, not a benchmark.
 
 See [PLAN.md](PLAN.md) for the architecture notes and how the build differs from the original plan.
+
+## Pipelines and extensions
+
+**Pipelines** send a project's row changes to a webhook (dashboard → Database → Pipelines, or `POST /v1/projects/:ref/pipelines`). Admins only.
+
+- Choose tables and events (insert, update, delete) and a URL. A pipeline starts from *now*; it does not replay existing rows.
+- Delivery is at least once and in order, one batch at a time. Failures are retried with a growing delay (up to 15 minutes) and a pipeline pauses itself after 30 in a row. Undelivered changes are kept for at most 24 hours.
+- Each request carries `X-Baas-Signature: t=<unix seconds>,v1=<hex>`, an HMAC-SHA256 of `"<t>.<body>"` with the signing secret shown once at creation (rotate it any time).
+- Rows are read with the platform's own access at delivery time: row-level security does not apply, and the row is the current one, not a snapshot. Turn off "include the row" to send only primary keys.
+- Destinations on private, loopback or link-local addresses are refused, and the connection is pinned to the address that was checked. Operators can allow them for development with `pipelines.allowPrivateTargets`.
+
+**Integrations → Postgres extensions** installs and removes extensions into the `extensions` schema. Only extensions Postgres marks as trusted (or that need no superuser) are offered; the rest need the server operator.
