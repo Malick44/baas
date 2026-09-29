@@ -35,6 +35,53 @@ const ident = (s) => /^[a-z_][a-z0-9_]{0,62}$/.test(s);
 const qi = (s) => `"${s}"`;
 const truncate = (s, n = 200) => (s.length > n ? s.slice(0, n) + "…" : s);
 
+// ---------- icons (inline SVG; no external files, so the CSP stays strict) ----------
+const SVGNS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs, ...children) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+  children.forEach((c) => c && el.append(c));
+  return el;
+}
+const ICONS = {
+  home: [["path", { d: "M3 11l9-8 9 8" }], ["path", { d: "M5 10v10h5v-6h4v6h5V10" }]],
+  table: [["rect", { x: 3, y: 4, width: 18, height: 16, rx: 2 }], ["path", { d: "M3 10h18M3 15h18M10 4v16" }]],
+  terminal: [["rect", { x: 3, y: 4, width: 18, height: 16, rx: 2 }], ["path", { d: "M7 9l3 3-3 3M13 15h4" }]],
+  database: [["ellipse", { cx: 12, cy: 5, rx: 8, ry: 3 }], ["path", { d: "M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" }]],
+  lock: [["rect", { x: 5, y: 11, width: 14, height: 10, rx: 2 }], ["path", { d: "M8 11V8a4 4 0 018 0v3" }]],
+  folder: [["path", { d: "M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2z" }]],
+  zap: [["path", { d: "M13 2L4 14h7l-1 8 9-12h-7z" }]],
+  radio: [["circle", { cx: 12, cy: 12, r: 2 }], ["path", { d: "M16.2 7.8a6 6 0 010 8.4M7.8 16.2a6 6 0 010-8.4M19 5a10 10 0 010 14M5 19a10 10 0 010-14" }]],
+  sparkles: [["path", { d: "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" }], ["path", { d: "M19 16l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z" }]],
+  list: [["path", { d: "M8 6h13M8 12h13M8 18h13" }], ["circle", { cx: 3.5, cy: 6, r: 1 }], ["circle", { cx: 3.5, cy: 12, r: 1 }], ["circle", { cx: 3.5, cy: 18, r: 1 }]],
+  settings: [["circle", { cx: 12, cy: 12, r: 3.5 }], ["path", { d: "M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1" }]],
+  plug: [["path", { d: "M9 2v6M15 2v6M6 8h12v4a6 6 0 01-12 0zM12 18v4" }]],
+  search: [["circle", { cx: 11, cy: 11, r: 7 }], ["path", { d: "M21 21l-4.5-4.5" }]],
+  chevrons: [["path", { d: "M8 9l4-4 4 4M8 15l4 4 4-4" }]],
+  chevron: [["path", { d: "M6 9l6 6 6-6" }]],
+  cpu: [["rect", { x: 6, y: 6, width: 12, height: 12, rx: 2 }], ["path", { d: "M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4" }]],
+  git: [["circle", { cx: 6, cy: 6, r: 2 }], ["circle", { cx: 6, cy: 18, r: 2 }], ["circle", { cx: 18, cy: 8, r: 2 }], ["path", { d: "M6 8v8M18 10c0 5-8 3-12 6" }]],
+  archive: [["rect", { x: 3, y: 4, width: 18, height: 5, rx: 1 }], ["path", { d: "M5 9v10a1 1 0 001 1h12a1 1 0 001-1V9M10 13h4" }]],
+  hard: [["rect", { x: 3, y: 5, width: 18, height: 14, rx: 2 }], ["path", { d: "M3 12h18M7 16h.01M11 16h.01" }]],
+  users: [["circle", { cx: 9, cy: 8, r: 3.5 }], ["path", { d: "M2.5 20c.5-3.5 3.2-5.5 6.5-5.5s6 2 6.5 5.5M16 4.5a3.5 3.5 0 010 7M18 14.8c2 .6 3.3 2.3 3.6 5.2" }]],
+  bolt: [["path", { d: "M13 3L5 13.5h6L10 21l9-11.5h-6z" }]],
+};
+function icon(name, size = 18) {
+  const svg = svgEl("svg", { viewBox: "0 0 24 24", width: size, height: size, fill: "none", stroke: "currentColor", "stroke-width": "1.75", "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true", focusable: "false" });
+  for (const [tag, attrs] of ICONS[name] || []) svg.append(svgEl(tag, attrs));
+  return svg;
+}
+function ago(d) {
+  if (!d) return "never";
+  const s = Math.max(0, (Date.now() - new Date(d).getTime()) / 1000);
+  const u = [[86400, "day"], [3600, "hour"], [60, "minute"]];
+  for (const [n, name] of u) if (s >= n) { const v = Math.floor(s / n); return `${v} ${name}${v === 1 ? "" : "s"} ago`; }
+  return "just now";
+}
+const pgLit = (s) => `'${String(s).replace(/'/g, "''")}'`;
+const schemaOk = (s) => /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(s);
+
+
 function toast(msg, kind = "") {
   const t = h("div", { class: `toast ${kind}`, role: "status" }, msg);
   document.getElementById("toasts").append(t);
@@ -127,18 +174,89 @@ function logout() {
   route();
 }
 
-// ---------- shell ----------
+// ---------- shell: top bar, icon rail, section sidebar ----------
+const LOGO = () => svgEl("svg", { viewBox: "0 0 24 24", width: 22, height: 22, fill: "currentColor", "aria-hidden": "true" }, svgEl("path", { d: "M13.4 2L4 13.6h6.2L9.4 22 20 9.6h-6.6z" }));
+
+function closeMenus() { document.querySelectorAll(".menu").forEach((m) => m.remove()); }
+document.addEventListener("click", (e) => { if (!e.target.closest(".menu, .avatar")) closeMenus(); });
+
+function appbar(project) {
+  const initials = (S.me?.organization.name || "?").slice(0, 2).toUpperCase();
+  const avatar = h("button", { class: "avatar", id: "avatar", "aria-label": "Account menu", title: "Account", onclick: (e) => {
+    e.stopPropagation();
+    if (document.querySelector(".menu")) return closeMenus();
+    document.body.append(h("div", { class: "menu", role: "menu" },
+      h("div", { class: "who", id: "who" }, h("div", null, S.me.organization.name), h("div", { class: "muted" }, `${S.me.role} · ${S.me.organization.slug}`)),
+      h("button", { role: "menuitem", onclick: () => { closeMenus(); location.hash = "#/projects"; } }, "All projects"),
+      h("button", { role: "menuitem", id: "signout", onclick: logout }, "Sign out")));
+  } }, initials);
+  const search = h("button", { class: "searchbox", id: "open-palette", title: "Search pages (Ctrl/⌘+K)", onclick: openPalette }, icon("search", 15), h("span", null, "Search…"), h("kbd", null, "⌘K"));
+  return h("header", { class: "appbar" },
+    h("a", { class: "logo", href: "#/projects", title: "All projects", "aria-label": "baas" }, LOGO()),
+    h("span", { class: "sep org" }, "/"),
+    h("a", { class: "crumb org", href: "#/projects" }, S.me?.organization.name || "", project && h("span", { class: "chip" }, project.plan), icon("chevrons", 14)),
+    project && [h("span", { class: "sep" }, "/"), h("a", { class: "crumb", href: `#/p/${project.ref}/overview`, id: "crumb-project" }, project.name, icon("chevrons", 14)), h("span", { class: `chip ${project.status}`, id: "project-status" }, project.status)],
+    project && h("button", { id: "connect-btn", onclick: () => connectDialog(project) }, icon("plug", 15), " Connect"),
+    h("span", { class: "spacer" }),
+    search, avatar);
+}
+
+/** Plain page: top bar plus a centred column (used for the project list and errors). */
 function shell(...content) {
-  const who = S.me ? `${S.me.organization.name} · ${S.me.role}` : "";
-  return h("div", null,
-    h("header", { class: "top" },
-      h("a", { class: "brand", href: "#/projects" }, "baas", h("b", null, "."), " dashboard"),
-      h("span", { class: "spacer" }),
-      h("span", { class: "who", id: "who" }, who),
-      h("button", { class: "ghost", onclick: logout }, "Sign out")),
-    h("main", null, content));
+  return h("div", null, appbar(null), h("main", { class: "plain" }, content));
 }
 const mount = (node) => { clear($app); $app.append(node); };
+
+async function connectDialog(p) {
+  const url = gwBase(p.ref);
+  await dialog("Connect to this project", () => h("div", { class: "stack" },
+    h("div", { class: "kv" },
+      h("span", { class: "k" }, "Project URL"), ...copyable(url),
+      h("span", { class: "k" }, "anon key"), ...copyable(S.keys.anon, { secret: true }),
+      h("span", { class: "k" }, "service_role key"), ...(S.keys.service_role ? copyable(S.keys.service_role, { secret: true }) : [h("span", { class: "muted" }, "Requires the admin role"), h("span")])),
+    h("h3", null, "Client"),
+    h("pre", null, `import { createClient } from "baas/client";\nconst baas = createClient("${url}", "<anon key>");\nawait baas.from("todos").select("*");`),
+    h("h3", null, "Environment"),
+    h("pre", null, `BAAS_URL=${url}\nBAAS_ANON_KEY=<anon key>`),
+    h("p", { class: "muted" }, "The service_role key bypasses row-level security. Keep it on servers only.")), { confirmLabel: "Close" });
+}
+
+// ---------- command palette ----------
+function pageIndex(ref) {
+  const out = [["Projects", "#/projects"]];
+  for (const n of NAV) if (n.id && n.id !== "database") out.push([n.label, `#/p/${ref}/${n.id}`]);
+  for (const g of DB_MENU) for (const [id, label] of g.items) out.push([`Database › ${label}`, `#/p/${ref}/database/${id}`]);
+  return out;
+}
+function openPalette() {
+  const ref = S.project?.ref;
+  const entries = ref ? pageIndex(ref) : [["Projects", "#/projects"]];
+  const input = h("input", { placeholder: "Jump to a page…", "aria-label": "Search pages", id: "palette-input", autocomplete: "off" });
+  const list = h("ul", { id: "palette-list" });
+  let shown = entries, at = 0;
+  const draw = () => {
+    clear(list);
+    shown.slice(0, 40).forEach(([label, hash], i) => list.append(h("li", null, h("button", { type: "button", class: i === at ? "on" : "", onclick: () => go(hash), "data-hash": hash }, label))));
+    if (!shown.length) list.append(h("li", { class: "empty" }, "No matching pages."));
+  };
+  let dlg;
+  const go = (hash) => { dlg.close(); location.hash = hash; };
+  input.addEventListener("input", () => { const q = input.value.toLowerCase(); shown = entries.filter(([l]) => l.toLowerCase().includes(q)); at = 0; draw(); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { at = Math.min(at + 1, Math.max(0, shown.length - 1)); draw(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { at = Math.max(at - 1, 0); draw(); e.preventDefault(); }
+    else if (e.key === "Enter" && shown[at]) { e.preventDefault(); go(shown[at][1]); }
+  });
+  dlg = h("dialog", { class: "palette" }, input, list);
+  dlg.addEventListener("close", () => dlg.remove());
+  document.body.append(dlg);
+  draw();
+  dlg.showModal();
+  input.focus();
+}
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k" && S.token && !document.querySelector("dialog[open]")) { e.preventDefault(); openPalette(); }
+});
 
 // ---------- login ----------
 function renderLogin() {
@@ -195,29 +313,54 @@ async function newProject() {
 }
 
 // ---------- project shell ----------
-const TABS = [
-  ["overview", "Overview"], ["tables", "Table editor"], ["sql", "SQL editor"], ["ai", "Ask AI"], ["auth", "Authentication"], ["storage", "Storage"],
-  ["functions", "Functions"], ["realtime", "Realtime"], ["logs", "Logs"], ["backups", "Backups"], ["settings", "Settings"],
+const NAV = [
+  { id: "overview", label: "Overview", icon: "home" },
+  { id: "tables", label: "Table editor", icon: "table" },
+  { id: "sql", label: "SQL editor", icon: "terminal" },
+  { id: "database", label: "Database", icon: "database" },
+  { divider: true },
+  { id: "auth", label: "Authentication", icon: "lock" },
+  { id: "storage", label: "Storage", icon: "folder" },
+  { id: "functions", label: "Edge Functions", icon: "zap" },
+  { id: "realtime", label: "Realtime", icon: "radio" },
+  { id: "ai", label: "Ask AI", icon: "sparkles" },
+  { divider: true },
+  { id: "logs", label: "Logs", icon: "list" },
+  { grow: true },
+  { id: "settings", label: "Project settings", icon: "settings" },
 ];
+const DB_MENU = [
+  { title: "Database management", items: [["tables", "Tables"], ["functions", "Functions"], ["triggers", "Triggers"], ["enums", "Enumerated Types"], ["extensions", "Extensions"], ["indexes", "Indexes"]] },
+  { title: "Access control", items: [["policies", "Policies"], ["roles", "Roles"]] },
+  { title: "Platform", items: [["backups", "Backups"], ["migrations", "Migrations"]] },
+];
+const OLD_TABS = { backups: "database/backups" };
 
-async function renderProject(ref, tab) {
+async function renderProject(ref, tab, page) {
+  if (OLD_TABS[tab]) { location.replace(`#/p/${ref}/${OLD_TABS[tab]}`); return; }
   if (!S.project || S.project.ref !== ref) {
     S.project = await api("GET", `/v1/projects/${ref}`);
     S.keys = await api("GET", `/v1/projects/${ref}/api-keys`);
     S.tables = null;
   }
   const p = S.project;
-  const body = h("div", { id: "tab-body" }, h("p", { class: "muted" }, "Loading…"));
-  mount(shell(
-    h("div", { class: "row between" },
-      h("div", null, h("a", { href: "#/projects", class: "muted" }, "← Projects"), h("h1", { id: "project-title" }, p.name, " ", h("span", { class: `badge ${p.status}`, id: "project-status" }, p.status)),
-        h("div", { class: "muted mono" }, p.ref))),
-    h("nav", { class: "tabs" }, TABS.map(([id, label]) => h("a", { href: `#/p/${ref}/${id}`, class: id === tab ? "on" : "", "data-tab": id }, label))),
-    p.status === "paused" && h("div", { class: "notice warn" }, "This project is paused: its API is offline. Resume it in Settings."),
-    body));
-  const fn = { overview, tables, sql, ai, auth, storage, functions, realtime, logs, backups, settings }[tab] || overview;
+  if (!NAV.some((n) => n.id === tab)) tab = "overview";
+  if (tab === "database" && !DB_MENU.some((g) => g.items.some(([id]) => id === page))) page = "tables";
+  const body = h("div", { id: "tab-body", "data-page": tab === "database" ? `database/${page}` : tab }, h("p", { class: "muted" }, "Loading…"));
+  const rail = h("nav", { class: "rail", "aria-label": "Project sections" }, NAV.map((n) =>
+    n.divider ? h("div", { class: "divider" }) : n.grow ? h("div", { class: "grow" })
+      : h("a", { href: `#/p/${ref}/${n.id === "database" ? "database/tables" : n.id}`, class: n.id === tab ? "on" : "", "data-tab": n.id, title: n.label, "aria-label": n.label }, icon(n.icon, 19))));
+  const sub = tab === "database" ? h("nav", { class: "sub", "aria-label": "Database" }, h("div", { class: "title" }, "Database"),
+    DB_MENU.map((g) => [h("div", { class: "group label" }, g.title), g.items.map(([id, label]) => h("a", { href: `#/p/${ref}/database/${id}`, class: id === page ? "on" : "", "data-dbpage": id }, label))])) : null;
+  mount(h("div", null, appbar(p),
+    h("div", { class: `frame ${sub ? "with-sub" : ""}` }, rail, sub,
+      h("main", { class: "content" },
+        p.status === "paused" && h("div", { class: "notice warn", id: "paused-note" }, "This project is paused: its API is offline. Resume it in Project settings."),
+        body))));
+  const fn = { overview, tables, sql, ai, auth, storage, functions, realtime, logs, settings }[tab];
   try {
-    await fn(body, p);
+    if (tab === "database") await dbPage(body, p, page);
+    else await fn(body, p);
   } catch (ex) {
     clear(body);
     body.append(h("div", { class: "notice bad" }, ex.message));
@@ -234,8 +377,8 @@ function copyable(value, { secret = false } = {}) {
   const code = h("code", { class: "mono" }, secret ? "•".repeat(24) : value);
   let shown = !secret;
   const controls = [];
-  if (secret) controls.push(h("button", { class: "small", onclick: (e) => { shown = !shown; code.textContent = shown ? value : "•".repeat(24); e.target.textContent = shown ? "Hide" : "Reveal"; } }, "Reveal"));
-  controls.push(h("button", { class: "small", onclick: async () => { await navigator.clipboard?.writeText(value).catch(() => {}); toast("Copied"); } }, "Copy"));
+  if (secret) controls.push(h("button", { class: "small", type: "button", onclick: (e) => { shown = !shown; code.textContent = shown ? value : "•".repeat(24); e.target.textContent = shown ? "Hide" : "Reveal"; } }, "Reveal"));
+  controls.push(h("button", { class: "small", type: "button", onclick: async () => { await navigator.clipboard?.writeText(value).catch(() => {}); toast("Copied"); } }, "Copy"));
   return [code, h("span", { class: "row" }, controls)];
 }
 
@@ -246,26 +389,92 @@ function meter(label, used, limit) {
   return h("div", { class: "meter" }, h("div", { class: "row between" }, h("span", null, label), h("span", { class: "muted" }, `${used.toLocaleString()} / ${limit.toLocaleString()}`)), h("div", { class: `bar ${pct > 90 ? "hot" : ""}` }, fill));
 }
 
+
+const SERVICE_LABELS = { rest: "REST API", auth: "Auth", storage: "Storage", functions: "Edge Functions", realtime: "Realtime" };
+
+/** A bar chart as inline SVG. Bars turn amber when a bucket had client errors and red when it had server errors. */
+function barChart(requests, warnings, errors) {
+  const n = requests.length;
+  const W = 240, H = 92, gap = n > 60 ? 0.5 : 1.5;
+  const bw = W / n - gap;
+  const max = Math.max(1, ...requests);
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", role: "img", "aria-label": `${requests.reduce((a, b) => a + b, 0)} requests` });
+  requests.forEach((v, i) => {
+    const hgt = v ? Math.max(3, (v / max) * (H - 4)) : 2;
+    svg.append(svgEl("rect", { x: i * (bw + gap), y: H - hgt, width: Math.max(bw, 0.6), height: hgt, rx: 1, class: !v ? "empty" : errors[i] ? "err" : warnings[i] ? "warn" : "ok" }));
+  });
+  return svg;
+}
+
+/** Sum consecutive hours into fewer buckets so a week of data stays readable. */
+function rebucket(m, size) {
+  if (size <= 1) return m;
+  const fold = (a) => Array.from({ length: Math.ceil(a.length / size) }, (_, i) => a.slice(i * size, (i + 1) * size).reduce((x, y) => x + y, 0));
+  return Object.fromEntries(Object.entries(m).map(([k, v]) => [k, { requests: fold(v.requests), warnings: fold(v.warnings), errors: fold(v.errors) }]));
+}
+
+function metricsView(data, hours) {
+  const services = rebucket(data.services, hours > 48 ? 3 : 1);
+  return h("div", { class: "metric-grid", id: "metric-grid" }, Object.entries(SERVICE_LABELS).map(([key, label]) => {
+    const m = services[key];
+    const sum = (a) => a.reduce((x, y) => x + y, 0);
+    return h("div", { class: "metric", "data-service": key },
+      h("div", { class: "head" },
+        h("div", null, h("div", { class: "label" }, label), h("div", { class: "total" }, sum(m.requests).toLocaleString())),
+        h("div", { class: "counts" }, h("span", null, "Warnings"), h("b", null, sum(m.warnings).toLocaleString()), h("span", null, "Errors"), h("b", null, sum(m.errors).toLocaleString()))),
+      barChart(m.requests, m.warnings, m.errors));
+  }));
+}
+
 async function overview(body, p) {
-  const [usage] = await Promise.all([api("GET", `/v1/projects/${p.ref}/usage`)]);
   const url = gwBase(p.ref);
-  const today = usage.daily[0] || { requests: 0, errors: 0, egress_bytes: 0 };
+  const canSql = S.me.role !== "developer";
+  const [usage, metrics, backupsList, facts] = await Promise.all([
+    api("GET", `/v1/projects/${p.ref}/usage`),
+    api("GET", `/v1/projects/${p.ref}/metrics?hours=24`),
+    api("GET", `/v1/projects/${p.ref}/backups`).catch(() => []),
+    canSql ? sqlRun(`select current_setting('server_version') as version,
+        (select count(*) from pg_stat_activity where datname = current_database())::int as conns,
+        (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p') and n.nspname = 'public')::int as tables,
+        (select name from baas_internal.migrations order by applied_at desc limit 1) as migration`).catch(() =>
+      sqlRun(`select current_setting('server_version') as version, (select count(*) from pg_stat_activity where datname = current_database())::int as conns,
+        (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p') and n.nspname = 'public')::int as tables, null::text as migration`)).catch(() => null) : null,
+  ]);
+  const f = facts ? Object.fromEntries(facts[0].fields.map((k, i) => [k, facts[0].rows[0][i]])) : null;
+  const lastBackup = backupsList.find((b) => b.status === "complete");
+  const stat = (ico, label, val, extra) => h("div", { class: "stat", "data-stat": label.toLowerCase() }, h("div", { class: "ico" }, icon(ico, 20)), h("div", null, h("div", { class: "label" }, label), h("div", { class: "val" }, val), extra));
+  const healthy = p.status === "active";
+  const range = h("select", { id: "metric-range", "aria-label": "Time range" }, h("option", { value: 24 }, "Last 24 hours"), h("option", { value: 168 }, "Last 7 days"));
+  const totals = h("div", { class: "metrics-head" });
+  const gridSlot = h("div", { id: "metric-slot" });
+  const drawMetrics = (m, hours) => {
+    clear(totals);
+    totals.append(
+      h("div", { class: "num", id: "total-requests" }, m.totals.requests.toLocaleString(), h("span", null, "Total Requests")),
+      h("div", { class: "num", id: "success-rate" }, m.totals.successRate === null ? "—" : `${m.totals.successRate.toFixed(1)}%`, h("span", null, "Success Rate")),
+      h("span", { class: "spacer" }), range);
+    clear(gridSlot);
+    gridSlot.append(metricsView(m, hours));
+  };
+  range.addEventListener("change", async () => { const hrs = Number(range.value); drawMetrics(await api("GET", `/v1/projects/${p.ref}/metrics?hours=${hrs}`), hrs); });
   clear(body);
-  body.append(h("div", { class: "stack" },
-    h("div", { class: "card" }, h("h3", null, "Connect"),
-      h("div", { class: "kv", id: "connect" },
-        h("span", { class: "k" }, "Project URL"), ...copyable(url),
-        h("span", { class: "k" }, "anon key"), ...copyable(S.keys.anon, { secret: true }),
-        h("span", { class: "k" }, "service_role key"), ...(S.keys.service_role ? copyable(S.keys.service_role, { secret: true }) : [h("span", { class: "muted" }, "Requires the admin role"), h("span")]))),
-    h("div", { class: "card" }, h("h3", null, "Use it"),
-      h("pre", null, `import { createClient } from "baas/client";\nconst baas = createClient("${url}", "<anon key>");\nawait baas.from("todos").select("*");`),
-      h("p", { class: "muted" }, "The service_role key bypasses row-level security. Keep it on servers only.")),
-    h("div", { class: "card stack", id: "usage" }, h("h3", null, `Usage · ${usage.plan} plan`),
-      meter("Requests today", Number(today.requests), usage.limits.requestsPerDay),
-      meter("Database size", Number(usage.current?.db_bytes || 0), usage.limits.dbBytes),
-      meter("Storage", Number(usage.current?.storage_bytes || 0), usage.limits.storageBytes),
-      h("p", { class: "muted" }, `${Number(today.errors)} server error${Number(today.errors) === 1 ? "" : "s"} · ${fmtBytes(today.egress_bytes)} sent today · ${usage.limits.rps} requests/second`),
-      usage.over_db_quota && h("div", { class: "notice bad" }, "The database is over its size limit: writes through the API are blocked until you delete data or upgrade."))));
+  body.append(h("div", null,
+    h("div", { class: "hero" }, h("h1", { id: "project-title" }, p.name),
+      h("div", { class: "urlrow" }, h("code", { class: "mono", id: "project-url" }, url), h("button", { class: "small", onclick: async () => { await navigator.clipboard?.writeText(url).catch(() => {}); toast("Copied"); } }, "Copy"))),
+    h("div", { class: "overview-top" },
+      h("div", { class: "stat-grid", id: "stat-grid" },
+        stat("hard", "Status", h("span", null, h("span", { class: "dots" }, h("i"), h("i"), h("i")), healthy ? "Healthy" : p.status)),
+        stat("cpu", "Requests today", `${Number(usage.daily[0]?.requests || 0).toLocaleString()} of ${usage.limits.requestsPerDay.toLocaleString()}`),
+        stat("database", "Database", `${fmtBytes(usage.current?.db_bytes || 0)} of ${fmtBytes(usage.limits.dbBytes)}`),
+        stat("folder", "Storage", `${fmtBytes(usage.current?.storage_bytes || 0)} of ${fmtBytes(usage.limits.storageBytes)}`),
+        stat("git", "Last migration", f?.migration || "None", !f?.migration && canSql ? h("div", { class: "muted" }, "baas db push") : null),
+        stat("archive", "Last backup", lastBackup ? ago(lastBackup.created_at) : "Never")),
+      h("div", { class: "arch", id: "arch" }, h("div", { class: "node" },
+        h("div", { class: "top" }, h("div", { class: "ico" }, icon("database", 18)), h("div", null, h("div", null, h("strong", null, "Primary Database")), h("div", { class: "muted" }, f ? `PostgreSQL ${f.version}` : "PostgreSQL"), h("div", { class: "muted mono" }, p.ref))),
+        h("div", { class: "foot" }, (f ? [`${f.tables} tables`, `${f.conns} conns`, fmtBytes(usage.current?.db_bytes || 0)] : [fmtBytes(usage.current?.db_bytes || 0)]).map((x) => h("span", null, x)))))),
+    usage.over_db_quota && h("div", { class: "notice bad" }, "The database is over its size limit: writes through the API are blocked until you delete data or upgrade."),
+    totals, gridSlot));
+  drawMetrics(metrics, 24);
 }
 
 // ---------- table editor ----------
@@ -465,7 +674,9 @@ function resultTable(r) {
 
 async function sql(body) {
   const hist = JSON.parse(sessionStorage.getItem("baas.sql.history") || "[]");
-  const editor = h("textarea", { class: "code editor", id: "sql-input", spellcheck: "false", placeholder: "select now();" }, hist[0] || "");
+  const prefill = sessionStorage.getItem("baas.sql.prefill");
+  sessionStorage.removeItem("baas.sql.prefill");
+  const editor = h("textarea", { class: "code editor", id: "sql-input", spellcheck: "false", placeholder: "select now();" }, prefill ?? (hist[0] || ""));
   const out = h("div", { class: "stack", id: "sql-output" });
   const run = async () => {
     const q = editor.value;
@@ -648,6 +859,177 @@ async function ai(body, p) {
     settings));
   drawIdentity();
   draw();
+}
+
+// ---------- database section ----------
+/** Run a catalog query and return rows as objects. Identifiers going into the SQL are validated first. */
+async function catalog(query) {
+  const [r] = await sqlRun(query);
+  return r.rows.map((row) => Object.fromEntries(r.fields.map((f, i) => [f, row[i]])));
+}
+function openInSql(text) { sessionStorage.setItem("baas.sql.prefill", text); location.hash = `#/p/${S.project.ref}/sql`; }
+const ROLE_NOTES = {
+  anon: "Requests with only the anon key", authenticated: "Requests carrying a signed-in user's token", service_role: "The service key; bypasses row-level security",
+  baas_ai_reader: "Ask AI in “everyone” mode; can read public tables, ignoring row-level security",
+};
+
+/** A searchable list page. `cfg.query(schema)` returns SQL; `cfg.cols` describe the columns; `cfg.actions(row, reload)` returns buttons. */
+async function listPage(body, p, cfg) {
+  const state = { schema: "public", q: "" };
+  let schemas = ["public"];
+  if (cfg.schemas !== false) schemas = (await catalog(`select nspname from pg_namespace where nspname !~ '^pg_' and nspname <> 'information_schema' order by (nspname = 'public') desc, nspname`)).map((r) => r.nspname);
+  const holder = h("div", { class: "tablewrap", id: "catalog-table" });
+  const note = h("p", { class: "muted pagehint" }, cfg.hint || "");
+  let rows = [];
+  const cellFor = (c, r) => {
+    const v = c.cell ? c.cell(r) : r[c.key];
+    const missing = v === null || v === undefined;
+    const text = missing ? "—" : v instanceof Node ? v : truncate(String(v), c.max || 80);
+    return h("td", { class: `${c.mono ? "mono-cell" : ""} ${missing ? "null" : ""}`, title: typeof v === "string" ? v.slice(0, 300) : "" }, text);
+  };
+  const draw = () => {
+    clear(holder);
+    const q = state.q.toLowerCase();
+    const shown = rows.filter((r) => !q || Object.values(r).some((v) => String(v ?? "").toLowerCase().includes(q)));
+    if (!shown.length) { holder.append(h("div", { class: "empty" }, rows.length ? "No matches." : cfg.empty)); return; }
+    const head = h("tr", null, cfg.cols.map((c) => h("th", null, c.label)), cfg.actions ? h("th") : null);
+    const bodyRows = shown.map((r) => {
+      const tr = h("tr", { "data-row": r.name ?? "" }, cfg.cols.map((c) => cellFor(c, r)));
+      if (cfg.actions) tr.append(h("td", null, h("div", { class: "row" }, cfg.actions(r, load))));
+      return tr;
+    });
+    holder.append(h("table", { class: "data" }, h("thead", null, head), h("tbody", null, bodyRows)));
+  };
+  const load = async () => {
+    try { rows = await catalog(cfg.query(state.schema, p)); draw(); }
+    catch (ex) { clear(holder); holder.append(h("div", { class: "empty" }, cfg.emptyOnError ? cfg.emptyOnError : ex.message)); }
+  };
+  const search = h("input", { id: "catalog-search", placeholder: cfg.searchPlaceholder || "Search", "aria-label": "Search", oninput: (e) => { state.q = e.target.value; draw(); } });
+  const schemaSel = cfg.schemas === false ? null : h("select", { id: "catalog-schema", "aria-label": "Schema", onchange: (e) => { state.schema = e.target.value; load(); } }, schemas.map((s) => h("option", { value: s }, `schema ${s}`)));
+  clear(body);
+  body.append(h("div", null,
+    h("div", { class: "page-head" }, h("h1", null, cfg.title), cfg.headAction ? cfg.headAction(load) : null),
+    cfg.hint && note,
+    h("div", { class: "toolbar" }, schemaSel, search),
+    holder));
+  await load();
+}
+
+const definitionDialog = (title, sqlText, extra) => dialog(title, () => h("div", { class: "stack" }, h("pre", { class: "sql" }, sqlText), extra), { confirmLabel: "Close" });
+
+const DB_PAGES = {
+  tables: {
+    title: "Tables", hint: "Tables, views and other relations in the schema. Use the Table editor to browse and edit rows.", searchPlaceholder: "Search for a table", empty: "No tables in this schema.",
+    query: (s) => `select c.relname as name, case c.relkind when 'r' then 'table' when 'p' then 'partitioned table' when 'v' then 'view' when 'm' then 'materialized view' when 'f' then 'foreign table' end as kind,
+      (select count(*) from pg_attribute a where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped)::int as columns, c.relrowsecurity as rls, greatest(c.reltuples, 0)::bigint as rows_estimate,
+      pg_size_pretty(pg_total_relation_size(c.oid)) as size, obj_description(c.oid) as comment
+      from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = ${pgLit(s)} and c.relkind in ('r','p','v','m','f') order by c.relname`,
+    cols: [{ key: "name", label: "Name" }, { key: "kind", label: "Type" }, { key: "columns", label: "Columns" }, { label: "RLS", cell: (r) => (r.rls ? "on" : h("span", { class: "warn" }, "off")) }, { key: "rows_estimate", label: "Rows (est.)" }, { key: "size", label: "Size" }, { key: "comment", label: "Comment", max: 60 }],
+    actions: (r) => [
+      h("button", { class: "small", onclick: async () => {
+        const schema = document.getElementById("catalog-schema")?.value || "public";
+        const cols = await catalog(`select a.attname as name, format_type(a.atttypid, a.atttypmod) as type, not a.attnotnull as nullable, pg_get_expr(d.adbin, d.adrelid) as default
+          from pg_attribute a left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum where a.attrelid = ${pgLit(`${schema}.${r.name}`)}::regclass and a.attnum > 0 and not a.attisdropped order by a.attnum`);
+        await dialog(`${schema}.${r.name}`, () => h("div", { class: "tablewrap" }, h("table", { class: "data" }, h("thead", null, h("tr", null, ["Column", "Type", "Nullable", "Default"].map((x) => h("th", null, x)))),
+          h("tbody", null, cols.map((c) => h("tr", null, h("td", null, c.name), h("td", { class: "mono-cell" }, c.type), h("td", null, c.nullable ? "yes" : "no"), h("td", { class: "mono-cell" }, c.default ?? "—")))))), { confirmLabel: "Close" });
+      } }, "Columns"),
+    ],
+  },
+  triggers: {
+    title: "Triggers", hint: "Functions that run automatically when rows change.", searchPlaceholder: "Search for a trigger", empty: "No triggers in this schema.",
+    query: (s) => `select t.tgname as name, c.relname as "table", p.proname as function, pg_get_triggerdef(t.oid) as definition, t.tgenabled <> 'D' as enabled
+      from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_namespace n on n.oid = c.relnamespace join pg_proc p on p.oid = t.tgfoid
+      where not t.tgisinternal and n.nspname = ${pgLit(s)} order by c.relname, t.tgname`,
+    cols: [{ key: "name", label: "Name" }, { key: "table", label: "Table" }, { key: "function", label: "Function" },
+      { label: "Events", cell: (r) => (/(?:BEFORE|AFTER|INSTEAD OF) ([A-Z ]+?) ON /.exec(r.definition)?.[1] || "").replace(/ OR /g, ", ") }, { label: "Enabled", cell: (r) => (r.enabled ? "yes" : "no") }],
+    actions: (r) => [h("button", { class: "small", onclick: () => definitionDialog(`Trigger ${r.name}`, r.definition) }, "Definition")],
+  },
+  enums: {
+    title: "Enumerated Types", hint: "Custom types with a fixed list of values.", searchPlaceholder: "Search for a type", empty: "No enumerated types in this schema.",
+    query: (s) => `select t.typname as name, (select string_agg(e.enumlabel, ', ' order by e.enumsortorder) from pg_enum e where e.enumtypid = t.oid) as "values"
+      from pg_type t join pg_namespace n on n.oid = t.typnamespace where t.typtype = 'e' and n.nspname = ${pgLit(s)} order by t.typname`,
+    cols: [{ key: "name", label: "Name" }, { key: "values", label: "Values", max: 120 }],
+  },
+  extensions: {
+    schemas: false, title: "Extensions", hint: "PostgreSQL extensions installed in this database. Installing more is done by whoever runs the server.", searchPlaceholder: "Search for an extension", empty: "No extensions.",
+    query: () => `select e.name, e.default_version as version, e.installed_version, e.comment from pg_available_extensions e order by (e.installed_version is null), e.name`,
+    cols: [{ key: "name", label: "Name" }, { label: "Status", cell: (r) => (r.installed_version ? h("span", { class: "ok" }, `enabled ${r.installed_version}`) : h("span", { class: "muted" }, "available")) }, { key: "comment", label: "Description", max: 90 }],
+  },
+  indexes: {
+    title: "Indexes", hint: "Indexes speed up lookups. Create one in the SQL editor.", searchPlaceholder: "Search for an index", empty: "No indexes in this schema.",
+    query: (s) => `select i.indexname as name, i.tablename as "table", i.indexdef as definition, pg_size_pretty(pg_relation_size((quote_ident(i.schemaname) || '.' || quote_ident(i.indexname))::regclass)) as size
+      from pg_indexes i where i.schemaname = ${pgLit(s)} order by i.tablename, i.indexname`,
+    cols: [{ key: "name", label: "Name" }, { key: "table", label: "Table" }, { key: "definition", label: "Definition", mono: true, max: 90 }, { key: "size", label: "Size" }],
+    actions: (r) => [h("button", { class: "small", onclick: () => definitionDialog(`Index ${r.name}`, r.definition) }, "Definition")],
+  },
+  policies: {
+    title: "Policies", hint: "Row-level security policies decide which rows each role can read or change. Tables with security on and no policy hide every row.", searchPlaceholder: "Search for a policy", empty: "No policies in this schema.",
+    headAction: () => h("button", { class: "primary", id: "new-policy", onclick: () => openInSql("create policy \"policy name\" on public.your_table\n  for select to authenticated\n  using ( auth.uid() = user_id );") }, "New policy"),
+    query: (s) => `select p.policyname as name, p.tablename as "table", p.cmd as command, array_to_string(p.roles, ', ') as roles, p.permissive, p.qual as "using", p.with_check as "check"
+      from pg_policies p where p.schemaname = ${pgLit(s)} order by p.tablename, p.policyname`,
+    cols: [{ key: "name", label: "Name" }, { key: "table", label: "Table" }, { key: "command", label: "Command" }, { key: "roles", label: "Roles" }, { key: "using", label: "Using", mono: true, max: 60 }, { key: "check", label: "With check", mono: true, max: 60 }],
+    actions: (r, reload) => [
+      h("button", { class: "small", onclick: () => definitionDialog(`Policy ${r.name}`, `create policy ${JSON.stringify(r.name)} on ${JSON.stringify(document.getElementById("catalog-schema").value)}.${JSON.stringify(r.table)}\n  as ${r.permissive.toLowerCase()} for ${r.command.toLowerCase()} to ${r.roles}${r.using ? `\n  using (${r.using})` : ""}${r.check ? `\n  with check (${r.check})` : ""};`) }, "Definition"),
+      h("button", { class: "small danger", "data-action": "drop-policy", onclick: async () => {
+        if (!(await confirmBox("Delete policy", `Delete “${r.name}” on ${r.table}? Access changes immediately.`, { confirmLabel: "Delete" }))) return;
+        try { await sqlRun(`drop policy ${JSON.stringify(r.name)} on ${JSON.stringify(document.getElementById("catalog-schema").value)}.${JSON.stringify(r.table)}`); toast("Policy deleted", "ok"); reload(); } catch (ex) { toast(ex.message, "bad"); }
+      } }, "Delete"),
+    ],
+  },
+  roles: {
+    schemas: false, title: "Roles", hint: "The database roles your API uses. Their privileges are granted per table; row-level security narrows them further.", searchPlaceholder: "Search for a role", empty: "No roles.",
+    query: (_s, p) => `select r.rolname as name, r.rolcanlogin as can_login, r.rolbypassrls as bypass_rls, r.rolconnlimit as connection_limit from pg_roles r
+      where r.rolname in ('anon', 'authenticated', 'service_role', 'baas_ai_reader') or r.rolname = ${pgLit(`authenticator_${p.ref}`)} order by r.rolname`,
+    cols: [{ key: "name", label: "Name" }, { label: "Used for", cell: (r) => ROLE_NOTES[r.name] || (r.name.startsWith("authenticator_") ? "This project's login role; switches to the roles above per request" : ""), max: 90 },
+      { label: "Can log in", cell: (r) => (r.can_login ? "yes" : "no") }, { label: "Bypasses RLS", cell: (r) => (r.bypass_rls ? h("span", { class: "warn" }, "yes") : "no") }, { label: "Connection limit", cell: (r) => (r.connection_limit < 0 ? "unlimited" : r.connection_limit) }],
+  },
+  migrations: {
+    schemas: false, title: "Migrations", hint: "Migrations applied with “baas db push”. Each ran in one transaction and its checksum is kept, so edits to applied files are refused.", searchPlaceholder: "Search migrations", empty: "No migrations applied yet. Put .sql files in baas/migrations and run “baas db push”.",
+    emptyOnError: "No migrations applied yet. Put .sql files in baas/migrations and run “baas db push”.",
+    query: () => `select name, applied_at, left(sha256, 12) as checksum from baas_internal.migrations order by name`,
+    cols: [{ key: "name", label: "Name" }, { label: "Applied", cell: (r) => fmtDate(r.applied_at) }, { key: "checksum", label: "Checksum", mono: true }],
+  },
+  functions: {
+    title: "Database Functions", hint: "Functions stored in the database (not Edge Functions). Call them from the API with rpc, or from policies and triggers.", searchPlaceholder: "Search for a function", empty: "No functions in this schema yet.",
+    headAction: (reload) => h("button", { class: "primary", id: "new-function", onclick: () => functionDialog(null, reload) }, "Create a new function"),
+    query: (s) => `select p.proname as name, pg_get_function_identity_arguments(p.oid) as arguments, pg_get_function_result(p.oid) as return_type, l.lanname as language,
+      p.prosecdef as security_definer, pg_get_functiondef(p.oid) as definition, n.nspname as schema
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace join pg_language l on l.oid = p.prolang
+      where n.nspname = ${pgLit(s)} and p.prokind = 'f' and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e') order by p.proname, p.oid`,
+    cols: [{ key: "name", label: "Name" }, { key: "arguments", label: "Arguments", mono: true, max: 50 }, { key: "return_type", label: "Return type", mono: true, max: 40 }, { key: "language", label: "Language" },
+      { label: "Security", cell: (r) => (r.security_definer ? h("span", { class: "warn", title: "Runs with its owner's privileges" }, "Definer") : "Invoker") }],
+    actions: (r, reload) => [
+      h("button", { class: "small", "data-action": "edit-function", onclick: () => functionDialog(r, reload) }, "Edit"),
+      h("button", { class: "small danger", "data-action": "drop-function", onclick: async () => {
+        if (!(await confirmBox("Delete function", `Delete ${r.schema}.${r.name}(${r.arguments})? Anything that calls it will fail.`, { typed: r.name, confirmLabel: "Delete function" }))) return;
+        try { await sqlRun(`drop function ${JSON.stringify(r.schema)}.${JSON.stringify(r.name)}(${r.arguments})`); toast("Function deleted", "ok"); reload(); } catch (ex) { toast(ex.message, "bad"); }
+      } }, "Delete"),
+    ],
+  },
+};
+
+const FUNCTION_TEMPLATE = `create or replace function public.hello_world()
+returns text
+language sql
+as $$
+  select 'Hello world';
+$$;`;
+
+/** Create or edit a database function by editing its SQL, so nothing about it is hidden behind a form. */
+async function functionDialog(fn, reload) {
+  const area = h("textarea", { class: "code editor", id: "function-sql", rows: 14, spellcheck: "false" }, fn ? fn.definition : FUNCTION_TEMPLATE);
+  const ok = await dialog(fn ? `Edit ${fn.name}` : "Create a new function", () => h("div", { class: "stack" },
+    h("p", { class: "muted" }, fn ? "Change the definition and save. It is applied with create or replace." : "Write the function as SQL. Functions run as the caller (security invoker) unless you say security definer."), area,
+    h("p", { class: "muted" }, "To call it from the API, grant execute to the roles that need it, for example: grant execute on function public.hello_world() to anon;")), {
+    confirmLabel: fn ? "Save function" : "Create function",
+    onSubmit: async () => { await sqlRun(area.value); return true; },
+  });
+  if (ok) { toast(fn ? "Function saved" : "Function created", "ok"); reload(); }
+}
+
+async function dbPage(body, p, page) {
+  if (page === "backups") { await backups(body, p); return; }
+  await listPage(body, p, DB_PAGES[page]);
 }
 
 // ---------- authentication ----------
@@ -919,9 +1301,9 @@ async function route() {
   if (!S.token) return renderLogin();
   if (!S.config) S.config = await fetch("/v1/config").then((r) => r.json());
   if (!S.me) S.me = await api("GET", "/v1/me");
-  const m = /^#\/p\/([a-z0-9]{20})\/([a-z]+)/.exec(location.hash);
+  const m = /^#\/p\/([a-z0-9]{20})\/([a-z]+)(?:\/([a-z]+))?/.exec(location.hash);
   try {
-    if (m) await renderProject(m[1], m[2]);
+    if (m) await renderProject(m[1], m[2], m[3]);
     else { S.project = null; await renderProjects(); }
   } catch (ex) {
     mount(shell(h("div", { class: "notice bad", id: "route-error" }, ex.message), h("p", null, h("a", { href: "#/projects" }, "Back to projects"))));

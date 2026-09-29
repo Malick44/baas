@@ -62,9 +62,14 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
 
   const shot = (name: string) => page.screenshot({ path: join(SHOTS, `${name}.png`), fullPage: true });
   const toast = (text: string | RegExp) => page.locator(".toast", { hasText: text }).first().waitFor({ timeout: 8000 });
-  const tab = async (id: string) => {
-    await page.click(`nav.tabs a[data-tab=${id}]`);
-    await page.waitForFunction((i) => document.querySelector(`nav.tabs a[data-tab=${i}]`)?.classList.contains("on") && !document.querySelector("#tab-body")?.textContent?.startsWith("Loading"), id);
+  /** Open a section the way a person would: rail icon, then the section sidebar for database pages. */
+  const tab = async (id: string, sub?: string) => {
+    const section = id === "backups" ? "database" : id;
+    const subPage = id === "backups" ? "backups" : sub;
+    await page.click(`nav.rail a[data-tab=${section}]`);
+    if (section === "database" && subPage) await page.click(`nav.sub a[data-dbpage=${subPage}]`);
+    const want = section === "database" ? `database/${subPage ?? "tables"}` : section;
+    await page.waitForFunction((w) => { const b = document.querySelector("#tab-body"); return b?.getAttribute("data-page") === w && !b.textContent?.startsWith("Loading"); }, want);
   };
   const rest = async (path: string, init: any = {}, key = anon) =>
     dnsFetch(`http://${ref}.localhost:${gwPort}${path}`, { ...init, headers: { apikey: key, ...(init.body ? { "content-type": "application/json" } : {}), ...(init.headers as object) } });
@@ -122,7 +127,11 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await page.click("#signin");
     await page.waitForSelector("#project-grid");
     await page.waitForSelector(".empty");
-    assert.match((await page.textContent("#who"))!, /e2e-org · owner/);
+    await page.click("#avatar");
+    assert.match((await page.textContent("#who"))!, /e2e-org\s*owner/);
+    await page.keyboard.press("Escape");
+    await page.click("h1, .empty"); // click away closes the menu
+    assert.equal(await page.locator(".menu").count(), 0);
     await shot("02-projects-empty");
   });
 
@@ -130,19 +139,26 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await page.click("#new-project");
     await page.fill("#project-name", "shop");
     await page.click("dialog button[type=submit]");
-    await page.waitForSelector("#connect");
+    await page.waitForSelector("#stat-grid");
     assert.equal((await page.textContent("#project-status"))!.trim(), "active");
+    assert.equal((await page.textContent("#project-title"))!.trim(), "shop");
     ref = /#\/p\/([a-z0-9]{20})\//.exec(page.url())![1]!;
     t.refs.push(ref);
-    // The connect card shows the project URL and reveals keys on demand.
-    const url = await page.textContent("#connect code");
-    assert.equal(url, `http://${ref}.localhost:${gwPort}`);
-    await page.locator("#connect button:has-text('Reveal')").first().click();
+    assert.equal(await page.textContent("#project-url"), `http://${ref}.localhost:${gwPort}`);
+    assert.match((await page.textContent("#stat-grid"))!, /Healthy/);
     const keys = (await t.api("GET", `/v1/projects/${ref}/api-keys`, { token: owner })).json;
     anon = keys.anon;
-    assert.match(await page.locator("#connect code").nth(1).textContent() ?? "", /^eyJ/);
+    // The Connect dialog shows the URL and reveals keys on demand.
+    await page.click("#connect-btn");
+    assert.equal(await page.locator("dialog .kv code").first().textContent(), `http://${ref}.localhost:${gwPort}`);
+    await page.locator("dialog button:has-text('Reveal')").first().click();
+    assert.match((await page.locator("dialog .kv code").nth(1).textContent()) ?? "", /^eyJ/);
+    await shot("03b-connect");
+    await page.click("dialog button:has-text('Close')");
     await shot("03-overview");
-    assert.match((await page.textContent("#usage"))!, /Usage · free plan/);
+    assert.match((await page.textContent("[data-stat=database]"))!, /of 500 MB/);
+    assert.match((await page.textContent("[data-stat='requests today']"))!, /of 50,000/);
+    assert.equal(await page.locator(".metric").count(), 5);
   });
 
   step("creates a table from the UI, with RLS on and API access granted", async () => {
@@ -213,6 +229,142 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     // Snippet menu fills the editor.
     await page.selectOption("select[aria-label=Snippets]", "Owner-only policy");
     assert.match(await page.inputValue("#sql-input"), /auth\.uid\(\)/);
+  });
+
+  step("explores the database section: tables, policies, roles, extensions, indexes and more", async () => {
+    await tab("database");
+    await page.waitForSelector("#catalog-table tr[data-row=notes]");
+    assert.match((await page.textContent("nav.sub"))!, /Database management[\s\S]*Tables[\s\S]*Functions[\s\S]*Triggers[\s\S]*Enumerated Types[\s\S]*Extensions[\s\S]*Indexes[\s\S]*Access control[\s\S]*Policies[\s\S]*Roles[\s\S]*Platform[\s\S]*Backups/);
+    assert.match((await page.textContent("tr[data-row=notes]"))!, /table\s*3\s*on/);
+    await shot("06d-db-tables");
+    await page.locator("tr[data-row=notes] button:has-text('Columns')").click();
+    const cols = (await page.textContent("dialog"))!;
+    assert.ok(/id\s*bigint/.test(cols) && /body\s*text/.test(cols) && /pinned\s*boolean/.test(cols));
+    await page.click("dialog button:has-text('Close')");
+    await page.fill("#catalog-search", "zzz");
+    assert.match((await page.textContent("#catalog-table"))!, /No matches/);
+    await page.fill("#catalog-search", "");
+    await page.selectOption("#catalog-schema", "auth");
+    await page.waitForSelector("tr[data-row=users]");
+    await page.selectOption("#catalog-schema", "public");
+
+    await tab("database", "policies");
+    await page.waitForSelector("tr[data-row='anyone reads']");
+    assert.match((await page.textContent("tr[data-row='anyone reads']"))!, /notes\s*SELECT\s*anon/);
+    await page.locator("tr[data-row='anyone reads'] button:has-text('Definition')").click();
+    assert.match((await page.textContent("dialog pre"))!, /create policy "anyone reads" on "public"\."notes"[\s\S]*to anon[\s\S]*using \(true\)/);
+    await page.click("dialog button:has-text('Close')");
+    await shot("06d-db-policies");
+
+    await tab("database", "roles");
+    for (const r of ["anon", "authenticated", "service_role"]) await page.waitForSelector(`tr[data-row=${r}]`);
+    assert.match((await page.textContent("tr[data-row=service_role]"))!, /yes/); // bypasses row-level security
+    assert.equal(await page.locator("#catalog-table tr[data-row^=authenticator_]").count(), 1, "only this project's own login role is listed");
+
+    await tab("database", "extensions");
+    await page.waitForSelector("tr[data-row=pgcrypto]");
+    assert.match((await page.textContent("tr[data-row=pgcrypto]"))!, /enabled/);
+    await tab("database", "indexes");
+    await page.waitForSelector("tr[data-row=notes_pkey]");
+    assert.match((await page.textContent("tr[data-row=notes_pkey]"))!, /CREATE UNIQUE INDEX/);
+    await tab("database", "triggers");
+    await page.waitForSelector("#catalog-table .empty");
+    assert.match((await page.textContent("#catalog-table"))!, /No triggers in this schema/);
+    await t.sql(owner, ref, "create type public.mood as enum ('sad', 'ok', 'happy')");
+    await tab("database", "enums");
+    await page.waitForSelector("tr[data-row=mood]");
+    assert.match((await page.textContent("tr[data-row=mood]"))!, /sad, ok, happy/);
+    await t.sql(owner, ref, "drop type public.mood");
+    await tab("database", "migrations");
+    await page.waitForSelector("#catalog-table .empty");
+    assert.match((await page.textContent("#catalog-table"))!, /No migrations applied yet/);
+  });
+
+  step("creates, edits, calls and deletes a database function", async () => {
+    await tab("database", "functions");
+    await page.waitForSelector("#catalog-table .empty");
+    await page.click("#new-function");
+    assert.match(await page.inputValue("#function-sql"), /hello_world/);
+    await page.fill("#function-sql", "create or replace function public.add_numbers(a int, b int) returns int language sql as $$ select a + b; $$;\ngrant execute on function public.add_numbers(int, int) to anon;");
+    await page.click("dialog button[type=submit]");
+    await toast("Function created");
+    await page.waitForSelector("tr[data-row=add_numbers]");
+    const row = (await page.textContent("tr[data-row=add_numbers]"))!;
+    assert.match(row, /a integer, b integer/);
+    assert.match(row, /integer/);
+    assert.match(row, /Invoker/);
+    await shot("06e-db-functions");
+    const call = async (a: number, b: number) => (await (await rest("/rest/v1/rpc/add_numbers", { method: "POST", body: JSON.stringify({ a, b }) })).json());
+    assert.equal(await call(2, 3), 5, "callable through the API");
+
+    // Editing applies create or replace, so grants survive.
+    await page.locator("tr[data-row=add_numbers] [data-action=edit-function]").click();
+    assert.match(await page.inputValue("#function-sql"), /select a \+ b/);
+    await page.fill("#function-sql", (await page.inputValue("#function-sql")).replace("select a + b", "select a * b"));
+    await page.click("dialog button[type=submit]");
+    await toast("Function saved");
+    assert.equal(await call(2, 3), 6);
+
+    // A mistake is reported in the dialog, which stays open, and changes nothing.
+    await page.locator("tr[data-row=add_numbers] [data-action=edit-function]").click();
+    await page.fill("#function-sql", "create or replace function public.add_numbers(a int, b int) returns int language sql as $$ select nope; $$;");
+    await page.click("dialog button[type=submit]");
+    await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+    assert.match((await page.textContent("dialog .notice.bad"))!, /nope/);
+    await page.click("dialog button:has-text('Cancel')");
+    assert.equal(await call(2, 3), 6);
+
+    // Security definer is called out.
+    await page.click("#new-function");
+    await page.fill("#function-sql", "create or replace function public.secret_sum() returns int language sql security definer as $$ select 42; $$;");
+    await page.click("dialog button[type=submit]");
+    await toast("Function created");
+    assert.match((await page.textContent("tr[data-row=secret_sum]"))!, /Definer/);
+
+    // Deleting needs the name typed.
+    await page.locator("tr[data-row=add_numbers] [data-action=drop-function]").click();
+    await page.click("dialog button[type=submit]");
+    await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+    await page.fill("dialog input[name=typed]", "add_numbers");
+    await page.click("dialog button[type=submit]");
+    await toast("Function deleted");
+    await page.waitForFunction(() => !document.querySelector("tr[data-row=add_numbers]"));
+    assert.equal((await rest("/rest/v1/rpc/add_numbers", { method: "POST", body: JSON.stringify({ a: 1, b: 1 }) })).status, 404);
+    await t.sql(owner, ref, "drop function public.secret_sum()");
+  });
+
+  step("jumps between pages with the command palette", async () => {
+    await page.keyboard.press("Control+k");
+    await page.waitForSelector("#palette-input");
+    await page.fill("#palette-input", "function");
+    const labels = await page.locator("#palette-list button").allTextContents();
+    assert.deepEqual(labels, ["Edge Functions", "Database › Functions"]);
+    await page.press("#palette-input", "ArrowDown");
+    await page.press("#palette-input", "Enter");
+    await page.waitForFunction(() => document.querySelector("#tab-body")?.getAttribute("data-page") === "database/functions");
+    await page.click("#open-palette");
+    await page.fill("#palette-input", "no such page");
+    assert.match((await page.textContent("#palette-list"))!, /No matching pages/);
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector("dialog.palette"));
+  });
+
+  step("shows live request charts per service on the overview", async () => {
+    await tab("overview");
+    await page.waitForSelector("#metric-grid");
+    const api = (await t.api("GET", `/v1/projects/${ref}/metrics`, { token: owner })).json;
+    const shown = Number(/^([\d,]+)/.exec((await page.textContent("#total-requests"))!)![1]!.replace(/,/g, ""));
+    assert.ok(shown > 0);
+    assert.equal(shown, api.totals.requests, "the dashboard shows the same total as the API");
+    assert.match((await page.textContent("#success-rate"))!, /^\d+(\.\d)?%\s*Success Rate/);
+    assert.deepEqual(await page.locator(".metric .label").allTextContents(), ["REST API", "Auth", "Storage", "Edge Functions", "Realtime"]);
+    assert.equal(await page.locator(".metric[data-service=rest] svg rect").count(), 24);
+    assert.ok(Number((await page.textContent(".metric[data-service=rest] .total"))!.replace(/,/g, "")) > 0);
+    await page.selectOption("#metric-range", "168");
+    await page.waitForFunction(() => document.querySelectorAll(".metric[data-service=rest] svg rect").length === 56);
+    await shot("03c-metrics");
+    await page.selectOption("#metric-range", "24");
+    await page.waitForFunction(() => document.querySelectorAll(".metric[data-service=rest] svg rect").length === 24);
   });
 
   step("asks the AI assistant in plain language; it answers, and can only propose changes", async () => {
@@ -319,7 +471,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     assert.match((await scoped.locator("[data-risk]").first().textContent())!, /^deletes rows$/);
     await scoped.locator("[data-action=run-proposal]").click();
     await page.click("dialog button[type=submit]");
-    await toast("Change applied");
+    await scoped.locator("text=/^Ran\./").waitFor();
     assert.deepEqual(await notes(), ["edited note"]);
 
     await ask("Tell me a joke");
@@ -435,7 +587,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await tab("logs");
     await page.waitForSelector("#request-log tbody tr");
     assert.match((await page.textContent("#request-log"))!, /\/rest\/v1\/notes/);
-    assert.match((await page.textContent("#audit-log"))!, /project\.create/);
+    assert.match((await page.textContent("#audit-log"))!, /project\.sql/);
     assert.match((await page.textContent("#audit-log"))!, /project\.sql/);
     await shot("11-logs");
   });
@@ -482,7 +634,8 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await toast("Plan updated");
     await shot("13-settings");
     await tab("overview");
-    assert.match((await page.textContent("#usage"))!, /Usage · pro plan/);
+    assert.equal((await page.locator("header.appbar .chip").first().textContent())!.trim(), "pro");
+    assert.match((await page.textContent("[data-stat='requests today']"))!, /of 5,000,000/);
   });
 
   step("pauses the project (API offline) and resumes it", async () => {
@@ -491,7 +644,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await page.click("dialog button[type=submit]");
     await page.waitForSelector("#resume-project");
     assert.equal((await page.textContent("#project-status"))!.trim(), "paused");
-    assert.match((await page.textContent(".notice.warn"))!, /paused/);
+    assert.match((await page.textContent("#paused-note"))!, /paused/);
     t.platform.dir.forget(ref);
     assert.equal((await rest("/rest/v1/notes")).status, 503);
     await shot("14-paused");
@@ -510,14 +663,18 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await p2.click("#signin");
     await p2.waitForSelector("#project-grid");
     assert.equal(await p2.isDisabled("#new-project"), true);
+    await p2.click("#avatar");
     assert.match((await p2.textContent("#who"))!, /developer/);
+    await p2.keyboard.press("Escape");
     await p2.click(".project-card");
-    await p2.waitForSelector("#connect");
-    assert.match((await p2.textContent("#connect"))!, /Requires the admin role/);
-    await p2.click("nav.tabs a[data-tab=ai]");
+    await p2.waitForSelector("#stat-grid");
+    await p2.click("#connect-btn");
+    assert.match((await p2.textContent("dialog"))!, /Requires the admin role/);
+    await p2.keyboard.press("Escape");
+    await p2.click("nav.rail a[data-tab=ai]");
     await p2.waitForSelector("#ai-off");
     assert.equal(await p2.isDisabled("#ai-enable"), true);
-    await p2.click("nav.tabs a[data-tab=sql]");
+    await p2.click("nav.rail a[data-tab=sql]");
     await p2.fill("#sql-input", "select 1");
     await p2.click("#run-sql");
     await p2.waitForSelector("#sql-error");
@@ -537,7 +694,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await p.screenshot({ path: join(SHOTS, "15-mobile.png"), fullPage: true });
     for (const tabName of ["overview", "tables", "sql", "settings"]) {
       await p.goto(`http://127.0.0.1:${apiPort}/#/p/${ref}/${tabName}`);
-      await p.waitForFunction((n) => document.querySelector(`nav.tabs a[data-tab=${n}]`)?.classList.contains("on") && !document.querySelector("#tab-body")?.textContent?.startsWith("Loading"), tabName);
+      await p.waitForFunction((n) => document.querySelector(`nav.rail a[data-tab=${n}]`)?.classList.contains("on") && !document.querySelector("#tab-body")?.textContent?.startsWith("Loading"), tabName);
       assert.ok((await overflow()) <= 1, `${tabName} scrolls horizontally by ${await overflow()}px`);
       if (tabName === "overview") await p.screenshot({ path: join(SHOTS, "16-mobile-overview.png"), fullPage: true });
     }
@@ -556,7 +713,8 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await page.waitForSelector(".empty");
     t.platform.dir.forget(ref); // the gateway caches project state for a couple of seconds
     assert.equal((await rest("/rest/v1/notes")).status, 404);
-    await page.click("text=Sign out");
+    await page.click("#avatar");
+    await page.click("#signout");
     await page.waitForSelector("#token");
   });
 });

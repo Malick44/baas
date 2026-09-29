@@ -177,6 +177,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
       const plan = planOf(project.plan);
       return { plan: project.plan, limits: plan, ...(await ops.usage!.report(ref, Number((req.query as Record<string, string>).days) || 30)) };
     });
+    app.get<{ Params: { ref: string } }>("/v1/projects/:ref/metrics", async (req) => ops.usage!.metrics((await owned(req)).ref, Number((req.query as Record<string, string>).hours) || 24));
     app.get<{ Params: { ref: string } }>("/v1/projects/:ref/logs", async (req) => ops.usage!.logsFor((await owned(req, "admin")).ref));
   }
 

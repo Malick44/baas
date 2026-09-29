@@ -110,6 +110,7 @@ export async function createPlatform(cfg: PlatformConfig) {
     await step("autoPaused", () => control.autoPauseIdle());
     await step("flushed", () => usage.flush());
     await step("measured", () => usage.measure());
+    await step("prunedHourly", () => usage.pruneHourly());
     await step("scheduledBackups", () => backups.runScheduled());
     return report;
   }

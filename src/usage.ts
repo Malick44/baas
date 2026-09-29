@@ -8,6 +8,15 @@ import type { StorageService } from "./storage.js";
 export type RequestLog = { at: string; method: string; path: string; status: number; ms: number };
 
 type Counter = { requests: number; errors: number; egress: number };
+export const SERVICES = ["rest", "auth", "storage", "functions", "realtime"] as const;
+export type Service = (typeof SERVICES)[number] | "other";
+type Bucket = { requests: number; clientErrors: number; serverErrors: number };
+
+/** Which part of the API a request path belongs to. */
+export function serviceOf(url: string): Service {
+  const m = /^\/(rest|auth|storage|functions|realtime)\//.exec(url);
+  return m ? (m[1] as Service) : "other";
+}
 
 /**
  * Per-project metering, quotas and rate limiting for the data plane.
@@ -16,6 +25,8 @@ type Counter = { requests: number; errors: number; egress: number };
  */
 export class UsageService {
   private pending = new Map<string, Counter>();
+  /** Keyed "ref|hourStartMs|service"; flushed with the daily counters. */
+  private hourly = new Map<string, Bucket>();
   private buckets = new Map<string, { tokens: number; at: number }>();
   private today = new Map<string, { at: number; requests: number }>();
   private overDb = new Set<string>();
@@ -88,6 +99,13 @@ export class UsageService {
     const c = this.counter(ref);
     c.egress += bytes;
     if (status >= 500) c.errors++;
+    const hour = Math.floor(this.now() / 3_600_000) * 3_600_000;
+    const key = `${ref}|${hour}|${serviceOf(req.url)}`;
+    const b = this.hourly.get(key) ?? { requests: 0, clientErrors: 0, serverErrors: 0 };
+    b.requests++;
+    if (status >= 500) b.serverErrors++;
+    else if (status >= 400) b.clientErrors++;
+    this.hourly.set(key, b);
     const list = this.logs.get(ref) ?? [];
     list.push({ at: new Date(this.now()).toISOString(), method: req.method, path: req.url.split("?")[0]!.slice(0, 200), status, ms });
     if (list.length > 200) list.shift();
@@ -99,8 +117,65 @@ export class UsageService {
     return [...(this.logs.get(ref) ?? [])].reverse();
   }
 
+  private async flushHourly(): Promise<void> {
+    const batch = [...this.hourly.entries()];
+    this.hourly = new Map();
+    for (const [key, b] of batch) {
+      const [ref, hour, service] = key.split("|") as [string, string, string];
+      try {
+        await this.control.pool.query(
+          `INSERT INTO usage_hourly (ref, hour, service, requests, client_errors, server_errors) VALUES ($1, to_timestamp($2::double precision / 1000), $3, $4, $5, $6)
+           ON CONFLICT (ref, hour, service) DO UPDATE SET requests = usage_hourly.requests + EXCLUDED.requests,
+             client_errors = usage_hourly.client_errors + EXCLUDED.client_errors, server_errors = usage_hourly.server_errors + EXCLUDED.server_errors`,
+          [ref, hour, service, b.requests, b.clientErrors, b.serverErrors],
+        );
+      } catch {
+        const back = this.hourly.get(key) ?? { requests: 0, clientErrors: 0, serverErrors: 0 };
+        back.requests += b.requests;
+        back.clientErrors += b.clientErrors;
+        back.serverErrors += b.serverErrors;
+        this.hourly.set(key, back); // try again on the next flush
+      }
+    }
+  }
+
+  /** Per-service request counts for each of the last `hours` hours (oldest first), for the overview charts. */
+  async metrics(ref: string, hours = 24) {
+    await this.flush();
+    const n = Math.min(Math.max(Math.floor(hours) || 24, 1), 168);
+    const end = Math.floor(this.now() / 3_600_000) * 3_600_000;
+    const start = end - (n - 1) * 3_600_000;
+    const rows = (await this.control.pool.query(
+      `SELECT (extract(epoch FROM hour) * 1000)::bigint AS h, service, requests, client_errors, server_errors FROM usage_hourly
+       WHERE ref = $1 AND hour >= to_timestamp($2::double precision / 1000)`,
+      [ref, start],
+    )).rows;
+    const stamps = Array.from({ length: n }, (_, i) => new Date(start + i * 3_600_000).toISOString());
+    const zeros = () => Array.from({ length: n }, () => 0);
+    const services = Object.fromEntries(SERVICES.map((s) => [s, { requests: zeros(), warnings: zeros(), errors: zeros() }])) as Record<string, { requests: number[]; warnings: number[]; errors: number[] }>;
+    let total = 0;
+    let bad = 0;
+    for (const r of rows) {
+      const i = Math.round((Number(r.h) - start) / 3_600_000);
+      const s = services[r.service];
+      if (!s || i < 0 || i >= n) continue;
+      s.requests[i]! += r.requests;
+      s.warnings[i]! += r.client_errors;
+      s.errors[i]! += r.server_errors;
+      total += r.requests;
+      bad += r.server_errors;
+    }
+    return { hours: stamps, services, totals: { requests: total, serverErrors: bad, successRate: total ? (100 * (total - bad)) / total : null } };
+  }
+
+  /** Drop hourly rows older than a week. */
+  async pruneHourly(): Promise<void> {
+    await this.control.pool.query(`DELETE FROM usage_hourly WHERE hour < now() - interval '8 days'`);
+  }
+
   /** Write buffered counters to the control database. */
   async flush(): Promise<void> {
+    await this.flushHourly();
     const batch = [...this.pending.entries()].filter(([, c]) => c.requests || c.errors || c.egress);
     this.pending = new Map([...this.pending.entries()].filter(([ref]) => !batch.some(([r]) => r === ref)).map(([k, v]) => [k, v]));
     for (const [ref, c] of batch) {

@@ -175,6 +175,39 @@ describe("platform ops", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
       assert.equal((await t.api("GET", `/v1/projects/${q.ref}/logs`, { token: dev })).status, 403);
     });
 
+    it("breaks requests down per service and hour, counting 4xx as warnings and 5xx as errors", async () => {
+      const q = await t.project(owner, "hourly");
+      await t.api("PATCH", `/v1/projects/${q.ref}`, { token: owner, body: { plan: "pro" } });
+      await t.api("PUT", `/v1/projects/${q.ref}/functions/boom`, { token: owner, body: { source: "export default () => { throw new Error('x'); }", verify_jwt: false } });
+      for (let i = 0; i < 3; i++) await t.gw(q.ref, "GET", "/rest/v1/", { key: q.anon }); // 200
+      await t.gw(q.ref, "GET", "/rest/v1/missing?select=id", { key: q.anon }); // 404: a warning
+      await t.gw(q.ref, "POST", "/auth/v1/signup", { key: q.anon, body: { email: "nope", password: "x" } }); // 422: a warning
+      await t.gw(q.ref, "GET", "/storage/v1/bucket", { key: q.anon }); // 403: a warning
+      await t.gw(q.ref, "POST", "/functions/v1/boom", {}); // 500: an error
+      const m = (await t.api("GET", `/v1/projects/${q.ref}/metrics`, { token: dev })).json;
+      const sum = (a: number[]) => a.reduce((x, y) => x + y, 0);
+      assert.equal(m.hours.length, 24);
+      assert.deepEqual(Object.keys(m.services), ["rest", "auth", "storage", "functions", "realtime"]);
+      assert.deepEqual([sum(m.services.rest.requests), sum(m.services.rest.warnings), sum(m.services.rest.errors)], [4, 1, 0]);
+      assert.deepEqual([sum(m.services.auth.requests), sum(m.services.auth.warnings)], [1, 1]);
+      assert.deepEqual([sum(m.services.storage.requests), sum(m.services.storage.warnings)], [1, 1]);
+      assert.deepEqual([sum(m.services.functions.requests), sum(m.services.functions.errors)], [1, 1]);
+      assert.equal(sum(m.services.realtime.requests), 0);
+      assert.equal(m.totals.requests, 7);
+      assert.equal(m.totals.serverErrors, 1);
+      assert.ok(Math.abs(m.totals.successRate - (100 * 6) / 7) < 1e-9);
+      // The newest hour is last, and the counts are stored, not just held in memory.
+      assert.ok(new Date(m.hours.at(-1)).getTime() > Date.now() - 3_600_000 && new Date(m.hours.at(-1)).getTime() <= Date.now());
+      assert.equal((await t.platform.pool.query(`SELECT sum(requests)::int AS n FROM usage_hourly WHERE ref = $1`, [q.ref])).rows[0].n, 7);
+      assert.equal((await t.api("GET", `/v1/projects/${q.ref}/metrics?hours=1000`, { token: dev })).json.hours.length, 168);
+      assert.equal((await t.api("GET", `/v1/projects/${q.ref}/metrics?hours=-5`, { token: dev })).json.hours.length, 1);
+      assert.equal((await t.api("GET", `/v1/projects/${q.ref}/metrics?hours=abc`, { token: dev })).json.hours.length, 24);
+      assert.equal((await t.api("GET", `/v1/projects/${q.ref}/metrics`, { token: await t.org() })).status, 404);
+      assert.equal((await t.api("GET", `/v1/projects/${q.ref}/metrics`, {})).status, 401);
+      const empty = (await t.api("GET", `/v1/projects/${(await t.project(owner, "quiet")).ref}/metrics`, { token: owner })).json;
+      assert.deepEqual([empty.totals.requests, empty.totals.successRate], [0, null]);
+    });
+
     it("keeps each project's counters and logs separate", async () => {
       const x = await t.project(owner, "sep-x");
       const y = await t.project(owner, "sep-y");

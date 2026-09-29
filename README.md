@@ -35,7 +35,7 @@ Without Docker: `npm ci && npm run build`, set the variables in `.env.example`, 
 | **Storage** | Buckets and objects governed by RLS policies, signed URLs, public buckets, size/type/quota limits | `src/storage.ts` |
 | **Functions** | Your JavaScript in an isolated Node process with a timeout, memory cap and no filesystem/subprocess access | `src/functions.ts`, `src/sandbox.ts` |
 | **Ask AI** | Ask questions about your data in plain language; the assistant runs read-only SQL to answer and *proposes* changes for you to review and run | `src/ai/`, dashboard tab, `baas ask` |
-| **Dashboard** | Projects, table editor, SQL editor, Ask AI, users, storage, functions, realtime inspector, logs, backups, settings | `dashboard/` |
+| **Dashboard** | Supabase-style workspace: project overview with live per-service request charts (`GET /v1/projects/:ref/metrics`), table and SQL editors, a Database section (tables, database functions, triggers, enums, extensions, indexes, policies, roles, backups, migrations), Ask AI, users, storage, edge functions, realtime inspector, logs, settings, and a Ctrl/⌘+K page switcher | `dashboard/` |
 | **Ops** | Usage metering, plan quotas, idle auto-pause, `pg_dump` backups with integrity-checked restore, housekeeping | `src/usage.ts`, `src/backup.ts`, `src/platform.ts` |
 | **CLI** | `baas` — projects, SQL, checksummed atomic migrations, functions, backups | `src/cli.ts` |
 | **SDK** | `createClient(url, key)` shaped like supabase-js | `src/client.ts` |
