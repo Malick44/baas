@@ -227,3 +227,6 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; }
   .hero h1 { font-size: 26px; }
   .stat-grid { grid-template-columns: minmax(0, 1fr); }
 }
+
+button.linkish { border: 0; background: transparent; padding: 0; color: var(--text); font: inherit; font-weight: 500; cursor: pointer; }
+button.linkish:hover { color: var(--brand-text); text-decoration: underline; }

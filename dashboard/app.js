@@ -996,7 +996,9 @@ const DB_PAGES = {
       p.prosecdef as security_definer, pg_get_functiondef(p.oid) as definition, n.nspname as schema
       from pg_proc p join pg_namespace n on n.oid = p.pronamespace join pg_language l on l.oid = p.prolang
       where n.nspname = ${pgLit(s)} and p.prokind = 'f' and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e') order by p.proname, p.oid`,
-    cols: [{ key: "name", label: "Name" }, { key: "arguments", label: "Arguments", mono: true, max: 50 }, { key: "return_type", label: "Return type", mono: true, max: 40 }, { key: "language", label: "Language" },
+    cols: [{ label: "Name", cell: (r) => h("button", { class: "linkish", title: `Edit ${r.name}`, onclick: () => document.querySelector(`tr[data-row="${CSS.escape(r.name)}"] [data-action=edit-function]`)?.click() }, r.name) },
+      { label: "Type", cell: () => "Function" },
+      { label: "Arguments", mono: true, cell: (r) => r.arguments || "–" }, { key: "return_type", label: "Return type", mono: true, max: 40 },
       { label: "Security", cell: (r) => (r.security_definer ? h("span", { class: "warn", title: "Runs with its owner's privileges" }, "Definer") : "Invoker") }],
     actions: (r, reload) => [
       h("button", { class: "small", "data-action": "edit-function", onclick: () => functionDialog(r, reload) }, "Edit"),
