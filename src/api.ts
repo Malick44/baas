@@ -112,6 +112,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     return { p, project, ref: project.ref };
   };
 
+  app.get("/v1/me", async (req) => control.whoami(await principal(req)));
   app.get("/v1/plans", async () => Object.fromEntries(Object.entries(PLANS)));
 
   app.patch<{ Params: { ref: string } }>("/v1/projects/:ref", async (req) => {

@@ -79,6 +79,8 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
     if (err instanceof AuthError) return reply.code(err.status).send({ code: err.status, error_code: err.errorCode, msg: err.message });
     if (err instanceof HttpError) return reply.headers(err.headers ?? {}).code(err.status).send({ message: err.message });
     if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ message: err.message });
+    // Malformed input that reached the database (bad bytes, out-of-range values) is the caller's mistake, not ours.
+    if (/^22/.test((err as { code?: string }).code ?? "")) return reply.code(400).send({ message: "invalid input" });
     return reply.code(500).send({ message: "internal error" });
   });
 
@@ -88,6 +90,10 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
     if (req.url === "/healthz") return;
     const ref = refFromHost(req.headers.host, opts.domain);
     if (!ref) return reply.code(404).send({ message: "unknown host" });
+    // Two Host headers are ambiguous when a proxy sits in front, so refuse them instead of guessing.
+    let hosts = 0;
+    for (let i = 0; i < req.raw.rawHeaders.length; i += 2) if (req.raw.rawHeaders[i]!.toLowerCase() === "host") hosts++;
+    if (hosts > 1) return reply.code(400).send({ message: "multiple Host headers" });
     req.projectRef = ref;
     (req as unknown as { t0: number }).t0 = Date.now();
   });

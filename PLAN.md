@@ -1,59 +1,55 @@
-# baas — self-hosted Supabase-style platform, multi-project
+# baas — design notes and status
 
-One control plane provisions many isolated projects on shared infrastructure.
+Self-hosted, multi-project Supabase-style platform. All six phases of the original plan are implemented; this file records the design and where the build departs from the plan. Usage and limitations are in [README.md](README.md).
 
 ## Decisions
 
-- **Language:** TypeScript for the control plane, gateway and dashboard. Data-plane services are the open-source Supabase components (PostgREST, GoTrue/auth, Realtime, Storage-api, postgres-meta, edge-runtime), not rewritten.
-- **Deployment:** Docker Compose on a single host for v1.
-- **v1 scope:** Auth, REST, Dashboard, Realtime, Storage and Functions, all from the start.
-- **Isolation:** database-per-project on a shared Postgres cluster (own DB, roles, JWT secret per project). Assumed; revisit if a project needs its own cluster.
+- **TypeScript** control plane, gateway, data-plane services and CLI/SDK; **Docker Compose** on one host.
+- **Database-per-project** on a shared Postgres: own database, own login role (connection-limited, with server-side timeouts), own JWT secret.
+- **All of Auth, REST, Realtime, Storage, Functions and the dashboard in v1.**
+
+## Where the build differs from the plan
+
+| Plan | Built | Why |
+|---|---|---|
+| Reuse PostgREST, GoTrue, Realtime, Storage-api, edge-runtime | Wrote TypeScript, multi-tenant implementations of the API subsets that matter | The open-source services are single-tenant; running one set per project costs ~1 GB idle each, and per-request tenant routing was the plan's main risk. One process resolving the project per request avoids both. The cost is that these are subsets (see README limitations), not full re-implementations |
+| Next.js dashboard | Dependency-free SPA served by the API (`dashboard/`) | No build step, strict CSP (no inline script/style), easy to test in a browser |
+| MinIO for storage | Files on a volume, keyed by object id | Simpler; an S3 backend can sit behind `StorageService` later. Object names never touch the filesystem |
+| Deno edge functions | Node child process under the permission model | No Deno dependency. Network egress is **not** restricted (Node 22 limitation) |
+| WAL-based Realtime | Trigger → `realtime.changes` + `NOTIFY`, one `LISTEN` per project | Payload-size safe; lets each event be re-checked under the subscriber's role |
+| Supavisor pooling | One small `pg.Pool` per project, LRU-evicted | Enough for one node |
+| PITR | Not built | Logical backups only; documented |
 
 ## Architecture
 
 ```
-Dashboard (Next.js) ─► Management API (Fastify/TS) ─► Provisioner
-                                   │                     │ creates DB, roles, keys
-                              control-plane DB           ▼
-Client ─► Gateway (TS, host <ref>.domain + apikey) ─► per-project routing
-            ├─ /auth/v1      GoTrue        (project JWT secret + DB)
-            ├─ /rest/v1      PostgREST     (project DB, role switching)
-            ├─ /realtime/v1  Realtime      (project replication slot)
-            ├─ /storage/v1   Storage-api   (MinIO, bucket prefix per project)
-            └─ /functions/v1 edge-runtime  (per-project function dir)
-         Pooler (Supavisor/PgBouncer) in front of Postgres
+Dashboard / CLI / SDK ─► Management API (Fastify) ─► ControlPlane ─► control DB (orgs, tokens, projects, encrypted secrets, usage, backups, functions)
+                                                         │ provisioner: CREATE DATABASE, roles, schema, keys
+Client ─► Gateway (host <ref>.domain → project; apikey/JWT) ─► admit: rate limit + quota + metering
+             ├─ /rest/v1      REST        ┐
+             ├─ /auth/v1      Auth        │ PoolManager: one small pool per project,
+             ├─ /storage/v1   Storage     │ each request in a transaction: SET LOCAL ROLE + JWT claims (RLS)
+             ├─ /functions/v1 Functions   │
+             └─ /realtime/v1  Realtime    ┘ (WebSocket; per-project LISTEN feed)
+Housekeeping: reconcile stuck provisioning, purge deleted (+files, backups), idle pause, measure usage, scheduled backups
 ```
-
-Because the OSS services are single-tenant by default, v1 runs them **multi-tenant via config lookup**: the gateway resolves the project and injects the project's DB URL and JWT secret per request where the service supports it (Realtime, Supavisor, Storage are tenant-aware); for PostgREST and GoTrue a worker pool keyed by project is spawned by the provisioner and reaped when idle. This is the highest-risk area; Phase 0 validates it.
-
-## Control-plane data model
-
-`organizations`, `members`, `projects` (ref, org, status, db_name, plan), `project_secrets` (JWT secret, anon/service keys, DB password; encrypted with a master key), `project_settings`, `usage_events`, `audit_log`.
-
-## Provisioning (`POST /projects`)
-
-1. Insert project (`provisioning`), generate ref, JWT secret, anon and service_role JWTs.
-2. `CREATE DATABASE proj_<ref>` from a template with extensions (pgcrypto, pgvector, pg_graphql).
-3. Create roles `anon`, `authenticated`, `service_role`, `authenticator`; apply base schemas (`auth`, `storage`, `realtime`) and RLS.
-4. Register with gateway, pooler, replication slot/publication, storage bucket prefix, functions directory.
-5. Mark `active`. Every step idempotent; failure rolls back with no orphan DB.
-
-Also: pause/resume, soft delete + purge, backup/restore.
 
 ## Phases
 
-0. **Spike (1 wk):** stock Supabase compose, two projects on one Postgres; prove per-project routing for each service.
-1. **Control plane (2–3 wk):** metadata DB, Management API, provisioner, secrets vault.
-2. **Gateway + Auth + REST (2–3 wk):** host/apikey routing, per-project isolation tests.
-3. **Realtime, Storage, Functions (3 wk).**
-4. **Dashboard (3 wk):** project switcher, table + SQL editor, auth users, storage browser, functions, keys, logs.
-5. **Ops (2–3 wk):** metering, quotas, rate limits, backups/PITR, idle pause, migrations CLI.
-6. **Hardening:** cross-tenant fuzz suite, noisy-neighbour and load tests.
+| # | Scope | State |
+|---|---|---|
+| 0 | Per-project database, role, keys; isolation tests | done |
+| 1 | Control plane: orgs, tokens, lifecycle, encrypted secrets, audit log | done |
+| 2 | Gateway, REST, Auth, per-project routing and pools | done |
+| 3 | Realtime, Storage, Functions | done |
+| 4 | Dashboard | done, browser-tested (`npm run e2e`) |
+| 5 | Metering, quotas, rate limits, idle pause, backups/restore, CLI with migrations, SDK | done |
+| 6 | Hardening: cross-tenant attack suite, fuzzing, noisy neighbours, load test | done |
 
-## Risks
+## Things the tests found (kept as regression tests)
 
-Noisy neighbours (statement timeouts, connection caps per project); Realtime replication slots per project; JWT secret handling and rotation; Postgres/extension upgrades across many DBs; component licences and no Supabase branding.
+Concurrent provisioning race on shared roles; realtime handled `access_token` and `subscribe` out of order; SQL-editor users could not create schemas or storage policies; new tables were writable by `anon` (now secure by default); object names were percent-decoded twice (500 on `100%.txt`); duplicate `Host` headers were silently accepted; password hashing could starve other projects; and in the dashboard, integer-like object keys reordered the column-default menu, two `pattern` attributes were invalid regexes, and a long key overflowed its card.
 
-## Definition of done for v1
+## Open work
 
-Create two projects via the dashboard; each has working Auth, REST, Realtime, Storage and Functions; project A's keys and host cannot reach project B's data through any service; the isolation test suite passes in CI.
+Email delivery and OAuth; embedded resources in REST; enforcing `cors_origins`/`redirect_urls`; an egress-restricted function runner; PITR; multi-node (shard project databases across clusters, move request logs and rate-limit state to shared storage); per-user dashboard accounts.

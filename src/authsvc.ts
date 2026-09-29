@@ -43,7 +43,7 @@ export const publicUser = (u: UserRow) => ({
   id: u.id, aud: "authenticated", role: "authenticated", email: u.email,
   email_confirmed_at: u.email_confirmed_at, confirmed_at: u.email_confirmed_at, phone: "",
   last_sign_in_at: u.last_sign_in_at, app_metadata: u.raw_app_meta_data, user_metadata: u.raw_user_meta_data,
-  created_at: u.created_at, updated_at: u.updated_at,
+  created_at: u.created_at, updated_at: u.updated_at, banned_until: u.banned_until,
 });
 
 /** Failed-login limiter per project+email so one project's guessing cannot lock out another's users. */
@@ -64,7 +64,32 @@ class Attempts {
   }
 }
 
+/**
+ * scrypt runs on the shared libuv threadpool, so one project's login storm could delay everyone's file and DNS work.
+ * Bound how many password hashes may run at once per project and overall; excess callers are told to retry.
+ */
+class HashSlots {
+  private per = new Map<string, number>();
+  private total = 0;
+  constructor(private maxPerProject = 3, private maxTotal = 8) {}
+  async run<T>(ref: string, fn: () => Promise<T>): Promise<T> {
+    if ((this.per.get(ref) ?? 0) >= this.maxPerProject || this.total >= this.maxTotal)
+      throw new AuthError(429, "over_request_rate_limit", "Too many sign-in requests at once, retry shortly");
+    this.per.set(ref, (this.per.get(ref) ?? 0) + 1);
+    this.total++;
+    try {
+      return await fn();
+    } finally {
+      this.total--;
+      const n = (this.per.get(ref) ?? 1) - 1;
+      if (n <= 0) this.per.delete(ref);
+      else this.per.set(ref, n);
+    }
+  }
+}
+
 export class AuthService {
+  private slots = new HashSlots();
   private attempts = new Attempts();
   constructor(private pm: PoolManager) {}
 
@@ -106,7 +131,7 @@ export class AuthService {
   }
 
   private async insertUser(ref: string, email: string, password: string, meta: object, appMeta: object): Promise<UserRow> {
-    const hash = await hashPassword(password);
+    const hash = await this.slots.run(ref, () => hashPassword(password));
     try {
       return await this.db(ref, async (c) =>
         (await c.query<UserRow>(
@@ -127,7 +152,7 @@ export class AuthService {
     const key = `${ref}:${email}`;
     this.attempts.check(key);
     const user = await this.db(ref, async (c) => (await c.query<UserRow>(`SELECT * FROM auth.users WHERE email = $1`, [email])).rows[0]);
-    const ok = await verifyPassword(password, user?.encrypted_password ?? null); // constant work for unknown emails
+    const ok = await this.slots.run(ref, () => verifyPassword(password, user?.encrypted_password ?? null)); // constant work for unknown emails
     if (!user || !ok) {
       this.attempts.fail(key);
       throw new AuthError(400, "invalid_credentials", "Invalid login credentials");
@@ -186,7 +211,7 @@ export class AuthService {
     }
     if (body.password !== undefined) {
       const { password } = this.validate("a@b.co", body.password);
-      params.push(await hashPassword(password));
+      params.push(await this.slots.run(ref, () => hashPassword(password)));
       sets.push(`encrypted_password = $${params.length}`);
     }
     for (const [field, col] of [["data", "raw_user_meta_data"], ["user_metadata", "raw_user_meta_data"], ["app_metadata", "raw_app_meta_data"]] as const) {

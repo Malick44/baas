@@ -182,7 +182,8 @@ export class StorageService implements Mountable {
     const svcOnly = (ctx: ProjectCtx) => {
       if (ctx.who.role !== "service_role") throw new HttpError(403, "bucket management requires the service_role key");
     };
-    const nameOf = (req: FastifyRequest) => decodeURIComponent((req.params as { "*": string })["*"] ?? "");
+    // Fastify has already percent-decoded route parameters; decoding again would turn "100%25.txt" into a crash.
+    const nameOf = (req: FastifyRequest) => (req.params as { "*": string })["*"] ?? "";
     const bucketOf = (req: FastifyRequest) => (req.params as { bucket: string }).bucket;
 
     // buckets

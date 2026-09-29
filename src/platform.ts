@@ -32,8 +32,9 @@ export type PlatformConfig = {
   publicPort: number | null;
   purgeRetentionMs: number;
   dashboardDir?: string;
-  /** Directory of a stub to disable services in tests. */
   realtimeCheckMs?: number;
+  /** Server-side cap on any single data-plane query (default 20 s). Users cannot raise it with SET statement_timeout. */
+  queryTimeoutMs?: number;
 };
 
 export const defaultDashboardDir = fileURLToPath(new URL("../dashboard", import.meta.url));
@@ -48,7 +49,7 @@ export async function createPlatform(cfg: PlatformConfig) {
   const vault = new Vault(cfg.masterKey);
   const control = new ControlPlane(pool, cfg.pgAdminUrl, vault);
   const dir = new Directory(control);
-  const pm = new PoolManager(dir, cfg.pgAdminUrl);
+  const pm = new PoolManager(dir, cfg.pgAdminUrl, { maxPools: 100, perPool: 5, queryTimeoutMs: cfg.queryTimeoutMs });
 
   const storage = new StorageService(pm, {
     root: cfg.storageDir,

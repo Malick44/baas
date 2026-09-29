@@ -42,7 +42,7 @@ export class PoolManager {
   constructor(
     readonly dir: Directory,
     private adminUrl: string,
-    private opts = { maxPools: 100, perPool: 5 },
+    private opts: { maxPools: number; perPool: number; queryTimeoutMs?: number } = { maxPools: 100, perPool: 5 },
   ) {}
 
   async active(ref: string): Promise<Resolved & { secrets: NonNullable<Resolved["secrets"]> }> {
@@ -110,7 +110,7 @@ export class PoolManager {
       await c.query(`SET LOCAL ROLE ${ctx.role}`); // ctx.role is whitelisted above
       await c.query("SELECT set_config('request.jwt.claims', $1, true)", [JSON.stringify(ctx.claims)]);
       // A server-side watchdog: users may SET statement_timeout themselves, so the platform also cancels.
-      timer = setTimeout(() => void this.cancel(url, (c as unknown as { processID: number }).processID), ctx.timeoutMs ?? 20_000);
+      timer = setTimeout(() => void this.cancel(url, (c as unknown as { processID: number }).processID), ctx.timeoutMs ?? this.opts.queryTimeoutMs ?? 20_000);
       const out = await fn(c, project);
       await c.query("COMMIT");
       return out;

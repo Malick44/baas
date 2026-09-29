@@ -114,6 +114,21 @@ describe("storage", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     assert.ok(!files.some((f) => f.includes("tricky") || f.includes("passwd")));
   });
 
+  it("round-trips file names with percent signs, plus, hash, spaces and unicode", async () => {
+    const names = ["100%.txt", "100%25.txt", "a+b.txt", "c#d.txt", "sp ace/é 日本.txt", "q?x=1.txt", "semi;colon.txt"];
+    for (const n of names) {
+      const path = n.split("/").map(encodeURIComponent).join("/");
+      assert.equal((await up(a, `pub/${path}`, `content of ${n}`, { key: a.service })).status, 200, n);
+      assert.equal((await h.call(a, "GET", `/storage/v1/object/public/pub/${path}`, {})).text, `content of ${n}`, n);
+    }
+    const listed = (await h.call(a, "POST", "/storage/v1/object/list/pub", { key: a.service, body: { prefix: "", limit: 1000 } })).json.map((x: any) => x.name);
+    for (const top of ["100%.txt", "100%25.txt", "a+b.txt", "c#d.txt", "sp ace"]) assert.ok(listed.includes(top), top);
+    // Raw NUL and broken escapes are refused cleanly, never a 500.
+    assert.equal((await up(a, "pub/nul%00byte", "x", { key: a.service })).status, 400);
+    assert.ok([400, 404].includes((await h.call(a, "GET", "/storage/v1/object/public/pub/%E0%A4%A", {})).status));
+    await h.call(a, "DELETE", "/storage/v1/object/pub", { key: a.service, body: { prefixes: names } });
+  });
+
   it("serves public buckets without credentials and hides private ones", async () => {
     await up(a, "pub/hello.txt", "world", { key: a.service });
     const pub = await h.call(a, "GET", "/storage/v1/object/public/pub/hello.txt", {});

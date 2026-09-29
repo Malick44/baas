@@ -118,6 +118,11 @@ export class ControlPlane {
     return row ? { tokenId: row.id, orgId: row.org_id, role: row.role } : null;
   }
 
+  async whoami(p: Principal) {
+    const org = (await this.pool.query(`SELECT id, name, slug FROM organizations WHERE id = $1`, [p.orgId])).rows[0];
+    return { role: p.role, organization: org };
+  }
+
   // ---- projects ----
 
   async createProject(p: Principal, name: string): Promise<ProjectRow> {
