@@ -226,6 +226,13 @@ describe("realtime", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     await c.waitFor((m) => m.type === "error" && m.message === "invalid access token" && c.msgs.filter((x) => x.type === "error").length === 2);
   });
 
+  it("evaluates a subscribe sent immediately after an access_token with the new identity", async () => {
+    const c = await open(a, a.anon);
+    c.send({ type: "access_token", token: u1.access_token });
+    c.send({ type: "subscribe", ref: "fast", table: "msgs" }); // anon cannot read msgs; authenticated can
+    assert.equal((await c.waitFor((m) => m.ref === "fast")).type, "subscribed");
+  });
+
   it("survives garbage frames and enforces subscription limits", async () => {
     const c = await open(a, a.service);
     c.ws.send("{not json");

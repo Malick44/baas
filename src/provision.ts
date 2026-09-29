@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS storage.objects (
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (bucket_id, name)
 );
+-- Owned by service_role so project admins can write storage policies from the SQL editor.
+ALTER TABLE storage.buckets OWNER TO service_role;
+ALTER TABLE storage.objects OWNER TO service_role;
 ALTER TABLE storage.buckets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
 GRANT ALL ON storage.buckets TO service_role;
@@ -172,6 +175,8 @@ export async function provisionProject(adminUrl: string, ref?: string): Promise<
       await c.query(`CREATE DATABASE "${dbName}"`);
       await c.query(`REVOKE ALL ON DATABASE "${dbName}" FROM PUBLIC`);
       await c.query(`GRANT CONNECT ON DATABASE "${dbName}" TO "${user}"`);
+      // Lets project admins create schemas in their own database (per-database privilege; no effect elsewhere).
+      await c.query(`GRANT CREATE ON DATABASE "${dbName}" TO service_role`);
     });
 
     await withClient(urlFor(adminUrl, dbName), async (c) => {

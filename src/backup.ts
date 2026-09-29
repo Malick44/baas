@@ -145,6 +145,7 @@ export class BackupService {
       swapped = true;
       await admin.query(`REVOKE ALL ON DATABASE "${live}" FROM PUBLIC`);
       await admin.query(`GRANT CONNECT ON DATABASE "${live}" TO "authenticator_${ref}"`);
+      await admin.query(`GRANT CREATE ON DATABASE "${live}" TO service_role`);
       await admin.query(`DROP DATABASE "${old}" WITH (FORCE)`);
       await this.control.audit(p.tokenId, p.orgId, "backup.restore", ref, { id });
     } catch (err) {

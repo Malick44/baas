@@ -1,20 +1,47 @@
-# Phase 0: shared infrastructure. Services are added per PLAN.md phases.
+# Postgres (control plane database + every project's database) and the platform itself.
+# Required: POSTGRES_PASSWORD, BAAS_MASTER_KEY (openssl rand -hex 32), BAAS_BOOTSTRAP_TOKEN (openssl rand -hex 24).
+# Put them in a .env file next to this one. Keep BAAS_MASTER_KEY safe: without it project secrets cannot be decrypted.
 services:
   postgres:
-    image: supabase/postgres:15.8.1.060
+    image: postgres:15-bookworm
+    restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
-    command: postgres -c wal_level=logical -c max_replication_slots=64
+      POSTGRES_DB: baas_control
+    # Project databases are created and dropped constantly; keep connections generous.
+    command: postgres -c max_connections=500
     volumes: [pgdata:/var/lib/postgresql/data]
-    ports: ["5432:5432"]
-  minio:
-    image: minio/minio
-    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  baas:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
-    volumes: [miniodata:/data]
-    ports: ["9000:9000", "9001:9001"]
+      BAAS_CONTROL_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/baas_control
+      BAAS_PG_ADMIN_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
+      BAAS_MASTER_KEY: ${BAAS_MASTER_KEY:?set BAAS_MASTER_KEY}
+      BAAS_BOOTSTRAP_TOKEN: ${BAAS_BOOTSTRAP_TOKEN:?set BAAS_BOOTSTRAP_TOKEN}
+      # Projects are served at http://<ref>.${BAAS_GATEWAY_DOMAIN}:${GATEWAY_PORT}. Browsers resolve *.localhost on their own;
+      # for a real domain add a wildcard DNS record and terminate TLS in front (see README).
+      BAAS_GATEWAY_DOMAIN: ${BAAS_GATEWAY_DOMAIN:-localhost}
+      BAAS_PUBLIC_SCHEME: ${BAAS_PUBLIC_SCHEME:-http}
+      BAAS_PUBLIC_PORT: ${BAAS_PUBLIC_PORT:-8081}
+      GATEWAY_PORT: "8081"
+      PORT: "8080"
+    ports:
+      - "8080:8080"   # management API and dashboard
+      - "8081:8081"   # data plane: <ref>.localhost:8081
+    volumes:
+      - storage:/data/storage
+      - backups:/data/backups
+
 volumes:
   pgdata:
-  miniodata:
+  storage:
+  backups:

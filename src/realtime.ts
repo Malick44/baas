@@ -108,6 +108,9 @@ export class RealtimeHub implements Mountable {
     feed.conns.add(conn);
     if (feed.idleTimer) clearTimeout(feed.idleTimer);
     ws.on("pong", () => (conn.alive = true));
+    // Messages on one socket are handled strictly in order: a subscribe sent right after an access_token
+    // must be evaluated with the new identity.
+    let chain: Promise<void> = Promise.resolve();
     ws.on("message", (data, isBinary) => {
       conn.alive = true;
       if (isBinary) return this.send(conn, { type: "error", message: "binary frames are not supported" });
@@ -118,7 +121,7 @@ export class RealtimeHub implements Mountable {
       } catch {
         return this.send(conn, { type: "error", message: "invalid JSON" });
       }
-      this.onMessage(conn, feed, msg).catch(() => this.send(conn, { type: "error", ref: msg.ref, message: "internal error" }));
+      chain = chain.then(() => this.onMessage(conn, feed, msg)).catch(() => this.send(conn, { type: "error", ref: msg.ref, message: "internal error" }));
     });
     ws.on("close", () => {
       feed.conns.delete(conn);
