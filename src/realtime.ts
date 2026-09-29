@@ -263,7 +263,12 @@ export class RealtimeHub implements Mountable {
 
   private async prune(feed: Feed) {
     await this.pm
-      .withRole(feed.ref, { role: "service_role", claims: { role: "service_role" } }, (c) => c.query(`DELETE FROM realtime.changes WHERE at < now() - interval '2 minutes'`))
+      .withRole(feed.ref, { role: "service_role", claims: { role: "service_role" } }, async (c) => {
+        // Pipelines read the same log; keep what any of them still needs, but never more than a day.
+        const piped = (await c.query(`SELECT to_regclass('realtime.pipeline_cursors') IS NOT NULL AS yes`)).rows[0].yes;
+        if (!piped) return c.query(`DELETE FROM realtime.changes WHERE at < now() - interval '2 minutes'`);
+        return c.query(`DELETE FROM realtime.changes WHERE (at < now() - interval '2 minutes' AND id <= coalesce((SELECT min(cursor) FROM realtime.pipeline_cursors), 9223372036854775807)) OR at < now() - interval '24 hours'`);
+      })
       .catch(() => {});
   }
 

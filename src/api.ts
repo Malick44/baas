@@ -5,7 +5,9 @@ import type { ProjectAdmin } from "./admin-sql.js";
 import type { AiAssistant } from "./ai/assistant.js";
 import type { BackupService } from "./backup.js";
 import { ControlPlane, HttpError, type Principal, type ProjectRow, type Role } from "./control.js";
+import type { ExtensionService } from "./extensions.js";
 import type { FunctionService } from "./functions.js";
+import type { PipelineService } from "./pipelines.js";
 import { PLANS, planOf } from "./plans.js";
 import type { UsageService } from "./usage.js";
 
@@ -16,6 +18,8 @@ export type ApiOps = {
   backups?: BackupService;
   functions?: FunctionService;
   ai?: AiAssistant;
+  pipelines?: PipelineService;
+  extensions?: ExtensionService;
   /** Where the data plane listens, so clients can build <ref>.<domain> URLs. */
   gateway?: { domain: string; scheme: string; port: number | null };
   /** Directory holding the dashboard's static files. */
@@ -168,6 +172,33 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
       return ai.setAllowBypass(await principal(req), refParam(req), b.allowBypassRls);
     });
     app.get<{ Params: { ref: string } }>("/v1/projects/:ref/ai/users", async (req) => ai.listUsers(await principal(req), refParam(req), String((req.query as Record<string, string>).q ?? "")));
+  }
+
+  // ---- pipelines (row changes to a webhook) ----
+  if (ops.pipelines) {
+    const pl = ops.pipelines;
+    const idOf = (req: FastifyRequest) => (req.params as { id: string }).id;
+    app.get("/v1/projects/:ref/pipelines", async (req) => pl.list(await principal(req), refParam(req)));
+    app.post("/v1/projects/:ref/pipelines", async (req, reply) => reply.code(201).send(await pl.create(await principal(req), refParam(req), body(req))));
+    app.patch("/v1/projects/:ref/pipelines/:id", async (req) => pl.update(await principal(req), refParam(req), idOf(req), body(req)));
+    app.delete("/v1/projects/:ref/pipelines/:id", async (req, reply) => {
+      await pl.remove(await principal(req), refParam(req), idOf(req));
+      return reply.code(204).send();
+    });
+    app.post("/v1/projects/:ref/pipelines/:id/rotate-secret", async (req) => pl.rotateSecret(await principal(req), refParam(req), idOf(req)));
+    app.post("/v1/projects/:ref/pipelines/:id/test", async (req) => pl.test(await principal(req), refParam(req), idOf(req)));
+    app.post("/v1/projects/:ref/pipelines/:id/run", async (req) => pl.run(await principal(req), refParam(req), idOf(req)));
+    app.get("/v1/projects/:ref/pipelines/:id/deliveries", async (req) => pl.deliveries(await principal(req), refParam(req), idOf(req)));
+  }
+
+  // ---- postgres extensions ----
+  if (ops.extensions) {
+    const ex = ops.extensions;
+    app.get("/v1/projects/:ref/extensions", async (req) => ex.list(await principal(req), refParam(req)));
+    app.post("/v1/projects/:ref/extensions", async (req) => {
+      const b = body(req);
+      return ex.set(await principal(req), refParam(req), b.name, b.install);
+    });
   }
 
   // ---- usage and logs ----
