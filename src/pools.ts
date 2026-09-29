@@ -111,8 +111,10 @@ export class PoolManager {
     let broken = false;
     try {
       await c.query(ctx.readOnly ? "BEGIN READ ONLY" : "BEGIN");
-      await c.query(`SET LOCAL ROLE ${ctx.role}`); // ctx.role is whitelisted above
+      // Publish the caller's claims while still the project's login role, then drop to their role. The order matters:
+      // when the AI assistant is enabled, anon and authenticated may not call set_config, so SQL running as them cannot rewrite these claims.
       await c.query("SELECT set_config('request.jwt.claims', $1, true)", [JSON.stringify(ctx.claims)]);
+      await c.query(`SET LOCAL ROLE ${ctx.role}`); // ctx.role is whitelisted above
       // A server-side watchdog: users may SET statement_timeout themselves, so the platform also cancels.
       timer = setTimeout(() => void this.cancel(url, (c as unknown as { processID: number }).processID), ctx.timeoutMs ?? this.opts.queryTimeoutMs ?? 20_000);
       const out = await fn(c, project);

@@ -22,7 +22,10 @@ const USAGE = `baas <command>
   functions list | deploy <name> <file> [--no-verify-jwt] | delete <name> | logs <name>
   backups list | create [--note <text>] | restore <id>
   ai status | enable | disable             the plain-language SQL assistant (needs a server-side Anthropic key)
-  ask "<question>"                        ask about your data; changes are only ever proposed, never run
+  ai config --allow-bypass-rls true|false   let it ignore row-level security ("everyone" mode; owner only to allow)
+  ask "<question>" [--as anon|all] [--as-user <email>]
+                                          ask about your data; by default as an anonymous visitor with row-level security
+                                          applied. Changes are only ever proposed, never run
   usage
 
 Project: --ref <ref>, or BAAS_PROJECT, or the link made by "baas link".`;
@@ -236,18 +239,33 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         if (sub === "enable" || sub === "disable") {
           const st = await api("POST", `/v1/projects/${ref}/ai/${sub}`);
           io.out(`AI assistant ${st.enabled ? "enabled" : "disabled"}.${st.enabled ? `\n${st.notice}` : ""}`);
+        } else if (sub === "config") {
+          const v = String(flags["allow-bypass-rls"] ?? "");
+          if (v !== "true" && v !== "false") throw new CliError("usage: baas ai config --allow-bypass-rls true|false");
+          const st = await api("PUT", `/v1/projects/${ref}/ai/config`, { allowBypassRls: v === "true" });
+          io.out(`"Everyone" mode is ${st.allowBypassRls ? "allowed" : "not allowed"}; the assistant asks as ${st.defaultIdentity === "service" ? "everyone" : "an anonymous visitor"} by default.`);
         } else if (sub === "status" || sub === undefined) {
           const st = await api("GET", `/v1/projects/${ref}/ai`);
-          io.out(st.available ? `AI assistant: ${st.enabled ? "on" : "off"} (${st.model}), ${st.questionsToday}/${st.questionsPerDay} questions today` : "AI assistant: not configured on this server");
-        } else throw new CliError("usage: baas ai status | enable | disable");
+          io.out(st.available ? `AI assistant: ${st.enabled ? "on" : "off"} (${st.model}), ${st.questionsToday}/${st.questionsPerDay} questions today; row-level security ${st.allowBypassRls ? "can be ignored (everyone mode allowed)" : "always applies"}` : "AI assistant: not configured on this server");
+        } else throw new CliError("usage: baas ai status | enable | disable | config --allow-bypass-rls true|false");
         return 0;
       }
       case "ask": {
         const ref = await projectRef();
         const question = [sub, ...rest].filter(Boolean).join(" ");
         if (!question.trim()) throw new CliError('usage: baas ask "<question>"');
-        const r = await api("POST", `/v1/projects/${ref}/ai/ask`, { question });
-        io.out(r.answer);
+        let as: unknown;
+        if (typeof flags["as-user"] === "string") {
+          const who = flags["as-user"];
+          const users = (await api("GET", `/v1/projects/${ref}/ai/users?q=${encodeURIComponent(who)}`)) as Array<{ id: string; email: string }>;
+          const hit = users.find((u) => u.email.toLowerCase() === who.toLowerCase() || u.id === who);
+          if (!hit) throw new CliError(`no user matches "${who}"`);
+          as = { type: "user", userId: hit.id };
+        } else if (flags.as === "anon") as = { type: "anon" };
+        else if (flags.as === "all") as = { type: "service" };
+        else if (flags.as !== undefined) throw new CliError('--as must be "anon" or "all" (or use --as-user <email>)');
+        const r = await api("POST", `/v1/projects/${ref}/ai/ask`, { question, ...(as ? { as } : {}) });
+        io.out(`(answering as ${r.answeredAs.label})\n${r.answer}`);
         for (const st of r.steps.filter((x: any) => x.tool === "run_query")) io.out(`\n  ${st.ok ? "ran" : "failed"} (read-only): ${st.sql.replace(/\s+/g, " ")}${st.error ? `\n    ${st.error}` : ""}`);
         for (const pr of r.proposals) {
           io.out(`\nProposed change — NOT run.${pr.risk.destructive ? " DESTRUCTIVE:" : " It would:"} ${pr.risk.flags.join("; ")}`);

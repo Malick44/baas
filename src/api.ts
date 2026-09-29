@@ -160,8 +160,14 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     app.post<{ Params: { ref: string } }>("/v1/projects/:ref/ai/disable", async (req) => ai.setEnabled(await principal(req), refParam(req), false));
     app.post<{ Params: { ref: string } }>("/v1/projects/:ref/ai/ask", async (req) => {
       const b = body(req);
-      return ai.ask(await principal(req), refParam(req), b.question, b.history);
+      return ai.ask(await principal(req), refParam(req), b.question, b.history, b.as);
     });
+    app.put<{ Params: { ref: string } }>("/v1/projects/:ref/ai/config", async (req) => {
+      const b = body(req);
+      if (typeof b.allowBypassRls !== "boolean") throw new HttpError(400, "allowBypassRls must be true or false");
+      return ai.setAllowBypass(await principal(req), refParam(req), b.allowBypassRls);
+    });
+    app.get<{ Params: { ref: string } }>("/v1/projects/:ref/ai/users", async (req) => ai.listUsers(await principal(req), refParam(req), String((req.query as Record<string, string>).q ?? "")));
   }
 
   // ---- usage and logs ----

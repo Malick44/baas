@@ -493,7 +493,7 @@ async function sql(body) {
 
 // ---------- Ask AI ----------
 // Conversation state per project, kept while the page stays open.
-let AI = { ref: null, entries: [] };
+let AI = { ref: null, entries: [], as: null };
 
 function proposalCard(pr, entry) {
   const state = h("div", { class: "muted" });
@@ -540,6 +540,7 @@ function entryView(e) {
   else if (e.error) box.append(h("div", { class: "notice bad", "data-ai-error": "1" }, e.error));
   else {
     const r = e.result;
+    box.append(h("div", { class: "muted small-note", "data-answered-as": "1" }, `Answered as ${r.answeredAs.label}`));
     box.append(h("div", { class: "bubble ai", "data-answer": "1" }, r.answer));
     if (r.steps.length) box.append(h("div", { class: "steps" }, r.steps.filter((s) => s.tool === "run_query").length ? h("p", { class: "muted" }, "Queries the assistant ran (read-only):") : null, r.steps.filter((s) => s.tool === "run_query").map(stepView)));
     r.proposals.forEach((pr) => box.append(proposalCard(pr, e)));
@@ -548,8 +549,10 @@ function entryView(e) {
 }
 
 async function ai(body, p) {
-  if (AI.ref !== p.ref) AI = { ref: p.ref, entries: [] };
+  if (AI.ref !== p.ref) AI = { ref: p.ref, entries: [], as: null };
   const st = await api("GET", `/v1/projects/${p.ref}/ai`);
+  // Default identity follows the project's setting; "everyone" is only ever selectable while the owner allows it.
+  if (!AI.as || (AI.as.type === "service" && !st.allowBypassRls)) AI.as = { type: st.defaultIdentity };
   clear(body);
   if (!st.available) {
     body.append(h("div", { class: "notice", id: "ai-unavailable" }, "The assistant is not available: this server has no AI provider configured. The server operator can enable it by setting ANTHROPIC_API_KEY."));
@@ -560,8 +563,9 @@ async function ai(body, p) {
     body.append(h("div", { class: "card stack", id: "ai-off" },
       h("h2", null, "Ask questions about your data in plain language"),
       h("p", null, "The assistant writes and runs read-only SQL to answer, and can propose changes that you review and run yourself. It never changes anything on its own."),
+      h("p", null, "By default it sees your data the way an anonymous visitor would, with row-level security applied. You can ask as a specific user to check what they can see. Only a project owner can let it ignore row-level security."),
       h("div", { class: "notice warn", id: "ai-notice" }, st.notice),
-      h("p", { class: "muted" }, "It can read the tables in your public schema (including rows protected by row-level security, like the SQL editor), but not users, sessions, files or other internals."),
+      h("p", { class: "muted" }, "It can read only what the chosen identity may read through the API: tables your policies and grants expose to it, never users, sessions or other internals."),
       h("button", { class: "primary", id: "ai-enable", disabled: !canAdmin, title: canAdmin ? "" : "Requires the admin role", onclick: async () => {
         if (!(await confirmBox("Enable the AI assistant?", st.notice, { danger: false, confirmLabel: "Enable" }))) return;
         try { await api("POST", `/v1/projects/${p.ref}/ai/enable`); toast("AI assistant enabled", "ok"); ai(body, p); } catch (ex) { toast(ex.message, "bad"); }
@@ -569,6 +573,45 @@ async function ai(body, p) {
     return;
   }
   const list = h("div", { class: "chat", id: "ai-chat" });
+  const identityBar = h("div", { class: "row", id: "ai-identity" });
+  const drawIdentity = () => {
+    clear(identityBar);
+    const sel = h("select", { id: "ai-as", "aria-label": "Ask as" },
+      h("option", { value: "anon", selected: AI.as.type === "anon" }, "an anonymous visitor (public data only)"),
+      h("option", { value: "user", selected: AI.as.type === "user" }, "a specific user…"),
+      st.allowBypassRls && h("option", { value: "service", selected: AI.as.type === "service" }, "everyone — ignore row-level security"));
+    sel.addEventListener("change", () => { AI.as = sel.value === "user" ? { type: "user", userId: null, email: null } : { type: sel.value }; drawIdentity(); });
+    identityBar.append(h("span", { class: "muted" }, "Ask as"), sel);
+    if (AI.as.type === "user") {
+      if (AI.as.userId) identityBar.append(h("span", { class: "badge", id: "ai-user-chip" }, AI.as.email), h("button", { class: "small", onclick: () => { AI.as = { type: "user", userId: null, email: null }; drawIdentity(); } }, "Change"));
+      else {
+        const q = h("input", { id: "ai-user-q", placeholder: "search users by email", "aria-label": "Search users" });
+        const found = h("div", { class: "row", id: "ai-user-results" });
+        const search = async () => {
+          try {
+            const users = await api("GET", `/v1/projects/${p.ref}/ai/users?q=${encodeURIComponent(q.value)}`);
+            clear(found);
+            if (!users.length) found.append(h("span", { class: "muted" }, "No users match."));
+            users.forEach((u) => found.append(h("button", { class: "small", "data-user": u.email, onclick: () => { AI.as = { type: "user", userId: u.id, email: u.email }; drawIdentity(); } }, u.email)));
+          } catch (ex) { toast(ex.message, "bad"); }
+        };
+        q.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); search(); } });
+        identityBar.append(q, h("button", { id: "ai-user-search", onclick: search }, "Search"), found);
+      }
+    }
+  };
+  const isOwner = S.me.role === "owner";
+  const allow = h("input", { type: "checkbox", id: "ai-allow-bypass", checked: st.allowBypassRls, disabled: (st.allowBypassRls ? !canAdmin : !isOwner) });
+  allow.addEventListener("change", async () => {
+    const want = allow.checked;
+    if (want && !(await confirmBox("Let the assistant ignore row-level security?", "In “everyone” mode the assistant can read every row in your public tables, including rows your policies hide from users, and those rows can be sent to Anthropic. Only turn this on if that is acceptable for this project's data.", { danger: true, confirmLabel: "Allow" }))) { allow.checked = false; return; }
+    try { await api("PUT", `/v1/projects/${p.ref}/ai/config`, { allowBypassRls: want }); toast(want ? "Everyone mode allowed" : "Everyone mode turned off", "ok"); ai(body, p); } catch (ex) { allow.checked = !want; toast(ex.message, "bad"); }
+  });
+  const settings = h("details", { id: "ai-settings" }, h("summary", null, "Assistant settings"),
+    h("div", { class: "stack" },
+      h("label", { class: "check" }, allow, "Allow “everyone” mode: the assistant may read all rows, ignoring row-level security"),
+      h("p", { class: "muted" }, st.allowBypassRls ? "On: anyone with the admin role can ask the assistant to look at every row." : "Off: the assistant sees only what an anonymous visitor or a chosen user could see through the API."),
+      !isOwner && !st.allowBypassRls && h("p", { class: "muted" }, "Only a project owner can turn this on.")));
   const input = h("textarea", { id: "ai-input", rows: 2, placeholder: "e.g. Which customers spent the most this month?", maxlength: 2000 });
   const send = h("button", { class: "primary", id: "ai-send" }, "Ask");
   const counter = h("span", { class: "muted", id: "ai-quota" }, `${st.questionsToday} of ${st.questionsPerDay} questions used today · ${st.model}`);
@@ -584,7 +627,8 @@ async function ai(body, p) {
     send.disabled = true;
     draw();
     try {
-      entry.result = await api("POST", `/v1/projects/${p.ref}/ai/ask`, { question: q, history });
+      if (AI.as.type === "user" && !AI.as.userId) throw new Error("Choose which user to ask as.");
+      entry.result = await api("POST", `/v1/projects/${p.ref}/ai/ask`, { question: q, history, as: AI.as.type === "user" ? { type: "user", userId: AI.as.userId } : { type: AI.as.type } });
       const st2 = await api("GET", `/v1/projects/${p.ref}/ai`);
       counter.textContent = `${st2.questionsToday} of ${st2.questionsPerDay} questions used today · ${st2.model}`;
     } catch (ex) { entry.error = ex.message; }
@@ -599,8 +643,10 @@ async function ai(body, p) {
     h("div", { class: "row between" }, h("h2", null, "Ask AI"), h("div", { class: "row" }, counter,
       h("button", { class: "small", onclick: () => { AI.entries = []; draw(); } }, "Clear chat"),
       h("button", { class: "small", id: "ai-disable", disabled: !canAdmin, onclick: async () => { if (await confirmBox("Turn off the assistant?", "The assistant loses its read access to this database.", { danger: false, confirmLabel: "Turn off" })) { await api("POST", `/v1/projects/${p.ref}/ai/disable`); AI.entries = []; ai(body, p); } } }, "Turn off"))),
-    list,
-    h("div", { class: "stack" }, input, h("div", { class: "row between" }, h("span", { class: "muted" }, "Your question, the table structure and query results are sent to Anthropic. Ctrl/⌘+Enter to send."), send))));
+    identityBar, list,
+    h("div", { class: "stack" }, input, h("div", { class: "row between" }, h("span", { class: "muted" }, "Your question, the table structure and query results are sent to Anthropic. Ctrl/⌘+Enter to send."), send)),
+    settings));
+  drawIdentity();
   draw();
 }
 

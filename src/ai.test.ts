@@ -118,6 +118,8 @@ describe("ai assistant", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     dev = await t.token(owner, "developer");
     P = await t.project(owner, "shop");
     await t.api("PATCH", `/v1/projects/${P.ref}`, { token: owner, body: { plan: "pro" } }); // the free plan's daily question quota has its own test
+    // These tests are about the assistant's mechanics over the admin's own data, so they use "everyone" mode, which the owner must allow.
+    assert.equal((await t.api("PUT", `/v1/projects/${P.ref}/ai/config`, { token: owner, body: { allowBypassRls: true } })).status, 200);
     const s = await t.sql(owner, P.ref, `
       CREATE TABLE public.customers (id serial PRIMARY KEY, name text NOT NULL, email text);
       CREATE TABLE public.orders (id serial PRIMARY KEY, customer_id int REFERENCES public.customers, total numeric NOT NULL, status text NOT NULL DEFAULT 'pending', note text);
@@ -344,15 +346,19 @@ describe("ai assistant", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
       assert.ok(msgs.every((m) => /permission denied|does not exist/.test(m)), `unexpected errors: ${msgs}`);
     });
 
-    it("cancels slow queries server-side even if the query removes its own timeout", async () => {
-      for (const sql of ["select pg_sleep(30)", "select set_config('statement_timeout', '0', false), pg_sleep(30)"]) {
-        fake.script([query(sql)], [text("done")]);
-        const t0 = Date.now();
-        const r = await ask(adm, P.ref, "slow");
-        assert.equal(r.json.steps[0].ok, false);
-        assert.match(r.json.steps[0].error, /cancelled because it ran longer/);
-        assert.ok(Date.now() - t0 < 3500);
-      }
+    it("cancels slow queries server-side, and a query cannot even try to lift its own timeout", async () => {
+      fake.script([query("select pg_sleep(30)")], [text("done")]);
+      const t0 = Date.now();
+      const r = await ask(adm, P.ref, "slow");
+      assert.equal(r.json.steps[0].ok, false);
+      assert.match(r.json.steps[0].error, /cancelled because it ran longer/);
+      assert.ok(Date.now() - t0 < 3500);
+      // set_config is closed to the assistant's roles altogether (see the identity tests), so the timeout cannot be removed.
+      fake.script([query("select set_config('statement_timeout', '0', false), pg_sleep(30)")], [text("done")]);
+      const t1 = Date.now();
+      const r2 = await ask(adm, P.ref, "slow 2");
+      assert.match(r2.json.steps[0].error, /permission denied for function set_config/);
+      assert.ok(Date.now() - t1 < 3500);
     });
 
     it("never runs a proposal, labels it from the SQL itself, and validates what it can", async () => {
@@ -509,6 +515,7 @@ describe("ai assistant", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
       const B = await t.project(owner, "other-shop");
       await t.sql(owner, B.ref, "CREATE TABLE public.only_in_b (id int)");
       await t.api("POST", `/v1/projects/${B.ref}/ai/enable`, { token: adm });
+      await t.api("PUT", `/v1/projects/${B.ref}/ai/config`, { token: owner, body: { allowBypassRls: true } });
       fake.script([text("ok")]);
       await ask(adm, B.ref, "tables?");
       assert.match(fake.requests[0]!.system[1]!, /only_in_b/);

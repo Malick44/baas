@@ -233,14 +233,55 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await toast("AI assistant enabled");
     await page.waitForSelector("#ai-input");
 
-    // A question is answered from a query the person can inspect.
+    // Row-level security applies by default: the first identity is an anonymous visitor, and "everyone" is not even offered.
+    assert.equal(await page.inputValue("#ai-as"), "anon");
+    assert.equal(await page.locator("#ai-as option[value=service]").count(), 0);
     await ask("How many notes are there?");
+    assert.match((await page.textContent("[data-answered-as]"))!, /Answered as an anonymous visitor/);
     assert.match((await page.textContent("[data-answer]"))!, /The notes table has 1 row\(s\)\./);
     await page.click("details.step summary");
     assert.match((await page.textContent("details.step pre.sql"))!, /select count\(\*\) as n from public\.notes/);
     assert.match((await page.textContent("details.step table"))!, /n\s*1/);
-    assert.match((await page.textContent("#ai-quota"))!, /1 of 20 questions used today/);
+    assert.match((await page.textContent("#ai-quota"))!, /\d+ of 20 questions used today/);
     await shot("06b-ai-answer");
+
+    // Asking as a specific user shows what that user's policies allow, which can differ from the public view.
+    await t.sql(owner, ref, `CREATE POLICY "auth hides edited" ON public.notes FOR SELECT TO authenticated USING (body <> 'edited note')`);
+    await rest("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email: "ai-user@example.com", password: "secret123" }) });
+    await page.selectOption("#ai-as", "user");
+    await page.fill("#ai-user-q", "ai-user");
+    await page.click("#ai-user-search");
+    await page.click("#ai-user-results [data-user='ai-user@example.com']");
+    assert.equal((await page.textContent("#ai-user-chip"))!.trim(), "ai-user@example.com");
+    await ask("How many notes are there?");
+    assert.match((await page.locator("[data-answered-as]").last().textContent())!, /Answered as user ai-user@example\.com/);
+    assert.match((await page.locator("[data-answer]").last().textContent())!, /The notes table has 0 row\(s\)\./);
+    await shot("06b-ai-as-user");
+    await t.sql(owner, ref, `DROP POLICY "auth hides edited" ON public.notes`);
+
+    // "Everyone" mode is the owner's decision, and an admin cannot make it.
+    const adminPage = await ctx.newPage();
+    adminPage.on("pageerror", (e) => problems.push(`admin pageerror: ${e.message}`));
+    await adminPage.goto(`http://127.0.0.1:${apiPort}/`);
+    await adminPage.fill("#token", await t.token(owner, "admin"));
+    await adminPage.click("#signin");
+    await adminPage.waitForSelector("#project-grid");
+    await adminPage.goto(`http://127.0.0.1:${apiPort}/#/p/${ref}/ai`);
+    await adminPage.waitForSelector("#ai-settings");
+    await adminPage.click("#ai-settings summary");
+    assert.equal(await adminPage.isDisabled("#ai-allow-bypass"), true);
+    assert.match((await adminPage.textContent("#ai-settings"))!, /Only a project owner can turn this on/);
+    await adminPage.close();
+    await page.click("#ai-settings summary");
+    await page.check("#ai-allow-bypass");
+    assert.match((await page.textContent("dialog"))!, /every row in your public tables/);
+    await page.click("dialog button[type=submit]");
+    await toast("Everyone mode allowed");
+    await page.waitForSelector("#ai-as option[value=service]", { state: "attached" });
+    await page.selectOption("#ai-as", "service");
+    await ask("How many notes are there?");
+    assert.match((await page.locator("[data-answered-as]").last().textContent())!, /Answered as everyone — row-level security ignored/);
+    assert.match((await page.locator("[data-answer]").last().textContent())!, /The notes table has 1 row\(s\)\./);
 
     // A change is only proposed. Nothing happens until a person runs it.
     await ask("Please add a note");
@@ -285,6 +326,14 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     assert.match((await page.locator("[data-answer]").last().textContent())!, /don't know/);
     assert.equal(await page.locator("#ai-chat [data-ai-error]").count(), 0);
 
+    // Owners can take "everyone" mode away again; the option disappears.
+    await page.click("#ai-settings summary");
+    await page.uncheck("#ai-allow-bypass");
+    await toast("Everyone mode turned off");
+    await page.waitForSelector("#ai-as");
+    assert.equal(await page.locator("#ai-as option[value=service]").count(), 0);
+    assert.equal(await page.inputValue("#ai-as"), "anon");
+
     // Turning it off removes the assistant's access again.
     await page.click("#ai-disable");
     await page.click("dialog button[type=submit]");
@@ -303,7 +352,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await page.click("dialog button[type=submit]");
     await toast("User created");
     await page.waitForSelector("#users tr[data-email='made-in-dashboard@example.com']");
-    assert.match((await page.textContent("#user-count"))!, /\(2\)/);
+    assert.match((await page.textContent("#user-count"))!, /\(3\)/); // includes the user the AI step created
     await shot("07-users");
 
     const row = page.locator("#users tr[data-email='signed-up@example.com']");

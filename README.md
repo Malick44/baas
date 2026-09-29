@@ -57,15 +57,23 @@ Set `ANTHROPIC_API_KEY` on the server and an admin can turn the assistant on per
 - "Which customers spent the most this month?" → the assistant writes SQL, runs it read-only, and answers from the results. The queries it ran are shown so you can check them.
 - "Cancel all pending orders" → it checks what would be affected, then **proposes** the SQL. Nothing runs until you click *Run* (destructive statements also ask you to type `run`).
 
+**Whose eyes it looks through.** Row-level security applies by default. Every question is asked *as* someone, and the answer says who:
+
+- **An anonymous visitor** (the default): only what your `anon` grants and policies expose through the API.
+- **A specific user** (search by email in the dashboard, `--as-user` in the CLI): exactly what that user's API calls would return, using their real claims, so `auth.uid()` and `auth.jwt()` in your policies work. This is the quick way to debug "why can't Ann see her orders?".
+- **Everyone**, ignoring row-level security: off unless a project **owner** allows it (*Assistant settings* in the dashboard, or `baas ai config --allow-bypass-rls true`). Admins can turn it back off. When it is on, hidden rows can be read and sent to Anthropic, so the setting asks for confirmation and is audited.
+
+The chosen identity cannot be changed by the SQL the model writes. Row-level security learns who is asking from a database setting, and any role can normally change a setting with `set_config()`, which would let generated SQL say "I am someone else". So while the assistant is on, `anon` and `authenticated` lose `EXECUTE` on `set_config` (the platform sets the claims first, as the project's login role, then drops to the caller's role). Before every question the assistant re-checks that this still holds, and repairs it if not (for example after a backup restore); if it cannot be confirmed it refuses. Switching the assistant off gives `set_config` back to everyone.
+
 How it stays safe — none of this depends on the model behaving:
 
-- **Reads are enforced by the database.** Queries run in a `READ ONLY` transaction, over the extended protocol (so `COMMIT; DROP …` cannot be smuggled in), as a dedicated role that can `SELECT` only from your `public` schema. It cannot see `auth` (password hashes, refresh tokens), storage or realtime internals, and has no file, role or server-control privileges. A server-side watchdog cancels slow queries even if the SQL tries to remove its own timeout.
-- **The model cannot change anything.** It can only *propose*. Each proposal is planned with `EXPLAIN` where possible, and a risk label ("deletes EVERY row (no WHERE)", "turns row-level security OFF"…) is computed from the SQL itself and shown beside the model's own description, so a description that plays a change down does not hide it. Running a proposal uses the normal, audited SQL endpoint.
+- **Reads are enforced by the database.** Queries run in a `READ ONLY` transaction, over the extended protocol (so `COMMIT; DROP …` cannot be smuggled in), as the chosen role: it can read only what that role may read, and never `auth` (password hashes, refresh tokens), storage or realtime internals. In "everyone" mode it uses a dedicated `SELECT`-only role over the `public` schema, which the project's login role can reach only while "everyone" mode is allowed. A server-side watchdog cancels slow queries.
+- **The model cannot change anything.** It can only *propose*. Each proposal is planned with `EXPLAIN` where possible, and a risk label ("deletes EVERY row (no WHERE)", "turns row-level security OFF"…) is computed from the SQL itself and shown beside the model's own description, so a description that plays a change down does not hide it. Running a proposal uses the normal, audited SQL endpoint, as `service_role`, like anything typed in the SQL editor.
 - **Instructions hidden in your data cannot make it act.** Rows are passed to the model as data and marked untrusted; and even a model that obeyed them could only propose.
-- **Opt-in, with a notice.** Off by default per project. When on, your question, the structure of your public tables, and the rows the assistant's queries return (at most 50 rows, long values shortened) are sent to Anthropic. Use it only where that is acceptable for your data.
-- **Bounded:** 8 steps and 90 s per question, 2 concurrent per project, a daily question limit by plan (20 free / 500 pro), token use recorded per day. The audit log records who asked what, never the results.
+- **Opt-in, with a notice.** Off by default per project. When on, your question, the structure of the tables the identity can read, and the rows its queries return (at most 50 rows, long values shortened) are sent to Anthropic. Use it only where that is acceptable for your data.
+- **Bounded:** 8 steps and 90 s per question, 2 concurrent per project, a daily question limit by plan (20 free / 500 pro), token use recorded per day. The audit log records who asked what and as whom, never the results.
 
-Configuration: `BAAS_AI_MODEL` (default `claude-opus-5-5`; a smaller model such as `claude-sonnet-5-5` is cheaper), `BAAS_AI_EFFORT` (`low`…`max`, default `medium`), and `BAAS_AI_FALLBACKS=off` if you run on a platform without the server-side refusal-fallback beta (it is on by default). Tables created outside the SQL editor by another owner need `GRANT SELECT … TO baas_ai_reader` before the assistant can see them.
+Configuration: `BAAS_AI_MODEL` (default `claude-opus-5-5`; a smaller model such as `claude-sonnet-5-5` is cheaper), `BAAS_AI_EFFORT` (`low`…`max`, default `medium`), and `BAAS_AI_FALLBACKS=off` if you run on a platform without the server-side refusal-fallback beta (it is on by default). In "everyone" mode, tables created outside the SQL editor by another owner need `GRANT SELECT … TO baas_ai_reader` before the assistant can see them.
 
 ## Using a project
 
@@ -129,7 +137,8 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 ## Known limitations — read before relying on it
 
 - **Functions can reach the network.** Node 22 cannot restrict outbound connections, so function code can call anything the host can (including internal services). Filesystem, subprocess and worker access are blocked and tested, but this is defence in depth, not a hardened multi-tenant sandbox. Only run code from people you trust, or run the platform where egress is firewalled, or replace `src/sandbox.ts` with a Deno/gVisor/Firecracker runner.
-- **The assistant is only as good as the model, and has only been tested against a scripted one.** The safety properties above are enforced by the database and server and are tested adversarially, but the live call to Anthropic (request shape is tested against the SDK's types and a stubbed client) had no API key available to run against. Try it on a non-critical project first. Its answers can be wrong: check the queries it shows before relying on a number. It reads through `BYPASSRLS` like the SQL editor, so it sees all rows of the admin's own tables.
+- **The assistant is only as good as the model, and has only been tested against a scripted one.** The safety properties above are enforced by the database and server and are tested adversarially, but the live call to Anthropic (request shape is tested against the SDK's types and a stubbed client) had no API key available to run against. Try it on a non-critical project first. Its answers can be wrong: check the queries it shows before relying on a number. In "everyone" mode (owner-enabled) it sees all rows, like the SQL editor.
+- **Enabling the assistant revokes `set_config` from `anon` and `authenticated`** in that project's database (see above). A function of yours that calls `set_config` while running as one of those roles will fail with "permission denied". `current_setting`, `SET LOCAL` inside your own `SECURITY DEFINER` functions, and everything `service_role` does are unaffected. Turning the assistant off restores it.
 - **No email or OAuth.** Password auth only; sign-ups are auto-confirmed, and password recovery, magic links and OTP return 501.
 - **REST subset.** No embedded resources (joins in `select`), JSON-path operators, casts, or full-text operators. Unfiltered `PATCH`/`DELETE` are rejected.
 - **No point-in-time recovery.** Backups are logical dumps; enable WAL archiving on the cluster if you need PITR. Stored files are not part of backups.
@@ -145,7 +154,7 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 ```bash
 npm ci
 export BAAS_TEST_PG_URL=postgres://postgres:…@localhost:5432/postgres   # a superuser on a throwaway Postgres
-npm test            # 180+ tests: isolation, control plane, REST/Auth, Storage, Functions, Realtime, ops, SDK, CLI, hardening, AI assistant
+npm test            # 200 tests: isolation, control plane, REST/Auth, Storage, Functions, Realtime, ops, SDK, CLI, hardening, AI assistant
 npm run e2e         # drives the dashboard in headless Chromium (needs a Chromium; set CHROMIUM_PATH)
 npx tsx scripts/load.ts 8 32     # throughput and latency per workload
 ```
