@@ -2,7 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 const b64 = (b: Buffer | string) => Buffer.from(b).toString("base64url");
 
-export type Claims = { role: string; iss: string; iat: number; exp: number; ref: string };
+export type Claims = { role: string; exp: number; iat?: number; sub?: string; [k: string]: unknown };
 
 export function newSecret(): string {
   return randomBytes(32).toString("hex");
@@ -21,10 +21,22 @@ export function verifyJwt(token: string, secret: string): Claims | null {
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   const [head, body, sig] = parts as [string, string, string];
+  try {
+    // Only HS256 is ever issued; refuse "none" and every other algorithm outright.
+    if ((JSON.parse(Buffer.from(head, "base64url").toString()) as { alg?: string }).alg !== "HS256") return null;
+  } catch {
+    return null;
+  }
   const expected = createHmac("sha256", secret).update(`${head}.${body}`).digest();
   const given = Buffer.from(sig, "base64url");
   if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
-  const claims = JSON.parse(Buffer.from(body, "base64url").toString()) as Claims;
+  let claims: Claims;
+  try {
+    claims = JSON.parse(Buffer.from(body, "base64url").toString()) as Claims;
+  } catch {
+    return null;
+  }
+  if (typeof claims.role !== "string" || typeof claims.exp !== "number") return null;
   return claims.exp > Math.floor(Date.now() / 1000) ? claims : null;
 }
 

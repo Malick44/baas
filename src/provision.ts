@@ -3,6 +3,103 @@ import pg from "pg";
 import { newSecret, projectKey } from "./keys.js";
 
 const REF = /^[a-z0-9]{20}$/;
+export const CONNECTION_LIMIT = 25;
+
+/** Base schema every project starts with: roles' grants, auth, storage and realtime tables. Idempotent. */
+export const PROJECT_SCHEMA_SQL = `
+CREATE SCHEMA IF NOT EXISTS auth; CREATE SCHEMA IF NOT EXISTS storage;
+CREATE SCHEMA IF NOT EXISTS realtime; CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions;
+GRANT USAGE ON SCHEMA public, auth, storage, realtime, extensions TO anon, authenticated, service_role;
+GRANT ALL ON SCHEMA public TO service_role;
+
+CREATE OR REPLACE FUNCTION auth.jwt() RETURNS jsonb LANGUAGE sql STABLE AS
+  $$ SELECT coalesce(nullif(current_setting('request.jwt.claims', true), '')::jsonb, '{}'::jsonb) $$;
+CREATE OR REPLACE FUNCTION auth.role() RETURNS text LANGUAGE sql STABLE AS $$ SELECT auth.jwt() ->> 'role' $$;
+CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT nullif(auth.jwt() ->> 'sub', '')::uuid $$;
+GRANT EXECUTE ON FUNCTION auth.jwt(), auth.role(), auth.uid() TO anon, authenticated, service_role;
+
+-- Tables in "public" created by the dashboard or SQL editor (owned by service_role) are usable by API roles,
+-- with row-level security deciding what they see. Enable RLS on anything user-facing.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO authenticated, service_role;
+ALTER DEFAULT PRIVILEGES FOR ROLE service_role IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES FOR ROLE service_role IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO anon, authenticated, service_role;
+
+CREATE TABLE IF NOT EXISTS auth.users (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  email text UNIQUE,
+  encrypted_password text,
+  email_confirmed_at timestamptz DEFAULT now(),
+  raw_app_meta_data jsonb NOT NULL DEFAULT '{"provider":"email"}',
+  raw_user_meta_data jsonb NOT NULL DEFAULT '{}',
+  banned_until timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  last_sign_in_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS auth.refresh_tokens (
+  id bigserial PRIMARY KEY,
+  token_hash text NOT NULL UNIQUE,
+  user_id uuid NOT NULL REFERENCES auth.users ON DELETE CASCADE,
+  session_id uuid NOT NULL,
+  revoked boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS refresh_tokens_session ON auth.refresh_tokens (session_id);
+CREATE INDEX IF NOT EXISTS refresh_tokens_user ON auth.refresh_tokens (user_id);
+GRANT ALL ON auth.users, auth.refresh_tokens TO service_role;
+GRANT USAGE, SELECT ON SEQUENCE auth.refresh_tokens_id_seq TO service_role;
+
+CREATE TABLE IF NOT EXISTS storage.buckets (
+  id text PRIMARY KEY CHECK (id ~ '^[A-Za-z0-9._-]{1,63}$'),
+  public boolean NOT NULL DEFAULT false,
+  file_size_limit bigint,
+  allowed_mime_types text[],
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS storage.objects (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  bucket_id text NOT NULL REFERENCES storage.buckets ON DELETE RESTRICT,
+  name text NOT NULL,
+  owner uuid,
+  size bigint NOT NULL DEFAULT 0,
+  mimetype text,
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (bucket_id, name)
+);
+ALTER TABLE storage.buckets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
+GRANT ALL ON storage.buckets TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON storage.objects TO anon, authenticated, service_role;
+
+CREATE TABLE IF NOT EXISTS realtime.changes (
+  id bigserial PRIMARY KEY,
+  at timestamptz NOT NULL DEFAULT now(),
+  schema_name text NOT NULL,
+  table_name text NOT NULL,
+  op text NOT NULL,
+  pk jsonb
+);
+CREATE INDEX IF NOT EXISTS realtime_changes_at ON realtime.changes (at);
+GRANT SELECT, DELETE ON realtime.changes TO service_role;
+CREATE OR REPLACE FUNCTION realtime.broadcast_change() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+  SET search_path = pg_catalog, realtime AS $$
+DECLARE r record; pkcols text[]; pkv jsonb; cid bigint;
+BEGIN
+  IF TG_OP = 'DELETE' THEN r := OLD; ELSE r := NEW; END IF;
+  SELECT array_agg(a.attname::text) INTO pkcols FROM pg_index i
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+    WHERE i.indrelid = TG_RELID AND i.indisprimary;
+  SELECT jsonb_object_agg(k, to_jsonb(r) -> k) INTO pkv FROM unnest(pkcols) k;
+  INSERT INTO realtime.changes (schema_name, table_name, op, pk) VALUES (TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_OP, pkv)
+    RETURNING id INTO cid;
+  PERFORM pg_notify('realtime_changes', cid::text);
+  RETURN NULL;
+END $$;
+`;
 
 export type Project = {
   ref: string;
@@ -70,6 +167,11 @@ export async function provisionProject(adminUrl: string, ref?: string): Promise<
       }
       await c.query(`CREATE ROLE "${user}" LOGIN NOINHERIT PASSWORD '${password}'`);
       await c.query(`GRANT anon, authenticated, service_role TO "${user}"`);
+      // Noisy-neighbour guards: bounded connections and server-side timeouts for every session of this project.
+      await c.query(`ALTER ROLE "${user}" CONNECTION LIMIT ${CONNECTION_LIMIT}`);
+      await c.query(`ALTER ROLE "${user}" SET statement_timeout = '15s'`);
+      await c.query(`ALTER ROLE "${user}" SET idle_in_transaction_session_timeout = '15s'`);
+      await c.query(`ALTER ROLE "${user}" SET lock_timeout = '5s'`);
       await c.query(`CREATE DATABASE "${dbName}"`);
       await c.query(`REVOKE ALL ON DATABASE "${dbName}" FROM PUBLIC`);
       await c.query(`GRANT CONNECT ON DATABASE "${dbName}" TO "${user}"`);
@@ -79,18 +181,7 @@ export async function provisionProject(adminUrl: string, ref?: string): Promise<
       await c.query(`CREATE SCHEMA IF NOT EXISTS auth; CREATE SCHEMA IF NOT EXISTS storage;
                      CREATE SCHEMA IF NOT EXISTS realtime; CREATE SCHEMA IF NOT EXISTS extensions`);
       await c.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions`);
-      await c.query(`GRANT USAGE ON SCHEMA public, auth, storage, realtime, extensions
-                     TO anon, authenticated, service_role`);
-      await c.query(`GRANT ALL ON SCHEMA public TO service_role`);
-      // Row-level-security helpers reading the claims PostgREST sets per request.
-      await c.query(`
-        CREATE OR REPLACE FUNCTION auth.role() RETURNS text LANGUAGE sql STABLE AS
-          $$ SELECT nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'role', '') $$;
-        CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS
-          $$ SELECT nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid $$;
-        GRANT EXECUTE ON FUNCTION auth.role(), auth.uid() TO anon, authenticated, service_role`);
-      await c.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public
-                     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated, service_role`);
+      await c.query(PROJECT_SCHEMA_SQL);
     });
   } catch (err) {
     await dropProject(adminUrl, ref).catch(() => {});

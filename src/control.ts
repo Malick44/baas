@@ -33,14 +33,28 @@ const SETTINGS_KEYS = {
   redirect_urls: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string"),
   cors_origins: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string"),
   jwt_expiry: (v: unknown) => Number.isInteger(v) && (v as number) >= 60 && (v as number) <= 604800,
+  disable_signup: (v: unknown) => typeof v === "boolean",
+  function_env: (v: unknown) =>
+    v !== null && typeof v === "object" && !Array.isArray(v) && Object.entries(v).every(([k, x]) => /^[A-Z_][A-Z0-9_]{0,63}$/.test(k) && typeof x === "string" && x.length <= 4096),
 } as const;
+
+export type Resolved = {
+  ref: string;
+  status: ProjectRow["status"];
+  plan: string;
+  orgId: string;
+  dbName: string;
+  settings: Record<string, unknown>;
+  /** Present only while the project is active. */
+  secrets?: ProjectSecrets;
+};
 
 const hashToken = (t: string) => createHash("sha256").update(t).digest("hex");
 
 export class ControlPlane {
   constructor(
     readonly pool: pg.Pool,
-    private readonly adminUrl: string,
+    readonly adminUrl: string,
     private readonly vault: Vault,
     /** Injectable so tests can simulate a failing provision. */
     private readonly provision: (adminUrl: string, ref: string) => Promise<Project> = provisionProject,
@@ -212,6 +226,30 @@ export class ControlPlane {
   }
 
   // ---- internal (gateway and background jobs; never exposed through the API) ----
+
+  /** One lookup for the data plane: status, plan, settings and (if active) decrypted secrets. Null if unknown. */
+  async resolve(ref: string): Promise<Resolved | null> {
+    if (!/^[a-z0-9]{20}$/.test(ref)) return null;
+    const r = await this.pool.query(
+      `SELECT p.status, p.plan, p.db_name, p.org_id, s.jwt_secret_enc, s.service_key_enc, s.db_password_enc, s.anon_key,
+              coalesce(ps.settings, '{}'::jsonb) AS settings
+       FROM projects p LEFT JOIN project_secrets s ON s.ref = p.ref LEFT JOIN project_settings ps ON ps.ref = p.ref
+       WHERE p.ref = $1`,
+      [ref],
+    );
+    const row = r.rows[0];
+    if (!row) return null;
+    const out: Resolved = { ref, status: row.status, plan: row.plan, orgId: row.org_id, dbName: row.db_name, settings: row.settings };
+    if (row.status === "active" && row.jwt_secret_enc) {
+      out.secrets = {
+        jwtSecret: this.vault.open(row.jwt_secret_enc, ref),
+        serviceKey: this.vault.open(row.service_key_enc, ref),
+        dbPassword: this.vault.open(row.db_password_enc, ref),
+        anonKey: row.anon_key,
+      };
+    }
+    return out;
+  }
 
   /** Decrypted secrets for a live project. The gateway (Phase 2) uses this to verify keys and reach the database. */
   async secretsFor(ref: string): Promise<ProjectSecrets | null> {
