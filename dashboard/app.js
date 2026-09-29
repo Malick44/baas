@@ -44,6 +44,7 @@ function svgEl(tag, attrs, ...children) {
   return el;
 }
 const ICONS = {
+  copy: [["rect", { x: 9, y: 9, width: 11, height: 11, rx: 2 }], ["path", { d: "M5 15V6a2 2 0 012-2h9" }]],
   key: [["circle", { cx: 8, cy: 15, r: 4 }], ["path", { d: "M11 12l9-9M16 7l3 3" }]],
   book: [["path", { d: "M4 5a2 2 0 012-2h13v16H6a2 2 0 00-2 2z" }], ["path", { d: "M4 19V5M9 3v16" }]],
   dots: [["circle", { cx: 12, cy: 5, r: 1 }], ["circle", { cx: 12, cy: 12, r: 1 }], ["circle", { cx: 12, cy: 19, r: 1 }]],
@@ -1146,47 +1147,171 @@ async function functionSheet(fn, reload, ctx) {
   if (ok) { toast(fn ? "Function saved" : "Function created", "ok"); reload(); }
 }
 
-/** Every table in a schema as a card of its columns, like the schema diagram in Supabase Studio (cards, no drawn relationship lines). */
+/** Every table in a schema as a draggable card of its columns, with a line for each foreign key. */
 async function schemaVisualizer(body, p) {
+  const W = 280, HEAD = 34, ROW = 29;
   const schemas = (await catalog(`select nspname from pg_namespace where nspname !~ '^pg_' and nspname <> 'information_schema' order by (nspname = 'public') desc, nspname`)).map((r) => r.nspname);
-  let schema = "public", tables = [], find = "", byLinks = false;
-  const canvas = h("div", { class: "schema-canvas", id: "schema-canvas" });
+  let schema = "public", tables = [], byName = new Map(), pos = {}, find = "", scale = 1;
+  const stage = h("div", { class: "schema-stage" });
+  const sizer = h("div", { class: "schema-sizer" }, stage);
+  const canvas = h("div", { class: "schema-canvas", id: "schema-canvas" }, sizer);
+  const svg = svgEl("svg", { class: "rel-lines", id: "rel-lines" });
+  const zoomLabel = h("span", { class: "zoom-label", id: "zoom-label" }, "100%");
+  const storeKey = () => `baas.schema.${p.ref}.${schema}`;
+  const save = () => { try { localStorage.setItem(storeKey(), JSON.stringify(pos)); } catch { /* private mode */ } };
+  const cardH = (t) => HEAD + t.cols.length * ROW + 2;
+
   const load = async () => {
     const rows = await catalog(`select c.relname as tbl, a.attname as col, format_type(a.atttypid, a.atttypmod) as type, a.attnotnull as notnull, a.attidentity <> '' as ident,
+      c.relrowsecurity as rls, c.reltuples::bigint as est,
       exists(select 1 from pg_constraint k where k.conrelid = c.oid and k.contype = 'p' and a.attnum = any(k.conkey)) as pk,
       exists(select 1 from pg_constraint k where k.conrelid = c.oid and k.contype = 'u' and k.conkey = array[a.attnum]) as uniq,
-      (select cf.relname || '.' || af.attname from pg_constraint k join pg_class cf on cf.oid = k.confrelid join pg_attribute af on af.attrelid = k.confrelid and af.attnum = k.confkey[1]
-         where k.conrelid = c.oid and k.contype = 'f' and k.conkey[1] = a.attnum limit 1) as fk
+      (select cf.relname from pg_constraint k join pg_class cf on cf.oid = k.confrelid where k.conrelid = c.oid and k.contype = 'f' and k.conkey[1] = a.attnum limit 1) as fk_table,
+      (select af.attname from pg_constraint k join pg_attribute af on af.attrelid = k.confrelid and af.attnum = k.confkey[1] where k.conrelid = c.oid and k.contype = 'f' and k.conkey[1] = a.attnum limit 1) as fk_col
       from pg_class c join pg_namespace n on n.oid = c.relnamespace join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
       where n.nspname = ${pgLit(schema)} and c.relkind in ('r', 'p') order by c.relname, a.attnum`);
     const map = new Map();
     for (const r of rows) { if (!map.has(r.tbl)) map.set(r.tbl, []); map.get(r.tbl).push(r); }
-    tables = [...map].map(([name, cols]) => ({ name, cols, links: cols.filter((c) => c.fk).length }));
+    tables = [...map].map(([name, cols]) => ({ name, cols, rls: cols[0].rls, est: Number(cols[0].est) }));
+    byName = new Map(tables.map((t) => [t.name, t]));
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem(storeKey()) || "{}"); } catch { /* ignore */ }
+    pos = {};
+    if (tables.every((t) => saved[t.name])) pos = saved; else autoLayout(false);
     draw();
   };
+
+  /** Referenced tables go left, the tables that point at them go right; long columns wrap. */
+  function autoLayout(redraw = true) {
+    const depth = new Map(tables.map((t) => [t.name, 0]));
+    for (let pass = 0; pass < tables.length; pass++) {
+      let changed = false;
+      for (const t of tables) for (const c of t.cols) {
+        if (c.fk_table && c.fk_table !== t.name && byName.has(c.fk_table) && depth.get(c.fk_table) + 1 > depth.get(t.name) && depth.get(c.fk_table) + 1 <= tables.length) { depth.set(t.name, depth.get(c.fk_table) + 1); changed = true; }
+      }
+      if (!changed) break;
+    }
+    pos = {};
+    let col = 0;
+    const maxDepth = Math.max(0, ...depth.values());
+    for (let d = 0; d <= maxDepth; d++) {
+      const group = tables.filter((t) => depth.get(t.name) === d);
+      for (let k = 0; k < group.length; k += 8) {
+        let y = 24;
+        for (const t of group.slice(k, k + 8)) { pos[t.name] = { x: 24 + col * (W + 90), y }; y += cardH(t) + 30; }
+        col++;
+      }
+    }
+    save();
+    if (redraw) draw();
+  }
+
   const marker = (c) => (c.pk ? h("span", { class: "mk pk", title: "Primary key" }, icon("key", 12)) : c.ident ? h("span", { class: "mk", title: "Identity" }, "#") : c.uniq ? h("span", { class: "mk", title: "Unique" }, "≡") : h("span", { class: `mk ${c.notnull ? "nn" : "nl"}`, title: c.notnull ? "Non-nullable" : "Nullable" }, c.notnull ? "◆" : "◇"));
-  const draw = () => {
-    clear(canvas);
-    const q = find.toLowerCase();
-    let list = tables.filter((t) => !q || t.name.toLowerCase().includes(q));
-    if (byLinks) list = [...list].sort((a, b) => b.links - a.links || a.name.localeCompare(b.name));
-    if (!list.length) { canvas.append(h("div", { class: "empty" }, tables.length ? "No matching tables." : "No tables in this schema.")); return; }
-    for (const t of list) canvas.append(h("div", { class: "schema-table", "data-table": t.name },
-      h("div", { class: "st-head" }, icon("table", 14), h("strong", null, t.name)),
-      t.cols.map((c) => h("div", { class: "st-col", "data-col": c.col, title: c.fk ? `References ${c.fk}` : "" }, marker(c), h("span", { class: "st-name" }, c.col), c.fk ? h("span", { class: "st-fk" }, `→ ${c.fk}`) : null, h("span", { class: "st-type" }, c.type)))));
+  const ddlFor = (t) => `create table ${JSON.stringify(schema)}.${JSON.stringify(t.name)} (\n${[...t.cols.map((c) => `  ${JSON.stringify(c.col)} ${c.type}${c.notnull ? " not null" : ""}`), ...(t.cols.some((c) => c.pk) ? [`  primary key (${t.cols.filter((c) => c.pk).map((c) => JSON.stringify(c.col)).join(", ")})`] : []), ...t.cols.filter((c) => c.fk_table).map((c) => `  foreign key (${JSON.stringify(c.col)}) references ${JSON.stringify(schema)}.${JSON.stringify(c.fk_table)} (${JSON.stringify(c.fk_col)})`)].join(",\n")}\n);`;
+  const copy = async (text, msg) => { try { await navigator.clipboard.writeText(text); toast(msg, "ok"); } catch { openInSql(text); } };
+  const matches = (t) => !find || t.name.toLowerCase().includes(find.toLowerCase());
+
+  function resize() {
+    let bw = 400, bh = 300;
+    for (const t of tables) { const q = pos[t.name]; bw = Math.max(bw, q.x + W + 40); bh = Math.max(bh, q.y + cardH(t) + 40); }
+    stage.style.width = `${bw}px`; stage.style.height = `${bh}px`;
+    stage.style.transform = `scale(${scale})`;
+    sizer.style.width = `${bw * scale}px`; sizer.style.height = `${bh * scale}px`;
+    zoomLabel.textContent = `${Math.round(scale * 100)}%`;
+    svg.setAttribute("width", bw); svg.setAttribute("height", bh);
+  }
+
+  function drawLines() {
+    clear(svg);
+    for (const t of tables) t.cols.forEach((c, ci) => {
+      const target = c.fk_table && byName.get(c.fk_table);
+      if (!target) return;
+      const a = pos[t.name], b = pos[target.name];
+      const ri = Math.max(0, target.cols.findIndex((x) => x.col === c.fk_col));
+      const y1 = a.y + HEAD + ci * ROW + ROW / 2 + 1, y2 = b.y + HEAD + ri * ROW + ROW / 2 + 1;
+      let x1, x2, d1, d2;
+      if (a.x + W + 20 <= b.x) { x1 = a.x + W; x2 = b.x; d1 = 1; d2 = -1; }
+      else if (b.x + W + 20 <= a.x) { x1 = a.x; x2 = b.x + W; d1 = -1; d2 = 1; }
+      else { x1 = a.x + W; x2 = b.x + W; d1 = 1; d2 = 1; }
+      const k = d1 === d2 ? 50 : Math.max(40, Math.abs(x2 - x1) / 2);
+      const dim = find && !matches(t) && !matches(target);
+      const rel = `${t.name}.${c.col}>${target.name}.${c.fk_col}`;
+      const g = svgEl("g", { class: `rel ${dim ? "dim" : ""}`, "data-rel": rel });
+      g.append(svgEl("title", {}), svgEl("path", { d: `M${x1},${y1} C${x1 + d1 * k},${y1} ${x2 + d2 * k},${y2} ${x2},${y2}` }),
+        svgEl("circle", { cx: x1, cy: y1, r: 3.5, class: "from" }), svgEl("circle", { cx: x2, cy: y2, r: 3.5, class: "to" }));
+      g.firstChild.textContent = `${t.name}.${c.col} references ${target.name}.${c.fk_col}`;
+      svg.append(g);
+    });
+  }
+
+  function draw() {
+    clear(stage);
+    stage.append(svg);
+    if (!tables.length) { stage.append(h("div", { class: "empty schema-empty" }, "No tables in this schema.")); resize(); return; }
+    for (const t of tables) {
+      const q = pos[t.name];
+      const head = h("div", { class: "st-head", title: "Drag to move" }, icon("table", 14), h("strong", null, t.name),
+        h("span", { class: "st-info", title: `${t.rls ? "Row-level security on" : "Row-level security off"} · about ${Math.max(0, t.est).toLocaleString()} rows` }, "ⓘ"),
+        rowMenu([
+          ["View in table editor", () => { TSTATE = { table: t.name, offset: 0, limit: 50 }; location.hash = `#/p/${p.ref}/tables`; }, { action: "view-table" }],
+          ["Copy table as SQL", () => copy(ddlFor(t), "SQL copied")],
+          ["Copy name", () => copy(t.name, "Name copied")],
+        ]));
+      const card = h("div", { class: `schema-table ${matches(t) ? "" : "dim"}`, "data-table": t.name }, head,
+        t.cols.map((c) => h("div", { class: "st-col", "data-col": c.col, title: c.fk_table ? `References ${c.fk_table}.${c.fk_col}` : "" }, marker(c), h("span", { class: "st-name" }, c.col), h("span", { class: "st-type" }, c.type))));
+      card.style.left = `${q.x}px`; card.style.top = `${q.y}px`;
+      head.addEventListener("pointerdown", (e) => {
+        if (e.target.closest("button")) return;
+        const sx = e.clientX, sy = e.clientY, o = { ...pos[t.name] };
+        head.setPointerCapture(e.pointerId);
+        const move = (ev) => {
+          pos[t.name] = { x: Math.max(0, Math.round(o.x + (ev.clientX - sx) / scale)), y: Math.max(0, Math.round(o.y + (ev.clientY - sy) / scale)) };
+          card.style.left = `${pos[t.name].x}px`; card.style.top = `${pos[t.name].y}px`;
+          drawLines();
+        };
+        const up = () => { head.removeEventListener("pointermove", move); head.removeEventListener("pointerup", up); save(); resize(); };
+        head.addEventListener("pointermove", move); head.addEventListener("pointerup", up);
+      });
+      stage.append(card);
+    }
+    drawLines(); resize();
+  }
+
+  const zoomTo = (v) => { scale = Math.min(1.5, Math.max(0.3, Math.round(v * 100) / 100)); resize(); };
+  const fit = () => {
+    const bw = Math.max(...tables.map((t) => pos[t.name].x + W + 40), 400);
+    zoomTo(Math.min(1, (canvas.clientWidth - 8) / bw));
+    canvas.scrollTo({ left: 0, top: 0 });
   };
-  const ddl = () => tables.map((t) => `create table ${JSON.stringify(schema)}.${JSON.stringify(t.name)} (\n${[...t.cols.map((c) => `  ${JSON.stringify(c.col)} ${c.type}${c.notnull ? " not null" : ""}`), ...(t.cols.some((c) => c.pk) ? [`  primary key (${t.cols.filter((c) => c.pk).map((c) => JSON.stringify(c.col)).join(", ")})`] : [])].join(",\n")}\n);`).join("\n\n");
   const schemaSel = h("select", { id: "schema-schema", "aria-label": "Schema", onchange: (e) => { schema = e.target.value; load(); } }, schemas.map((x) => h("option", { value: x }, `schema ${x}`)));
+  const copyMenu = (e) => {
+    e.stopPropagation();
+    const open = document.querySelector(".menu.row-menu"); closeMenus(); if (open) return;
+    const box = e.currentTarget.getBoundingClientRect();
+    const menu = h("div", { class: "menu row-menu", role: "menu" },
+      h("button", { role: "menuitem", onclick: () => { closeMenus(); copy(tables.map(ddlFor).join("\n\n"), "SQL copied"); } }, "Copy as SQL"),
+      h("button", { role: "menuitem", onclick: () => { closeMenus(); copy(JSON.stringify({ schema, tables: tables.map((t) => ({ name: t.name, columns: t.cols.map((c) => ({ name: c.col, type: c.type, notNull: c.notnull, primaryKey: c.pk, references: c.fk_table ? `${c.fk_table}.${c.fk_col}` : null })) })) }, null, 2), "JSON copied"); } }, "Copy as JSON"));
+    menu.style.position = "fixed"; menu.style.top = `${Math.round(box.bottom + 4)}px`; menu.style.right = `${Math.round(window.innerWidth - box.right)}px`;
+    document.body.append(menu);
+  };
   const legend = [["key", "Primary key"], ["#", "Identity"], ["≡", "Unique"], ["◇", "Nullable"], ["◆", "Non-Nullable"]];
   clear(body);
   body.append(h("div", { class: "schema-page" },
     h("div", { class: "toolbar" }, schemaSel,
-      h("input", { id: "schema-find", placeholder: "Find table...", "aria-label": "Find table", oninput: (e) => { find = e.target.value; draw(); } }),
+      h("input", { id: "schema-find", placeholder: "Find table...", "aria-label": "Find table", oninput: (e) => {
+        find = e.target.value; draw();
+        const first = tables.find(matches);
+        if (find && first) canvas.scrollTo({ left: Math.max(0, pos[first.name].x * scale - 20), top: Math.max(0, pos[first.name].y * scale - 20), behavior: "smooth" });
+      } }),
       h("span", { class: "spacer" }),
-      h("button", { id: "copy-sql", onclick: async () => { try { await navigator.clipboard.writeText(ddl()); toast("SQL copied", "ok"); } catch { openInSql(ddl()); } } }, "Copy as SQL"),
-      h("button", { id: "auto-layout", onclick: () => { byLinks = !byLinks; draw(); toast(byLinks ? "Related tables first" : "Alphabetical", "ok"); } }, "Auto layout")),
+      h("div", { class: "zoom" }, h("button", { id: "zoom-out", "aria-label": "Zoom out", onclick: () => zoomTo(scale - 0.1) }, "−"), zoomLabel,
+        h("button", { id: "zoom-in", "aria-label": "Zoom in", onclick: () => zoomTo(scale + 0.1) }, "+"), h("button", { id: "zoom-fit", onclick: fit }, "Fit")),
+      h("div", { class: "splitbtn" },
+        h("button", { id: "copy-sql", onclick: () => copy(tables.map(ddlFor).join("\n\n"), "SQL copied") }, icon("copy", 14), " Copy as SQL"),
+        h("button", { id: "copy-more", "aria-label": "More copy options", onclick: copyMenu }, icon("chevrons", 13))),
+      h("button", { id: "auto-layout", onclick: () => { autoLayout(); toast("Layout reset", "ok"); } }, "Auto layout")),
     canvas,
-    h("div", { class: "legend" }, legend.map(([m, t]) => h("span", null, m === "key" ? icon("key", 13) : h("b", null, m), " ", t)))));
+    h("div", { class: "legend" }, legend.map(([m, t]) => h("span", null, m === "key" ? icon("key", 13) : h("b", null, m), " ", t)), h("span", { class: "hint" }, "Drag a table by its title to move it."))));
   await load();
 }
 

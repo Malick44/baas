@@ -273,3 +273,27 @@ dialog.sheet .actions { padding: 14px 24px; border-top: 1px solid var(--line); }
 .mk.nn { color: var(--text); }
 .legend { display: flex; gap: 22px; flex-wrap: wrap; padding: 12px 4px; font-family: var(--mono); font-size: 12.5px; color: var(--muted); }
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
+
+.schema-canvas { display: block; position: relative; overflow: auto; padding: 0; height: calc(100vh - 250px); min-height: 420px; }
+.schema-sizer { position: relative; }
+.schema-stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.rel-lines { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 0; overflow: visible; }
+.rel path { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+.rel .from { fill: var(--muted); } .rel .to { fill: var(--panel); stroke: var(--muted); stroke-width: 1.4; }
+.rel.dim { opacity: .18; }
+.schema-table { position: absolute; z-index: 1; width: 280px; }
+.schema-table.dim { opacity: .3; }
+.st-head { height: 34px; cursor: grab; touch-action: none; user-select: none; }
+.st-head strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-head:active { cursor: grabbing; }
+.st-info { color: var(--muted); font-size: 13px; cursor: help; }
+.st-head button.iconbtn { width: 24px; height: 24px; border-color: transparent; background: transparent; }
+.st-col { height: 29px; padding-top: 0; padding-bottom: 0; }
+.zoom { display: inline-flex; align-items: center; gap: 6px; }
+.zoom button { padding: 4px 9px; }
+.zoom-label { min-width: 42px; text-align: center; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.splitbtn { display: inline-flex; }
+.splitbtn button:first-child { display: inline-flex; align-items: center; gap: 6px; border-radius: 8px 0 0 8px; }
+.splitbtn button:last-child { border-radius: 0 8px 8px 0; border-left: 0; padding: 6px 8px; }
+.legend .hint { margin-left: auto; font-family: var(--sans); }
+.schema-empty { position: absolute; left: 24px; top: 24px; }
