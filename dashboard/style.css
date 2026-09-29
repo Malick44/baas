@@ -297,3 +297,35 @@ dialog.sheet .actions { padding: 14px 24px; border-top: 1px solid var(--line); }
 .splitbtn button:last-child { border-radius: 0 8px 8px 0; border-left: 0; padding: 6px 8px; }
 .legend .hint { margin-left: auto; font-family: var(--sans); }
 .schema-empty { position: absolute; left: 24px; top: 24px; }
+
+/* ---- top bar extras, menus, advisors, reports ---- */
+.crumb-group { display: inline-flex; align-items: center; }
+.crumb-switch { display: inline-grid; place-items: center; width: 24px; height: 28px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); }
+.crumb-switch:hover { background: var(--panel-2); color: var(--text); }
+header.appbar .plain { border: 0; background: transparent; color: var(--muted); }
+header.appbar .plain:hover { color: var(--text); background: transparent; }
+header.appbar a.iconbtn { text-decoration: none; }
+.menu-link { display: block; padding: 7px 10px; border-radius: 6px; color: var(--text); }
+.menu-link:hover { background: var(--panel-2); text-decoration: none; }
+.menu-title { padding: 6px 10px; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.menu-note { margin: 4px 10px 8px; font-size: 12.5px; max-width: 240px; }
+.menu button.current { font-weight: 600; }
+.menu button { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+kbd.key { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line-strong); border-bottom-width: 2px; border-radius: 6px; padding: 1px 6px; background: var(--panel-2); }
+.frame.with-sub.sub-hidden { grid-template-columns: 56px minmax(0, 1fr); }
+.frame.sub-hidden nav.sub { display: none; }
+.rail-toggle { margin-top: 6px; border-color: transparent !important; background: transparent !important; color: var(--muted) !important; }
+.code-wrap { display: grid; grid-template-columns: 44px minmax(0, 1fr); border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; background: var(--panel); }
+.code-wrap .gutter { margin: 0; padding: 10px 8px; border: 0; border-right: 1px solid var(--line); border-radius: 0; text-align: right; color: var(--muted); background: var(--bg-subtle); overflow: hidden; line-height: 1.5; font-size: 12.5px; height: 260px; }
+.code-wrap textarea { border: 0; border-radius: 0; margin: 0; padding: 10px; height: 260px; min-height: 0; line-height: 1.5; font-size: 12.5px; white-space: pre; overflow: auto; resize: none; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+.tabs .tab { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; padding: 8px 14px; color: var(--muted); }
+.tabs .tab.on { color: var(--text); border-bottom-color: var(--brand); font-weight: 600; }
+.tabs .count { margin-left: 8px; font-family: var(--mono); font-size: 11px; border: 1px solid var(--line-strong); border-radius: 999px; padding: 0 7px; }
+.findings { display: grid; gap: 12px; }
+.finding { border: 1px solid var(--line); border-left-width: 4px; border-radius: 10px; padding: 14px 16px; background: var(--panel); }
+.finding.error { border-left-color: var(--bad); } .finding.warn { border-left-color: var(--warn); } .finding.info { border-left-color: var(--line-strong); }
+.finding p { margin: 6px 0 0; } .finding .target { margin-top: 6px; }
+.level { font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; border-radius: 999px; padding: 0 8px; line-height: 18px; border: 1px solid var(--line-strong); }
+.level.error { color: var(--bad); border-color: var(--bad); } .level.warn { color: var(--warn); border-color: var(--warn); }
+@media (max-width: 900px) { header.appbar .extra { display: none; } }

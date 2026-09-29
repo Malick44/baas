@@ -44,6 +44,11 @@ function svgEl(tag, attrs, ...children) {
   return el;
 }
 const ICONS = {
+  help: [["circle", { cx: 12, cy: 12, r: 9 }], ["path", { d: "M9.5 9.5a2.5 2.5 0 015 .5c0 1.5-2.5 2-2.5 3.5M12 17h.01" }]],
+  bulb: [["path", { d: "M9 18h6M10 21h4M12 3a6 6 0 00-3.5 10.9c.5.4.8 1 .8 1.6V16h5.4v-.5c0-.6.3-1.2.8-1.6A6 6 0 0012 3z" }]],
+  chart: [["path", { d: "M4 20V10M10 20V4M16 20v-8M22 20H2" }]],
+  panel: [["rect", { x: 3, y: 4, width: 18, height: 16, rx: 2 }], ["path", { d: "M9 4v16" }]],
+  diamond: [["path", { d: "M12 3l9 9-9 9-9-9z" }], ["circle", { cx: 12, cy: 12, r: 2.5 }]],
   copy: [["rect", { x: 9, y: 9, width: 11, height: 11, rx: 2 }], ["path", { d: "M5 15V6a2 2 0 012-2h9" }]],
   key: [["circle", { cx: 8, cy: 15, r: 4 }], ["path", { d: "M11 12l9-9M16 7l3 3" }]],
   book: [["path", { d: "M4 5a2 2 0 012-2h13v16H6a2 2 0 00-2 2z" }], ["path", { d: "M4 19V5M9 3v16" }]],
@@ -204,6 +209,22 @@ function rowMenu(items) {
 }
 function closeMenus() { document.querySelectorAll(".menu").forEach((m) => m.remove()); }
 document.addEventListener("click", (e) => { if (!e.target.closest(".menu, .avatar")) closeMenus(); });
+/** Open a menu under the clicked element; clicking again closes it. `nodes` are the menu's children. */
+function showMenu(e, nodes, { left = false } = {}) {
+  e.stopPropagation();
+  const open = document.querySelector(".menu");
+  closeMenus();
+  if (open) return;
+  const box = e.currentTarget.getBoundingClientRect();
+  const menu = h("div", { class: "menu row-menu", role: "menu" }, nodes);
+  menu.style.position = "fixed";
+  menu.style.top = `${Math.round(box.bottom + 4)}px`;
+  if (left) menu.style.left = `${Math.max(8, Math.round(box.left))}px`; else menu.style.right = `${Math.max(8, Math.round(window.innerWidth - box.right))}px`;
+  document.body.append(menu);
+}
+const menuItem = (label, run, o = {}) => h("button", { role: "menuitem", class: o.danger ? "danger-item" : "", onclick: () => { closeMenus(); run(); } }, label);
+const menuLink = (label, href) => h("a", { role: "menuitem", class: "menu-link", href, target: "_blank", rel: "noopener noreferrer", onclick: () => closeMenus() }, label);
+const REPO = "https://github.com/Malick44/baas";
 
 function appbar(project) {
   const initials = (S.me?.organization.name || "?").slice(0, 2).toUpperCase();
@@ -216,17 +237,74 @@ function appbar(project) {
       h("button", { role: "menuitem", id: "signout", onclick: logout }, "Sign out")));
   } }, initials);
   const search = h("button", { class: "searchbox", id: "open-palette", title: "Search pages (Ctrl/⌘+K)", onclick: openPalette }, icon("search", 15), h("span", null, "Search…"), h("kbd", null, "⌘K"));
+  const switcher = (id, label, build) => h("button", { class: "crumb-switch", id, "aria-label": label, title: label, onclick: async (e) => {
+    const ev = { stopPropagation: () => e.stopPropagation(), currentTarget: e.currentTarget };
+    showMenu(ev, await build(), { left: true });
+  } }, icon("chevrons", 14));
+  const orgSwitch = switcher("org-switch", "Organisation", () => [
+    h("div", { class: "who" }, h("div", null, S.me.organization.name), h("div", { class: "muted" }, `${S.me.role} · ${S.me.organization.slug}`)),
+    menuItem("All projects", () => { location.hash = "#/projects"; })]);
+  const projectSwitch = project && switcher("project-switch", "Switch project", async () => {
+    let rows = [];
+    try { rows = await api("GET", "/v1/projects"); } catch { /* menu still offers the list page */ }
+    return [h("div", { class: "menu-title" }, "Projects"),
+      ...rows.map((r) => h("button", { role: "menuitem", class: r.ref === project.ref ? "current" : "", "data-ref": r.ref, onclick: () => { closeMenus(); location.hash = `#/p/${r.ref}/overview`; } }, r.name, h("span", { class: `chip ${r.status}` }, r.status))),
+      menuItem("All projects", () => { location.hash = "#/projects"; })];
+  });
+  const branchSwitch = project && switcher("branch-switch", "Branch", () => [
+    h("div", { class: "menu-title" }, "Branches"),
+    h("button", { role: "menuitem", class: "current" }, "main", h("span", { class: "chip env" }, "production")),
+    h("p", { class: "muted menu-note" }, "This project runs a single production database. Preview branches are not part of baas yet.")]);
+  const sql = project && h("a", { class: "iconbtn extra", id: "cli-btn", href: "#", title: "Use from the command line", "aria-label": "Command line", onclick: (e) => { e.preventDefault(); cliDialog(project); } }, icon("terminal", 16));
+  const help = h("button", { class: "iconbtn extra", id: "help-btn", title: "Help", "aria-label": "Help", onclick: (e) => showMenu(e, [
+    menuLink("Documentation", `${REPO}#readme`), menuLink("Report a problem", `${REPO}/issues/new`),
+    menuItem("Keyboard shortcuts", () => shortcutsDialog())]) }, icon("help", 16));
   return h("header", { class: "appbar" },
     h("a", { class: "logo", href: "#/projects", title: "All projects", "aria-label": "baas" }, LOGO()),
     h("span", { class: "sep org" }, "/"),
-    h("a", { class: "crumb org", href: "#/projects" }, S.me?.organization.name || "", project && h("span", { class: "chip" }, project.plan), icon("chevrons", 14)),
-    project && [h("span", { class: "sep" }, "/"), h("a", { class: "crumb", href: `#/p/${project.ref}/overview`, id: "crumb-project" }, project.name, icon("chevrons", 14)), h("span", { class: `chip ${project.status}`, id: "project-status" }, project.status)],
+    h("span", { class: "crumb-group org" }, h("a", { class: "crumb", href: "#/projects" }, S.me?.organization.name || "", project && h("span", { class: "chip" }, project.plan)), orgSwitch),
+    project && [h("span", { class: "sep" }, "/"),
+      h("span", { class: "crumb-group" }, h("a", { class: "crumb", href: `#/p/${project.ref}/overview`, id: "crumb-project" }, project.name), projectSwitch),
+      h("span", { class: `chip ${project.status}`, id: "project-status" }, project.status),
+      h("span", { class: "sep org" }, "/"),
+      h("span", { class: "crumb-group org" }, h("span", { class: "crumb", id: "branch-crumb" }, "main", h("span", { class: "chip env" }, "production")), branchSwitch)],
     project && h("button", { id: "connect-btn", onclick: () => connectDialog(project) }, icon("plug", 15), " Connect"),
     h("span", { class: "spacer" }),
-    search, avatar);
+    h("button", { class: "plain extra", id: "feedback-btn", onclick: feedbackDialog }, "Feedback"),
+    search, help,
+    project && h("a", { class: "iconbtn extra", id: "advisors-btn", href: `#/p/${project.ref}/advisors`, title: "Advisors", "aria-label": "Advisors" }, icon("bulb", 16)),
+    sql,
+    project && h("a", { class: "iconbtn extra", id: "ask-ai-btn", href: `#/p/${project.ref}/ai`, title: "Ask AI", "aria-label": "Ask AI" }, icon("diamond", 16)),
+    avatar);
 }
 
-/** Plain page: top bar plus a centred column (used for the project list and errors). */
+function feedbackDialog() {
+  return dialog("Send feedback", () => h("div", { class: "stack" },
+    h("p", { class: "muted" }, "Feedback is tracked as an issue on the baas repository. Write it here and it opens on GitHub, where you can review it before sending. Nothing is sent from this page."),
+    h("textarea", { name: "text", id: "feedback-text", rows: 6, placeholder: "What would make this better?", required: true })), {
+    confirmLabel: "Open on GitHub",
+    onSubmit: (fd) => {
+      const text = String(fd.get("text")).trim();
+      if (!text) throw new Error("Write something first.");
+      window.open(`${REPO}/issues/new?title=${encodeURIComponent("Dashboard feedback")}&body=${encodeURIComponent(text)}`, "_blank", "noopener,noreferrer");
+      return true;
+    },
+  });
+}
+
+function shortcutsDialog() {
+  const rows = [["Ctrl/⌘ + K", "Search pages"], ["Ctrl/⌘ + Enter", "Run the SQL, or send the Ask AI question"], ["Esc", "Close a dialog, panel or menu"]];
+  return dialog("Keyboard shortcuts", () => h("table", { class: "data" }, h("tbody", null, rows.map(([k, d]) => h("tr", null, h("td", null, h("kbd", { class: "key" }, k)), h("td", null, d))))), { confirmLabel: "Close" });
+}
+
+function cliDialog(p) {
+  const url = location.origin;
+  return dialog("Use this project from the command line", () => h("div", { class: "stack" },
+    h("p", { class: "muted" }, "The baas CLI talks to the management API with an API token. Link this folder to the project, then push migrations or ask questions."),
+    h("pre", { id: "cli-snippet" }, `npx baas login --url ${url} --token <your token>\nnpx baas link ${p.ref}\nnpx baas db push\nnpx baas ask "how many rows are in my biggest table?"`),
+    h("p", { class: "muted" }, "Create a token under your organisation, and keep it out of source control.")), { confirmLabel: "Close" });
+}
+
 function shell(...content) {
   return h("div", null, appbar(null), h("main", { class: "plain" }, content));
 }
@@ -350,6 +428,8 @@ const NAV = [
   { id: "realtime", label: "Realtime", icon: "radio" },
   { id: "ai", label: "Ask AI", icon: "sparkles" },
   { divider: true },
+  { id: "advisors", label: "Advisors", icon: "bulb" },
+  { id: "reports", label: "Reports", icon: "chart" },
   { id: "logs", label: "Logs", icon: "list" },
   { grow: true },
   { id: "settings", label: "Project settings", icon: "settings" },
@@ -378,12 +458,21 @@ async function renderProject(ref, tab, page) {
       : h("a", { href: `#/p/${ref}/${n.id === "database" ? "database/schema" : n.id}`, class: n.id === tab ? "on" : "", "data-tab": n.id, title: n.label, "aria-label": n.label }, icon(n.icon, 19))));
   const sub = tab === "database" ? h("nav", { class: "sub", "aria-label": "Database" }, h("div", { class: "title" }, "Database"),
     DB_MENU.map((g) => [h("div", { class: "group label" }, g.title), g.items.map(([id, label, tabId]) => h("a", { href: tabId ? `#/p/${ref}/${tabId}` : `#/p/${ref}/database/${id}`, class: !tabId && id === page ? "on" : "", "data-dbpage": id }, label))])) : null;
+  let hidden = false;
+  try { hidden = localStorage.getItem("baas.sub.hidden") === "1"; } catch { /* ignore */ }
+  const frame = h("div", { class: `frame ${sub ? "with-sub" : ""} ${sub && hidden ? "sub-hidden" : ""}` });
+  if (sub) rail.append(h("button", { class: "iconbtn rail-toggle", id: "toggle-sub", title: "Collapse the sidebar", "aria-label": "Collapse sidebar", "aria-pressed": String(hidden), onclick: (e) => {
+    const now = frame.classList.toggle("sub-hidden");
+    e.currentTarget.setAttribute("aria-pressed", String(now));
+    try { localStorage.setItem("baas.sub.hidden", now ? "1" : "0"); } catch { /* ignore */ }
+  } }, icon("panel", 16)));
   mount(h("div", null, appbar(p),
-    h("div", { class: `frame ${sub ? "with-sub" : ""}` }, rail, sub,
-      h("main", { class: "content" },
-        p.status === "paused" && h("div", { class: "notice warn", id: "paused-note" }, "This project is paused: its API is offline. Resume it in Project settings."),
-        body))));
-  const fn = { overview, tables, sql, ai, auth, storage, functions, realtime, logs, settings }[tab];
+    frame));
+  frame.append(...[rail, sub,
+    h("main", { class: "content" },
+      p.status === "paused" && h("div", { class: "notice warn", id: "paused-note" }, "This project is paused: its API is offline. Resume it in Project settings."),
+      body)].filter(Boolean));
+  const fn = { overview, tables, sql, ai, advisors, reports, auth, storage, functions, realtime, logs, settings }[tab];
   try {
     if (tab === "database") await dbPage(body, p, page);
     else await fn(body, p);
@@ -851,6 +940,8 @@ async function ai(body, p) {
       !isOwner && !st.allowBypassRls && h("p", { class: "muted" }, "Only a project owner can turn this on.")));
   const input = h("textarea", { id: "ai-input", rows: 2, placeholder: "e.g. Which customers spent the most this month?", maxlength: 2000 });
   const send = h("button", { class: "primary", id: "ai-send" }, "Ask");
+  const aiPrefill = sessionStorage.getItem("baas.ai.prefill");
+  if (aiPrefill) { input.value = aiPrefill; sessionStorage.removeItem("baas.ai.prefill"); }
   const counter = h("span", { class: "muted", id: "ai-quota" }, `${st.questionsToday} of ${st.questionsPerDay} questions used today · ${st.model}`);
   const draw = () => { clear(list); if (!AI.entries.length) list.append(h("p", { class: "muted" }, "Ask about your tables. Try “How many rows are in each table?”")); AI.entries.forEach((e) => list.append(entryView(e))); list.scrollTop = list.scrollHeight; };
   const submit = async () => {
@@ -1031,7 +1122,9 @@ const DB_PAGES = {
   functions: {
     title: "Database Functions", hint: "Functions stored in the database (not Edge Functions). Call them from the API with rpc, or from policies and triggers.", searchPlaceholder: "Search for a function", empty: "No functions in this schema yet.",
     docs: "https://www.postgresql.org/docs/current/sql-createfunction.html",
-    toolbarAction: (reload, ctx) => h("button", { class: "primary", id: "new-function", onclick: () => functionSheet(null, reload, ctx) }, icon("plus", 15), " New function"),
+    toolbarAction: (reload, ctx) => h("span", { class: "row" },
+      h("button", { class: "primary", id: "new-function", onclick: () => functionSheet(null, reload, ctx) }, icon("plus", 15), " New function"),
+      h("button", { class: "iconbtn", id: "fn-ai", title: "Describe the function to the AI assistant", "aria-label": "Create with AI", onclick: () => { sessionStorage.setItem("baas.ai.prefill", `Create a new function for the schema ${ctx.state.schema} that does `); location.hash = `#/p/${S.project.ref}/ai`; } }, icon("sparkles", 15))),
     filters: [
       { id: "return", label: "Return Type", values: (rows) => [...new Set(rows.map((r) => r.return_type).filter(Boolean))].sort(), test: (r, v) => r.return_type === v },
       { id: "security", label: "Security", values: () => ["Definer", "Invoker"], test: (r, v) => (r.security_definer ? "Definer" : "Invoker") === v },
@@ -1088,6 +1181,16 @@ const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const TYPE_TEXT = /^[\w\s.\[\]()",]+$/;
 
 /** The right-hand "Add a new function" panel. Editing fills the same form from the catalog; unusual functions fall back to raw SQL. */
+/** A textarea with a line-number gutter that scrolls with it. */
+function lineNumbered(area) {
+  const gutter = h("pre", { class: "gutter", "aria-hidden": "true" });
+  const draw = () => { const n = area.value.split("\n").length; gutter.textContent = Array.from({ length: n }, (_, i) => i + 1).join("\n"); gutter.scrollTop = area.scrollTop; };
+  area.addEventListener("input", draw); area.addEventListener("scroll", () => { gutter.scrollTop = area.scrollTop; });
+  area.setAttribute("wrap", "off");
+  draw();
+  return h("div", { class: "code-wrap" }, gutter, area);
+}
+
 async function functionSheet(fn, reload, ctx) {
   if (fn && (!fn.plain_args || /\bdefault\b/i.test(fn.arguments_full || "") || !["sql", "plpgsql"].includes(fn.language) || /^table\(/i.test(fn.return_type || ""))) return functionDialog(fn, reload);
   let list = [];
@@ -1121,7 +1224,7 @@ async function functionSheet(fn, reload, ctx) {
     field("Return type", ret, "void returns nothing; setof … returns several rows; trigger is for trigger functions"), types,
     h("div", { class: "form-section" }, h("h3", null, "Arguments"), h("p", { class: "muted" }, "Arguments can be referenced in the function body using either names or numbers."),
       argBox, h("button", { type: "button", id: "add-arg", onclick: () => addArg() }, icon("plus", 14), " Add a new argument")),
-    h("div", { class: "form-section" }, h("h3", null, "Definition"), h("p", { class: "muted" }, "The language below should be written in ", h("code", null, "plpgsql"), ". Change the language in the advanced settings."), body),
+    h("div", { class: "form-section" }, h("h3", null, "Definition"), h("p", { class: "muted" }, "The language below should be written in ", h("code", null, "plpgsql"), ". Change the language in the advanced settings."), lineNumbered(body)),
     h("details", { class: "form-section", id: "fn-advanced" }, h("summary", null, "Advanced settings"),
       h("div", { class: "stack" }, field("Language", lang), field("Behavior", vol), field("Type of security", sec,
         "Definer runs with the owner's privileges, which bypasses row-level security. Use it carefully and check who may call it."))),
@@ -1319,6 +1422,100 @@ async function dbPage(body, p, page) {
   if (page === "backups") { await backups(body, p); return; }
   if (page === "schema") { await schemaVisualizer(body, p); return; }
   await listPage(body, p, DB_PAGES[page]);
+}
+
+// ---------- advisors ----------
+const ADVISOR_CHECKS = [
+  { id: "rls_disabled", area: "security", level: "error", title: "Table is exposed without row-level security",
+    why: "anon or authenticated can read or change every row of this table through the API, because row-level security is off.",
+    sql: `select c.relname as name from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind in ('r', 'p') and not c.relrowsecurity
+      and (has_table_privilege('anon', c.oid, 'select,insert,update,delete') or has_table_privilege('authenticated', c.oid, 'select,insert,update,delete')) order by 1`,
+    fix: (r) => `alter table public.${JSON.stringify(r.name)} enable row level security;`, target: (r) => `public.${r.name}` },
+  { id: "rls_no_policy", area: "security", level: "info", title: "Row-level security is on but there are no policies",
+    why: "With no policy, the API returns no rows and rejects every write. Add a policy for the roles that should have access.",
+    sql: `select c.relname as name from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind in ('r', 'p') and c.relrowsecurity
+      and not exists (select 1 from pg_policy o where o.polrelid = c.oid) order by 1`,
+    fix: (r) => `create policy "own rows" on public.${JSON.stringify(r.name)} for select to authenticated using (auth.uid() = user_id);\n-- change user_id to the column that holds the owner`, target: (r) => `public.${r.name}` },
+  { id: "permissive_policy", area: "security", level: "warn", title: "Policy lets anonymous users change every row",
+    why: "This policy allows writes to anon (or everyone) with a condition that is always true.",
+    sql: `select policyname || ' on ' || tablename as name, tablename, policyname from pg_policies where schemaname = 'public' and cmd <> 'SELECT'
+      and (qual = 'true' or with_check = 'true') and (roles && array['anon', 'public']::name[]) order by 1`,
+    fix: (r) => `drop policy ${JSON.stringify(r.policyname)} on public.${JSON.stringify(r.tablename)};`, target: (r) => r.name },
+  { id: "definer_fn", area: "security", level: "warn", title: "Function runs with its owner's privileges and can be called from the API",
+    why: "A security definer function ignores row-level security for its owner. Anyone who may execute it can use that power.",
+    sql: `select p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as name from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.prokind = 'f' and p.prosecdef and (has_function_privilege('anon', p.oid, 'execute') or has_function_privilege('authenticated', p.oid, 'execute'))
+      and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e') order by 1`,
+    fix: (r) => `revoke execute on function public.${r.name} from public, anon, authenticated;`, target: (r) => `public.${r.name}` },
+  { id: "no_pk", area: "performance", level: "warn", title: "Table has no primary key",
+    why: "Without a primary key rows cannot be addressed reliably, and updates and deletes through the API are harder to target.",
+    sql: `select c.relname as name from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r'
+      and not exists (select 1 from pg_constraint k where k.conrelid = c.oid and k.contype = 'p') order by 1`,
+    fix: (r) => `alter table public.${JSON.stringify(r.name)} add column id bigint generated always as identity primary key;`, target: (r) => `public.${r.name}` },
+  { id: "fk_no_index", area: "performance", level: "info", title: "Foreign key has no index",
+    why: "Deleting or updating rows in the referenced table scans this table without an index on the foreign key column.",
+    sql: `select (select relname from pg_class where oid = c.conrelid) as tbl, a.attname as col, c.conname as name from pg_constraint c
+      join pg_attribute a on a.attrelid = c.conrelid and a.attnum = c.conkey[1]
+      where c.contype = 'f' and c.connamespace = 'public'::regnamespace and not exists (select 1 from pg_index i where i.indrelid = c.conrelid and i.indkey[0] = c.conkey[1]) order by 1, 2`,
+    fix: (r) => `create index on public.${JSON.stringify(r.tbl)} (${JSON.stringify(r.col)});`, target: (r) => `${r.tbl}.${r.col}` },
+];
+
+async function advisors(body, p) {
+  let area = "security";
+  const slot = h("div", { id: "advisor-slot" });
+  let findings = [];
+  const scan = async () => {
+    clear(slot); slot.append(h("p", { class: "muted" }, "Checking…"));
+    const out = [];
+    await Promise.all(ADVISOR_CHECKS.map(async (c) => {
+      try { for (const r of await catalog(c.sql)) out.push({ check: c, row: r }); } catch { /* a check that cannot run is skipped */ }
+    }));
+    findings = out;
+    draw();
+  };
+  const draw = () => {
+    clear(slot);
+    const count = (a) => findings.filter((f) => f.check.area === a).length;
+    const tabBtn = (a, label) => h("button", { class: `tab ${a === area ? "on" : ""}`, id: `adv-tab-${a}`, onclick: () => { area = a; draw(); } }, label, h("span", { class: "count" }, String(count(a))));
+    const shown = findings.filter((f) => f.check.area === area).sort((a, b) => ["error", "warn", "info"].indexOf(a.check.level) - ["error", "warn", "info"].indexOf(b.check.level) || a.check.id.localeCompare(b.check.id));
+    slot.append(h("div", { class: "tabs" }, tabBtn("security", "Security"), tabBtn("performance", "Performance")),
+      shown.length ? h("div", { class: "findings" }, shown.map((f) => h("div", { class: `finding ${f.check.level}`, "data-check": f.check.id, "data-target": f.check.target(f.row) },
+        h("div", { class: "row between" }, h("div", { class: "row" }, h("span", { class: `level ${f.check.level}` }, { error: "Error", warn: "Warning", info: "Info" }[f.check.level]), h("strong", null, f.check.title)),
+          h("button", { class: "small", "data-action": "open-fix", onclick: () => openInSql(f.check.fix(f.row)) }, "Open fix in SQL editor")),
+        h("div", { class: "mono target" }, f.check.target(f.row)), h("p", { class: "muted" }, f.check.why))))
+        : h("div", { class: "empty card", id: "advisor-clear" }, `No ${area} issues found.`));
+  };
+  clear(body);
+  body.append(h("div", null,
+    h("div", { class: "page-head" }, h("h1", null, "Advisors"), h("button", { id: "adv-refresh", onclick: scan }, "Run checks again")),
+    h("p", { class: "muted pagehint" }, "Checks of the public schema for common mistakes. They read the catalog only and change nothing; every suggested fix opens in the SQL editor for you to review and run."),
+    slot));
+  await scan();
+}
+
+// ---------- reports ----------
+async function reports(body, p) {
+  const range = h("select", { id: "report-range", "aria-label": "Time range" }, [[24, "Last 24 hours"], [72, "Last 3 days"], [168, "Last 7 days"]].map(([v, l]) => h("option", { value: v }, l)));
+  const slot = h("div", { id: "report-slot" });
+  const load = async () => {
+    const hours = Number(range.value);
+    const m = await api("GET", `/v1/projects/${p.ref}/metrics?hours=${hours}`);
+    const sum = (a) => a.reduce((x, y) => x + y, 0);
+    clear(slot);
+    slot.append(
+      h("div", { class: "metrics-head" }, h("div", { class: "num", id: "report-total" }, m.totals.requests.toLocaleString(), h("span", null, "Total Requests")),
+        h("div", { class: "num" }, m.totals.successRate === null ? "—" : `${m.totals.successRate.toFixed(1)}%`, h("span", null, "Success Rate"))),
+      metricsView(m, hours),
+      h("div", { class: "tablewrap" }, h("table", { class: "data", id: "report-table" },
+        h("thead", null, h("tr", null, ["Service", "Requests", "Client errors", "Server errors"].map((x) => h("th", null, x)))),
+        h("tbody", null, Object.entries(SERVICE_LABELS).map(([k, label]) => h("tr", { "data-service": k },
+          h("td", null, label), h("td", null, sum(m.services[k].requests).toLocaleString()), h("td", null, sum(m.services[k].warnings).toLocaleString()), h("td", null, sum(m.services[k].errors).toLocaleString())))))));
+  };
+  range.addEventListener("change", load);
+  clear(body);
+  body.append(h("div", null, h("div", { class: "page-head" }, h("h1", null, "Reports"), range),
+    h("p", { class: "muted pagehint" }, "Requests through this project's API, by service. Counted per hour; warnings are client errors (4xx) and errors are server errors (5xx)."), slot));
+  await load();
 }
 
 // ---------- authentication ----------

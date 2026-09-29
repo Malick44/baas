@@ -321,6 +321,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await page.click("#new-function");
     await page.waitForSelector("dialog.sheet");
     assert.match((await page.textContent("dialog.sheet"))!, /Add a new function[\s\S]*Schema[\s\S]*Name of function[\s\S]*Return type[\s\S]*Arguments[\s\S]*Definition[\s\S]*Advanced settings/);
+    assert.equal(await page.textContent(".code-wrap .gutter"), "1\n2\n3", "the definition editor has line numbers");
     await shot("06e-db-function-sheet");
 
     // A bad name is refused inside the panel, which stays open.
@@ -653,6 +654,99 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await page.waitForSelector("#rt-events .event:has-text('live from api')", { timeout: 8000 });
     assert.match((await page.textContent("#rt-events .event"))!, /INSERT notes/);
     await shot("10-realtime");
+  });
+
+  step("sends a function idea to Ask AI from the functions page", async () => {
+    await tab("database", "functions");
+    await page.click("#fn-ai");
+    // The assistant is off here; the idea waits until it is turned on.
+    await page.waitForSelector("#ai-off");
+    await page.click("#ai-enable");
+    await page.waitForSelector("dialog");
+    await page.click("dialog button[type=submit]");
+    await page.waitForSelector("#ai-input");
+    assert.equal(await page.inputValue("#ai-input"), "Create a new function for the schema public that does ");
+    await page.click("#ai-disable");
+    await page.click("dialog button[type=submit]");
+    await page.waitForSelector("#ai-off");
+  });
+
+  step("has working top-bar controls: switchers, help, command line and feedback", async () => {
+    await tab("overview");
+    await page.click("#project-switch");
+    await page.waitForSelector(`.menu button[data-ref='${ref}']`);
+    await page.click(`.menu button[data-ref='${ref}']`);
+    await page.click("#branch-switch");
+    assert.match((await page.textContent(".menu"))!, /main[\s\S]*production[\s\S]*Preview branches are not part of baas yet/i);
+    await page.mouse.click(5, 300);
+    await page.click("#org-switch");
+    assert.match((await page.textContent(".menu"))!, /e2e-org[\s\S]*All projects/);
+    await page.mouse.click(5, 300);
+    await page.click("#help-btn");
+    assert.match((await page.textContent(".menu"))!, /Documentation[\s\S]*Report a problem[\s\S]*Keyboard shortcuts/);
+    await page.click(".menu >> text=Keyboard shortcuts");
+    assert.match((await page.textContent("dialog"))!, /Ctrl\/⌘ \+ K[\s\S]*Search pages/);
+    await page.click("dialog button[type=submit]");
+    await page.click("#cli-btn");
+    assert.match((await page.textContent("#cli-snippet"))!, new RegExp(`npx baas link ${ref}`));
+    await page.click("dialog button[type=submit]");
+    assert.match((await page.getAttribute("#advisors-btn", "href"))!, /\/advisors$/);
+    assert.match((await page.getAttribute("#ask-ai-btn", "href"))!, /\/ai$/);
+
+    // Feedback opens a prefilled GitHub issue; nothing is sent from the page itself.
+    await page.evaluate(() => { (window as any).__opened = []; window.open = ((u: string) => { (window as any).__opened.push(u); return null; }) as any; });
+    await page.click("#feedback-btn");
+    await page.fill("#feedback-text", "Love the new layout & the charts");
+    await page.click("dialog button[type=submit]");
+    const opened: string[] = await page.evaluate(() => (window as any).__opened);
+    assert.equal(opened.length, 1);
+    assert.match(opened[0]!, /^https:\/\/github\.com\/Malick44\/baas\/issues\/new\?title=.*&body=Love%20the%20new%20layout%20%26%20the%20charts$/);
+  });
+
+  step("collapses the database sidebar and remembers it", async () => {
+    await tab("database", "tables");
+    assert.equal(await page.isVisible("nav.sub"), true);
+    await page.click("#toggle-sub");
+    assert.equal(await page.isVisible("nav.sub"), false);
+    await page.reload();
+    await page.waitForSelector("#tab-body[data-page='database/tables']");
+    assert.equal(await page.isVisible("nav.sub"), false, "stays collapsed after a reload");
+    await page.click("#toggle-sub");
+    assert.equal(await page.isVisible("nav.sub"), true);
+  });
+
+  step("advisors report risky tables and open the fix in the SQL editor", async () => {
+    await t.sql(owner, ref, "create table public.loose (owner_id bigint references public.notes(id), note text)");
+    await t.sql(owner, ref, "grant select on public.loose to anon");
+    await tab("advisors");
+    await page.waitForSelector(".finding[data-check=rls_disabled][data-target='public.loose']");
+    assert.match((await page.textContent(".finding[data-check=rls_disabled]"))!, /Error[\s\S]*exposed without row-level security/);
+    assert.equal(await page.locator(".finding[data-check=rls_disabled][data-target='public.notes']").count(), 0, "a table with row-level security on is not flagged");
+    assert.equal(await page.textContent("#adv-tab-security .count") !== "0", true);
+    await page.click("#adv-tab-performance");
+    await page.waitForSelector(".finding[data-check=no_pk][data-target='public.loose']");
+    await page.waitForSelector(".finding[data-check=fk_no_index][data-target='loose.owner_id']");
+    await shot("06f-advisors");
+    await page.click("#adv-tab-security");
+    await page.click(".finding[data-check=rls_disabled][data-target='public.loose'] [data-action=open-fix]");
+    await page.waitForSelector("#sql-input");
+    assert.equal(await page.inputValue("#sql-input"), 'alter table public."loose" enable row level security;');
+    await t.sql(owner, ref, 'alter table public."loose" enable row level security');
+    await tab("advisors");
+    await page.waitForFunction(() => !document.querySelector(".finding[data-check=rls_disabled]") || document.querySelector(".finding[data-check=rls_disabled]")?.getAttribute("data-target") !== "public.loose");
+    await t.sql(owner, ref, "drop table public.loose");
+  });
+
+  step("shows reports per service with a selectable range", async () => {
+    await tab("reports");
+    await page.waitForSelector("#report-table");
+    const api = (await t.api("GET", `/v1/projects/${ref}/metrics?hours=24`, { token: owner })).json;
+    assert.equal(Number((await page.textContent("#report-total"))!.replace(/[^\d]/g, "").slice(0, String(api.totals.requests).length)), api.totals.requests);
+    assert.deepEqual(await page.locator("#report-table tbody tr td:first-child").allTextContents(), ["REST API", "Auth", "Storage", "Edge Functions", "Realtime"]);
+    assert.ok(Number((await page.textContent("#report-table tr[data-service=rest] td:nth-child(2)"))!.replace(/,/g, "")) > 0);
+    await page.selectOption("#report-range", "168");
+    await page.waitForFunction(() => document.querySelectorAll(".metric[data-service=rest] svg rect").length === 56);
+    await shot("06g-reports");
   });
 
   step("lists request logs and activity", async () => {
