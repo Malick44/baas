@@ -177,4 +177,6 @@ See [PLAN.md](PLAN.md) for the architecture notes and how the build differs from
 
 From the command line: `baas pipelines list | show | create <name> --tables a,b --url <url> [--events insert,update,delete] [--no-rows] | edit | pause | resume | run | test | deliveries | rotate-secret | delete`. `<pipeline>` is a name or an id (or its first 8 characters). The signing secret is printed once, by `create` and `rotate-secret`.
 
+From the command line: `baas extensions list [--installed|--available] [--search <text>]` and `baas extensions install|remove <name...>`.
+
 **Integrations → Postgres extensions** installs and removes extensions into the `extensions` schema. Only extensions Postgres marks as trusted (or that need no superuser) are offered; the rest need the server operator.

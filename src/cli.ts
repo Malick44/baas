@@ -25,6 +25,8 @@ const USAGE = `baas <command>
   pipelines create <name> --tables <a,b> --url <url> [--events insert,update,delete] [--no-rows]
   pipelines edit <pipeline> [--name <n>] [--tables <a,b>] [--url <url>] [--events <list>] [--rows|--no-rows]
   pipelines pause|resume|run|test|deliveries|rotate-secret|delete <pipeline>
+  extensions list [--installed|--available] [--search <text>]   Postgres extensions (admin role)
+  extensions install|remove <name...>     only extensions Postgres marks as safe for database owners can be installed
   ai status | enable | disable             the plain-language SQL assistant (needs a server-side Anthropic key)
   ai config --allow-bypass-rls true|false   let it ignore row-level security ("everyone" mode; owner only to allow)
   ask "<question>" [--as anon|all] [--as-user <email>]
@@ -42,7 +44,7 @@ function parseArgs(argv: string[]) {
     if (a.startsWith("--")) {
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith("--") && !["no-verify-jwt", "no-rows", "rows"].includes(key)) {
+      if (next !== undefined && !next.startsWith("--") && !["no-verify-jwt", "no-rows", "rows", "installed", "available"].includes(key)) {
         flags[key] = next;
         i++;
       } else flags[key] = true;
@@ -313,6 +315,25 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           await api("DELETE", `${base}/${x.id}`);
           io.out(`Deleted ${x.name}.`);
         } else throw new CliError("usage: baas pipelines list | show | create | edit | pause | resume | run | test | deliveries | rotate-secret | delete (see baas help)");
+        return 0;
+      }
+      case "extensions": {
+        const ref = await projectRef();
+        const base = `/v1/projects/${ref}/extensions`;
+        if (sub === "list" || sub === undefined) {
+          if (flags.installed === true && flags.available === true) throw new CliError("use --installed or --available, not both");
+          const q = typeof flags.search === "string" ? flags.search.toLowerCase() : "";
+          const rows = ((await api("GET", base)) as any[])
+            .filter((e) => (flags.installed === true ? e.installed : flags.available === true ? !e.installed : true) && (!q || `${e.name} ${e.comment ?? ""}`.toLowerCase().includes(q)))
+            .sort((a, b) => Number(b.installed) - Number(a.installed) || Number(b.installable) - Number(a.installable) || a.name.localeCompare(b.name));
+          const state = (e: any) => (e.installed ? (e.protected ? "installed (required)" : "installed") : e.installable ? "available" : "needs operator");
+          io.out(rows.length ? table([["NAME", "VERSION", "STATE", "SCHEMA", "DESCRIPTION"], ...rows.map((e) => [e.name, e.installed_version ?? e.version, state(e), e.schema ?? "", (e.comment ?? "").slice(0, 60)])]) : "No matching extensions.");
+        } else if ((sub === "install" || sub === "remove") && rest.length) {
+          for (const name of rest) {
+            const r = await api("POST", base, { name, install: sub === "install" });
+            io.out(sub === "install" ? `Installed ${r.name} ${r.installed_version} in schema ${r.schema}; call its functions as ${r.schema}.<name>().` : `Removed ${r.name}.`);
+          }
+        } else throw new CliError("usage: baas extensions list [--installed|--available] [--search <text>] | install|remove <name...>");
         return 0;
       }
       case "ai": {

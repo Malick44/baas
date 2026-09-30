@@ -188,6 +188,35 @@ describe("cli", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     }
   });
 
+  it("lists, installs and removes Postgres extensions", async () => {
+    const all = await run("extensions", "list");
+    assert.equal(all.code, 0, all.err);
+    assert.match(all.out, /NAME\s+VERSION\s+STATE\s+SCHEMA\s+DESCRIPTION/);
+    assert.match(all.out, /pgcrypto\s+\S+\s+installed \(required\)\s+extensions/);
+    assert.match(all.out, /pg_trgm\s+\S+\s+available/);
+    assert.ok(all.out.indexOf("pgcrypto") < all.out.indexOf("pg_trgm"), "installed ones come first");
+    assert.match((await run("extensions", "list", "--installed")).out, /pgcrypto/);
+    assert.equal((await run("extensions", "list", "--installed")).out.includes("pg_trgm"), false);
+    assert.match((await run("extensions", "list", "--search", "trigram")).out, /^NAME[\s\S]*pg_trgm[^\n]*$/);
+    assert.match((await run("extensions", "list", "--search", "zzzz-none")).out, /No matching/);
+    assert.equal((await run("extensions", "list", "--installed", "--available")).code, 1);
+
+    const on = await run("extensions", "install", "pg_trgm", "citext");
+    assert.equal(on.code, 0, on.err);
+    assert.match(on.out, /Installed pg_trgm \S+ in schema extensions[\s\S]*Installed citext/);
+    assert.match((await run("sql", "SELECT extensions.similarity('abc', 'abd') > 0 AS ok")).out, /ok\ntrue\n/);
+    assert.equal((await run("extensions", "list", "--available")).out.includes("pg_trgm"), false, "installed ones are not listed as available");
+    assert.match((await run("extensions", "remove", "pg_trgm", "citext")).out, /Removed pg_trgm\.\nRemoved citext\./);
+
+    assert.match((await run("extensions", "remove", "pgcrypto")).err, /used by the platform/);
+    assert.match((await run("extensions", "install", "no_such_ext")).err, /not available/);
+    const all2 = (await run("extensions", "list")).out;
+    const opOnly = /^(\S+)\s+\S+\s+needs operator/m.exec(all2);
+    if (opOnly) assert.match((await run("extensions", "install", opOnly[1]!)).err, /server operator/);
+    assert.equal((await run("extensions", "install")).code, 1);
+    assert.equal((await run("extensions", "bogus")).code, 1);
+  });
+
   it("asks the AI assistant and shows proposals without running them", async () => {
     assert.match((await run("ai", "status")).out, /off/);
     assert.match((await run("ask", "how", "many", "people?")).err, /not enabled/);
