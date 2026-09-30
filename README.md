@@ -175,4 +175,6 @@ See [PLAN.md](PLAN.md) for the architecture notes and how the build differs from
 - Rows are read with the platform's own access at delivery time: row-level security does not apply, and the row is the current one, not a snapshot. Turn off "include the row" to send only primary keys.
 - Destinations on private, loopback or link-local addresses are refused, and the connection is pinned to the address that was checked. Operators can allow them for development with `pipelines.allowPrivateTargets`.
 
+From the command line: `baas pipelines list | show | create <name> --tables a,b --url <url> [--events insert,update,delete] [--no-rows] | edit | pause | resume | run | test | deliveries | rotate-secret | delete`. `<pipeline>` is a name or an id (or its first 8 characters). The signing secret is printed once, by `create` and `rotate-secret`.
+
 **Integrations → Postgres extensions** installs and removes extensions into the `extensions` schema. Only extensions Postgres marks as trusted (or that need no superuser) are offered; the rest need the server operator.

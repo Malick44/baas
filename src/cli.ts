@@ -21,6 +21,10 @@ const USAGE = `baas <command>
   db status [--dir baas/migrations]
   functions list | deploy <name> <file> [--no-verify-jwt] | delete <name> | logs <name>
   backups list | create [--note <text>] | restore <id>
+  pipelines list | show <pipeline>        send row changes to a webhook (admin role); <pipeline> is a name or id
+  pipelines create <name> --tables <a,b> --url <url> [--events insert,update,delete] [--no-rows]
+  pipelines edit <pipeline> [--name <n>] [--tables <a,b>] [--url <url>] [--events <list>] [--rows|--no-rows]
+  pipelines pause|resume|run|test|deliveries|rotate-secret|delete <pipeline>
   ai status | enable | disable             the plain-language SQL assistant (needs a server-side Anthropic key)
   ai config --allow-bypass-rls true|false   let it ignore row-level security ("everyone" mode; owner only to allow)
   ask "<question>" [--as anon|all] [--as-user <email>]
@@ -38,7 +42,7 @@ function parseArgs(argv: string[]) {
     if (a.startsWith("--")) {
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith("--") && !["no-verify-jwt"].includes(key)) {
+      if (next !== undefined && !next.startsWith("--") && !["no-verify-jwt", "no-rows", "rows"].includes(key)) {
         flags[key] = next;
         i++;
       } else flags[key] = true;
@@ -232,6 +236,83 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           await api("POST", `/v1/projects/${ref}/backups/${rest[0]}/restore`);
           io.out(`Restored ${ref} from ${rest[0]}.`);
         } else throw new CliError("usage: baas backups list | create [--note <text>] | restore <id>");
+        return 0;
+      }
+      case "pipelines": {
+        const ref = await projectRef();
+        const base = `/v1/projects/${ref}/pipelines`;
+        const one = async (which: string | undefined) => {
+          if (!which) throw new CliError("name the pipeline: baas pipelines list shows names and ids");
+          const all = (await api("GET", base)) as any[];
+          const hit = all.filter((x) => x.id === which || x.name.toLowerCase() === which.toLowerCase());
+          const found = hit.length ? hit : which.length >= 8 ? all.filter((x) => x.id.startsWith(which)) : [];
+          if (found.length > 1) throw new CliError(`"${which}" matches more than one pipeline; use its id`);
+          if (!found[0]) throw new CliError(`no pipeline named "${which}"`);
+          return found[0];
+        };
+        const list = (v: unknown, what: string, upper = false) => {
+          const items = String(v).split(",").map((x) => x.trim()).filter(Boolean).map((x) => (upper ? x.toUpperCase() : x));
+          if (!items.length) throw new CliError(`${what} must be a comma-separated list`);
+          return items;
+        };
+        const when = (d: unknown) => (d ? new Date(String(d)).toISOString().replace("T", " ").slice(0, 19) : "never");
+        const secretNote = (secret: string) => `Signing secret (shown once, keep it safe):\n  ${secret}\nDeliveries carry X-Baas-Signature: t=<unix time>,v1=<hex HMAC-SHA256 of "<t>.<body>">.`;
+        const fields = () => {
+          const body: Record<string, unknown> = {};
+          if (typeof flags.name === "string") body.name = flags.name;
+          if (flags.tables !== undefined) body.tables = list(flags.tables, "--tables");
+          if (flags.events !== undefined) body.events = list(flags.events, "--events", true);
+          if (typeof flags.url === "string") body.url = flags.url;
+          if (flags["no-rows"] === true) body.include_rows = false;
+          else if (flags.rows === true) body.include_rows = true;
+          return body;
+        };
+        if (sub === "list" || sub === undefined) {
+          const rows = (await api("GET", base)) as any[];
+          io.out(rows.length
+            ? table([["NAME", "STATUS", "TABLES", "EVENTS", "DELIVERED", "LAST DELIVERY", "DESTINATION"], ...rows.map((x) => [x.name, x.status, x.tables.join(","), x.events.map((e: string) => e[0]).join(""), String(x.delivered), when(x.last_success_at), (() => { try { return new URL(x.url).host; } catch { return x.url; } })()])])
+            : "No pipelines.");
+        } else if (sub === "show") {
+          const x = await one(rest[0]);
+          io.out([`name:        ${x.name}`, `id:          ${x.id}`, `status:      ${x.status}${x.disabled_reason ? ` (${x.disabled_reason})` : ""}`, `tables:      ${x.tables.join(", ")}`, `events:      ${x.events.join(", ")}`,
+            `rows:        ${x.include_rows ? "included" : "primary key only"}`, `destination: ${x.url}`, `delivered:   ${x.delivered}, failed ${x.failed}`, `last ok:     ${when(x.last_success_at)}`,
+            ...(x.last_error ? [`last error:  ${x.last_error}`] : [])].join("\n"));
+        } else if (sub === "create") {
+          if (!rest[0] || flags.tables === undefined || typeof flags.url !== "string") throw new CliError("usage: baas pipelines create <name> --tables <a,b> --url <url> [--events insert,update,delete] [--no-rows]");
+          const x = await api("POST", base, { ...fields(), name: rest[0] });
+          io.out(`Created pipeline ${x.name} (${x.id}). It sends changes made from now on.\n${secretNote(x.secret)}`);
+        } else if (sub === "edit") {
+          const x = await one(rest[0]);
+          const body = fields();
+          if (!Object.keys(body).length) throw new CliError("nothing to change: pass --name, --tables, --url, --events, --rows or --no-rows");
+          const r = await api("PATCH", `${base}/${x.id}`, body);
+          io.out(`Updated ${r.name}.`);
+        } else if (sub === "pause" || sub === "resume") {
+          const x = await one(rest[0]);
+          const r = await api("PATCH", `${base}/${x.id}`, { enabled: sub === "resume" });
+          io.out(`${r.name}: ${r.status}`);
+        } else if (sub === "run") {
+          const x = await one(rest[0]);
+          const r = await api("POST", `${base}/${x.id}/run`);
+          io.out(`${r.name}: ${r.status}, ${r.delivered} delivered${r.last_error ? `\nlast error: ${r.last_error}` : ""}`);
+        } else if (sub === "test") {
+          const x = await one(rest[0]);
+          const r = await api("POST", `${base}/${x.id}/test`);
+          if (!r.ok) throw new CliError(`test event failed${r.status ? ` (${r.status})` : ""}: ${r.error}`);
+          io.out(`Test event delivered: ${r.status} in ${r.ms} ms.`);
+        } else if (sub === "deliveries") {
+          const x = await one(rest[0]);
+          const rows = (await api("GET", `${base}/${x.id}/deliveries`)) as any[];
+          io.out(rows.length ? table([["WHEN", "KIND", "RESULT", "EVENTS", "MS"], ...rows.map((d) => [when(d.at), d.kind, d.ok ? `ok ${d.status}` : (d.error ?? "failed").slice(0, 80), String(d.events), String(d.ms ?? "")])]) : "No deliveries yet.");
+        } else if (sub === "rotate-secret") {
+          const x = await one(rest[0]);
+          const r = await api("POST", `${base}/${x.id}/rotate-secret`);
+          io.out(`New signing secret for ${x.name}; the old one no longer signs.\n${secretNote(r.secret)}`);
+        } else if (sub === "delete") {
+          const x = await one(rest[0]);
+          await api("DELETE", `${base}/${x.id}`);
+          io.out(`Deleted ${x.name}.`);
+        } else throw new CliError("usage: baas pipelines list | show | create | edit | pause | resume | run | test | deliveries | rotate-secret | delete (see baas help)");
         return 0;
       }
       case "ai": {

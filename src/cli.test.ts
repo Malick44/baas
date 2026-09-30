@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +27,7 @@ describe("cli", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
   };
 
   before(async () => {
-    t = await makePlatform(ADMIN!, { ai: { llm: fake } });
+    t = await makePlatform(ADMIN!, { ai: { llm: fake }, pipelines: { allowPrivateTargets: true, backoffBaseMs: 10 } });
     const ports = await t.platform.listen({ api: 0, gateway: 0, host: "127.0.0.1" });
     apiUrl = `http://127.0.0.1:${ports.api}`;
     owner = await t.org();
@@ -117,6 +119,73 @@ describe("cli", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     await writeFile(join(cwd, "broken.mjs"), "export default (");
     assert.match((await run("functions", "deploy", "broken", "broken.mjs")).err, /syntax error/);
     assert.match((await run("functions", "delete", "hello")).out, /Deleted hello/);
+  });
+
+  it("manages pipelines: create, deliver, inspect, pause, rotate and delete", async () => {
+    const got: { sig: string; raw: string }[] = [];
+    let answer = 200;
+    const hook = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (d) => chunks.push(d));
+      req.on("end", () => { got.push({ sig: String(req.headers["x-baas-signature"]), raw: Buffer.concat(chunks).toString() }); res.statusCode = answer; res.end("x"); });
+    });
+    await new Promise<void>((r) => hook.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${(hook.address() as AddressInfo).port}/h`;
+    try {
+      assert.match((await run("pipelines", "list")).out, /No pipelines/);
+      assert.equal((await run("pipelines", "create", "p1")).code, 1, "tables and url are required");
+      assert.match((await run("pipelines", "create", "p1", "--tables", "nope", "--url", url)).err, /no such table/);
+      assert.match((await run("pipelines", "create", "p1", "--tables", "people", "--url", "ftp://x/y")).err, /http/);
+      assert.match((await run("pipelines", "create", "p1", "--tables", "people", "--url", url, "--events", "truncate")).err, /events/);
+
+      const c = await run("pipelines", "create", "people-hook", "--tables", "people", "--url", url, "--events", "insert,update");
+      assert.equal(c.code, 0, c.err);
+      const secret = /whsec_[\w-]+/.exec(c.out)![0];
+      assert.match(c.out, /shown once/);
+      assert.equal((await run("pipelines", "create", "people-hook", "--tables", "people", "--url", url)).code, 1, "names are unique");
+      assert.match((await run("pipelines", "list")).out, /NAME\s+STATUS[\s\S]*people-hook\s+healthy\s+people\s+IU\s+0\s+never\s+127\.0\.0\.1:/);
+      assert.equal((await run("pipelines", "list")).out.includes("whsec_"), false);
+
+      await run("sql", "INSERT INTO public.people (name) VALUES ('via cli'); DELETE FROM public.people WHERE name = 'via cli'");
+      const r = await run("pipelines", "run", "people-hook");
+      assert.match(r.out, /people-hook: healthy, 1 delivered/, r.err);
+      const body = JSON.parse(got[0]!.raw);
+      assert.deepEqual(body.events.map((e: any) => e.type), ["INSERT"], "the delete is not in --events");
+      const m = /t=(\d+),v1=(\w+)/.exec(got[0]!.sig)!;
+      assert.equal(m[2], (await import("node:crypto")).createHmac("sha256", secret).update(`${m[1]}.${got[0]!.raw}`).digest("hex"));
+
+      assert.match((await run("pipelines", "show", "PEOPLE-HOOK")).out, /status:\s+healthy\ntables:\s+people\nevents:\s+INSERT, UPDATE\nrows:\s+included/);
+      assert.match((await run("pipelines", "test", "people-hook")).out, /Test event delivered: 200/);
+      assert.match((await run("pipelines", "deliveries", "people-hook")).out, /WHEN\s+KIND\s+RESULT[\s\S]*test\s+ok 200[\s\S]*delivery\s+ok 200\s+1/);
+
+      answer = 500;
+      const bad = await run("pipelines", "test", "people-hook");
+      assert.equal(bad.code, 1);
+      assert.match(bad.err, /test event failed \(500\)/);
+      answer = 200;
+
+      assert.match((await run("pipelines", "edit", "people-hook", "--no-rows", "--events", "insert")).out, /Updated people-hook/);
+      assert.match((await run("pipelines", "show", "people-hook")).out, /events:\s+INSERT\nrows:\s+primary key only/);
+      assert.equal((await run("pipelines", "edit", "people-hook")).code, 1);
+
+      assert.match((await run("pipelines", "pause", "people-hook")).out, /paused/);
+      assert.match((await run("pipelines", "run", "people-hook")).err, /paused/);
+      assert.match((await run("pipelines", "resume", "people-hook")).out, /healthy/);
+
+      const rot = await run("pipelines", "rotate-secret", "people-hook");
+      assert.match(rot.out, /whsec_/);
+      assert.notEqual(/whsec_[\w-]+/.exec(rot.out)![0], secret);
+
+      const id = /\(([0-9a-f-]{36})\)/.exec(c.out)![1]!;
+      assert.match((await run("pipelines", "show", id.slice(0, 8))).out, /name:\s+people-hook/, "an id prefix works");
+      assert.match((await run("pipelines", "show", "nope")).err, /no pipeline named/);
+      assert.equal((await run("pipelines", "show")).code, 1);
+      assert.match((await run("pipelines", "delete", "people-hook")).out, /Deleted people-hook/);
+      assert.match((await run("pipelines", "list")).out, /No pipelines/);
+      assert.equal((await run("pipelines", "bogus")).code, 1);
+    } finally {
+      hook.close();
+    }
   });
 
   it("asks the AI assistant and shows proposals without running them", async () => {
