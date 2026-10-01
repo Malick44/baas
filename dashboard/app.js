@@ -331,6 +331,7 @@ function pageIndex(ref) {
   const out = [["Projects", "#/projects"]];
   for (const n of NAV) if (n.id && n.id !== "database") out.push([n.label, `#/p/${ref}/${n.id}`]);
   for (const g of DB_MENU) for (const [id, label, tabId] of g.items) if (!tabId) out.push([`Database › ${label}`, `#/p/${ref}/database/${id}`]);
+  for (const g of AUTH_MENU) for (const [id, label] of g.items) out.push([`Authentication › ${label}`, `#/p/${ref}/auth/${id}`]);
   return out;
 }
 function openPalette() {
@@ -443,6 +444,12 @@ const DB_MENU = [
   { title: "Configuration", items: [["settings", "Settings", "settings"]] },
   { title: "Platform", items: [["pipelines", "Pipelines", null, true], ["backups", "Backups"], ["migrations", "Migrations"]] },
 ];
+const AUTH_MENU = [
+  { title: "Manage", items: [["users", "Users"]] },
+  { title: "Configuration", items: [["providers", "Sign-in providers"], ["urls", "URL configuration"], ["email", "Email"], ["sessions", "Sessions and sign-ups"]] },
+];
+/** Sections with their own second sidebar. */
+const SUBMENUS = { database: { menu: DB_MENU, first: "schema", title: "Database" }, auth: { menu: AUTH_MENU, first: "users", title: "Authentication" } };
 const OLD_TABS = { backups: "database/backups" };
 
 async function renderProject(ref, tab, page) {
@@ -454,13 +461,14 @@ async function renderProject(ref, tab, page) {
   }
   const p = S.project;
   if (!NAV.some((n) => n.id === tab)) tab = "overview";
-  if (tab === "database" && !DB_MENU.some((g) => g.items.some(([id]) => id === page))) page = "schema";
-  const body = h("div", { id: "tab-body", "data-page": tab === "database" ? `database/${page}` : tab }, h("p", { class: "muted" }, "Loading…"));
+  const subm = SUBMENUS[tab];
+  if (subm && !subm.menu.some((g) => g.items.some(([id]) => id === page))) page = subm.first;
+  const body = h("div", { id: "tab-body", "data-page": subm ? `${tab}/${page}` : tab }, h("p", { class: "muted" }, "Loading…"));
   const rail = h("nav", { class: "rail", "aria-label": "Project sections" }, NAV.map((n) =>
     n.divider ? h("div", { class: "divider" }) : n.grow ? h("div", { class: "grow" })
-      : h("a", { href: `#/p/${ref}/${n.id === "database" ? "database/schema" : n.id}`, class: n.id === tab ? "on" : "", "data-tab": n.id, title: n.label, "aria-label": n.label }, icon(n.icon, 19))));
-  const sub = tab === "database" ? h("nav", { class: "sub", "aria-label": "Database" }, h("div", { class: "title" }, "Database"),
-    DB_MENU.map((g) => [h("div", { class: "group label" }, g.title), g.items.map(([id, label, tabId, isNew]) => h("a", { href: tabId ? `#/p/${ref}/${tabId}` : `#/p/${ref}/database/${id}`, class: !tabId && id === page ? "on" : "", "data-dbpage": id }, label, isNew ? h("span", { class: "new" }, "NEW") : null))])) : null;
+      : h("a", { href: `#/p/${ref}/${SUBMENUS[n.id] ? `${n.id}/${SUBMENUS[n.id].first}` : n.id}`, class: n.id === tab ? "on" : "", "data-tab": n.id, title: n.label, "aria-label": n.label }, icon(n.icon, 19))));
+  const sub = subm ? h("nav", { class: "sub", "aria-label": subm.title }, h("div", { class: "title" }, subm.title),
+    subm.menu.map((g) => [h("div", { class: "group label" }, g.title), g.items.map(([id, label, tabId, isNew]) => h("a", { href: tabId ? `#/p/${ref}/${tabId}` : `#/p/${ref}/${tab}/${id}`, class: !tabId && id === page ? "on" : "", "data-dbpage": id }, label, isNew ? h("span", { class: "new" }, "NEW") : null))])) : null;
   let hidden = false;
   try { hidden = localStorage.getItem("baas.sub.hidden") === "1"; } catch { /* ignore */ }
   const frame = h("div", { class: `frame ${sub ? "with-sub" : ""} ${sub && hidden ? "sub-hidden" : ""}` });
@@ -475,9 +483,10 @@ async function renderProject(ref, tab, page) {
     h("main", { class: "content" },
       p.status === "paused" && h("div", { class: "notice warn", id: "paused-note" }, "This project is paused: its API is offline. Resume it in Project settings."),
       body)].filter(Boolean));
-  const fn = { overview, tables, sql, ai, advisors, reports, integrations, auth, storage, functions, realtime, logs, settings }[tab];
+  const fn = { overview, tables, sql, ai, advisors, reports, integrations, storage, functions, realtime, logs, settings }[tab];
   try {
     if (tab === "database") await dbPage(body, p, page);
+    else if (tab === "auth") await authPage(body, p, page);
     else await fn(body, p);
   } catch (ex) {
     clear(body);
@@ -2009,33 +2018,195 @@ async function integrations(body, p) {
 }
 
 // ---------- authentication ----------
-async function auth(body) {
+async function authPage(body, p, page) {
+  const cfg = await api("GET", `/v1/projects/${p.ref}/auth-config`);
+  const canEdit = S.me.role !== "developer";
+  const pages = { users: authUsers, providers: authProviders, urls: authUrls, email: authEmail, sessions: authSessions };
+  await pages[page](body, p, cfg, canEdit);
+}
+
+const saveAuthSettings = async (p, patch) => { const r = await api("PATCH", `/v1/projects/${p.ref}/settings`, patch); await refreshProject().catch(() => {}); return r; };
+const needAdmin = (canEdit) => (canEdit ? null : h("div", { class: "notice warn" }, "Changing these settings needs the admin role."));
+
+async function authUsers(body, p, cfg) {
   const load = async () => (await gw("/auth/v1/admin/users?per_page=100")).data;
   let { users, total } = await load();
+  const mailTo = async (path, email, ok) => { try { await gw(path, { method: "POST", body: { email } }); toast(ok, "ok"); } catch (ex) { toast(ex.message, "bad"); } };
   const draw = () => {
     clear(body);
     body.append(h("div", { class: "stack" },
-      h("div", { class: "row between" }, h("h2", null, "Users ", h("span", { class: "muted", id: "user-count" }, `(${total})`)),
+      h("div", { class: "page-head" }, h("h1", null, "Users ", h("span", { class: "muted", id: "user-count" }, `(${total})`)),
         h("button", { class: "primary", id: "new-user", onclick: async () => {
+          const confirmBox_ = h("input", { type: "checkbox", id: "user-confirm", checked: true });
           const u = await dialog("Create user", () => h("div", { class: "stack" },
             h("label", { class: "field" }, "Email", h("input", { name: "email", type: "email", required: true, id: "user-email" })),
-            h("label", { class: "field" }, "Password", h("input", { name: "password", type: "password", required: true, minlength: 6, id: "user-password" }))), {
-            confirmLabel: "Create user", onSubmit: async (fd) => (await gw("/auth/v1/admin/users", { method: "POST", body: { email: fd.get("email"), password: fd.get("password") } })).data,
+            h("label", { class: "field" }, "Password", h("input", { name: "password", type: "password", required: true, minlength: 6, id: "user-password" })),
+            h("label", { class: "check" }, confirmBox_, "Mark the email address as confirmed")), {
+            confirmLabel: "Create user", onSubmit: async (fd) => (await gw("/auth/v1/admin/users", { method: "POST", body: { email: fd.get("email"), password: fd.get("password"), email_confirm: confirmBox_.checked } })).data,
           });
           if (u) { toast("User created", "ok"); ({ users, total } = await load()); draw(); }
         } }, "Create user")),
       h("div", { class: "tablewrap" }, users.length
         ? h("table", { class: "data", id: "users" },
           h("thead", null, h("tr", null, ["Email", "ID", "Created", "Last sign in", "Status", ""].map((x) => h("th", null, x)))),
-          h("tbody", null, users.map((u) => h("tr", { "data-email": u.email },
-            h("td", null, u.email), h("td", { class: "mono" }, u.id), h("td", null, fmtDate(u.created_at)), h("td", null, fmtDate(u.last_sign_in_at)),
-            h("td", null, u.banned_until && new Date(u.banned_until) > new Date() ? h("span", { class: "bad" }, "banned") : "active"),
-            h("td", { class: "row" },
-              h("button", { class: "small", onclick: async () => { const banned = u.banned_until && new Date(u.banned_until) > new Date(); await gw(`/auth/v1/admin/users/${u.id}`, { method: "PUT", body: { ban_duration: banned ? "none" : "876000h" } }); toast(banned ? "User unbanned" : "User banned", "ok"); ({ users, total } = await load()); draw(); } }, u.banned_until && new Date(u.banned_until) > new Date() ? "Unban" : "Ban"),
-              h("button", { class: "small danger", "data-action": "delete-user", onclick: async () => { if (await confirmBox("Delete user", `Delete ${u.email}? Their sessions end immediately.`, { confirmLabel: "Delete" })) { await gw(`/auth/v1/admin/users/${u.id}`, { method: "DELETE" }); toast("User deleted", "ok"); ({ users, total } = await load()); draw(); } } }, "Delete"))))))
+          h("tbody", null, users.map((u) => {
+            const banned = u.banned_until && new Date(u.banned_until) > new Date();
+            const unconfirmed = !u.email_confirmed_at;
+            const mail = [];
+            if (cfg.email_delivery && u.email) {
+              mail.push(["Send password recovery", () => mailTo("/auth/v1/recover", u.email, `Recovery email sent to ${u.email}`), { action: "send-recovery" }]);
+              mail.push(["Send magic link", () => mailTo("/auth/v1/magiclink", u.email, `Sign-in link sent to ${u.email}`), { action: "send-magic" }]);
+              if (unconfirmed) mail.push(["Resend confirmation email", () => mailTo("/auth/v1/resend", u.email, `Confirmation email sent to ${u.email}`), { action: "resend-confirm" }]);
+            }
+            if (unconfirmed) mail.push(["Mark email as confirmed", async () => { try { await gw(`/auth/v1/admin/users/${u.id}`, { method: "PUT", body: { email_confirm: true } }); toast("Email confirmed", "ok"); ({ users, total } = await load()); draw(); } catch (ex) { toast(ex.message, "bad"); } }, { action: "confirm-email" }]);
+            return h("tr", { "data-email": u.email },
+              h("td", null, u.email), h("td", { class: "mono" }, u.id), h("td", null, fmtDate(u.created_at)), h("td", null, fmtDate(u.last_sign_in_at)),
+              h("td", null, banned ? h("span", { class: "bad" }, "banned") : unconfirmed ? h("span", { class: "warn", "data-status": "unconfirmed", title: "Has not confirmed the email address" }, "unconfirmed") : "active"),
+              h("td", { class: "row" },
+                h("button", { class: "small", onclick: async () => { await gw(`/auth/v1/admin/users/${u.id}`, { method: "PUT", body: { ban_duration: banned ? "none" : "876000h" } }); toast(banned ? "User unbanned" : "User banned", "ok"); ({ users, total } = await load()); draw(); } }, banned ? "Unban" : "Ban"),
+                h("button", { class: "small danger", "data-action": "delete-user", onclick: async () => { if (await confirmBox("Delete user", `Delete ${u.email}? Their sessions end immediately.`, { confirmLabel: "Delete" })) { await gw(`/auth/v1/admin/users/${u.id}`, { method: "DELETE" }); toast("User deleted", "ok"); ({ users, total } = await load()); draw(); } } }, "Delete"),
+                mail.length ? rowMenu(mail) : null));
+          })))
         : h("div", { class: "empty" }, "No users yet. They appear here when someone signs up through the API."))));
   };
   draw();
+}
+
+// ---------- authentication settings ----------
+const PROVIDER_HELP = {
+  google: "Create an OAuth client (type Web application) in the Google Cloud console under APIs & Services → Credentials.",
+  github: "Create an OAuth App under GitHub → Settings → Developer settings → OAuth Apps.",
+  gitlab: "Create an application under GitLab → User settings → Applications, with the read_user, openid and email scopes.",
+  discord: "Create an application at discord.com/developers/applications and add the redirect under OAuth2.",
+  microsoft: "Register an app in the Microsoft Entra admin center (App registrations) and add the redirect as a Web platform URI.",
+};
+
+async function authProviders(body, p, cfg, canEdit) {
+  const slot = h("div", { id: "provider-slot" });
+  let state = cfg;
+  const sheet = async (pr) => {
+    const enabled = h("input", { type: "checkbox", id: "prov-enabled", checked: pr.enabled });
+    const clientId = h("input", { id: "prov-client-id", autocomplete: "off", value: pr.client_id, placeholder: "Client ID" });
+    const secret = h("input", { id: "prov-secret", type: "password", autocomplete: "new-password", placeholder: pr.secret_set ? "A secret is saved. Leave empty to keep it." : "Client secret" });
+    const ok = await dialog(`Sign in with ${pr.label}`, () => h("div", { class: "stack" },
+      h("p", { class: "muted" }, PROVIDER_HELP[pr.id]),
+      formRow("Callback URL", h("div", { class: "kv" }, ...copyable(state.callback_url)), "Add this as the authorized redirect URI in the provider's settings."),
+      formRow("Enabled", h("label", { class: "check" }, enabled, `Let people sign in with ${pr.label}`)),
+      formRow("Client ID", clientId), formRow("Client secret", secret, "Stored encrypted and never shown again."),
+      h("p", { class: "muted" }, `People who sign in this way get an account with the email address ${pr.label} verified for them. It is linked to an existing account only when ${pr.label} confirms the address.`)), {
+      sheet: true, confirmLabel: "Save",
+      onSubmit: async () => {
+        const entry = { enabled: enabled.checked, client_id: clientId.value.trim() };
+        if (secret.value) entry.secret = secret.value;
+        await saveAuthSettings(p, { auth_providers: { [pr.id]: entry } });
+        return true;
+      },
+    });
+    if (ok) { toast(`${pr.label} saved`, "ok"); state = await api("GET", `/v1/projects/${p.ref}/auth-config`); draw(); }
+  };
+  const draw = () => {
+    clear(slot);
+    slot.append(h("div", { class: "tablewrap" }, h("table", { class: "data", id: "provider-table" },
+      h("thead", null, h("tr", null, ["Provider", "Status", "Client ID", ""].map((x) => h("th", null, x)))),
+      h("tbody", null,
+        h("tr", { "data-row": "email" }, h("td", null, "Email"), h("td", null, h("span", { class: "chip healthy" }, "Enabled")), h("td", { class: "muted" }, "Built in"), h("td", { class: "actions-cell" }, h("a", { href: `#/p/${p.ref}/auth/email` }, "Email settings"))),
+        state.providers.map((pr) => h("tr", { "data-row": pr.id },
+          h("td", null, h("button", { class: "linkish", "data-action": "configure", disabled: !canEdit, onclick: () => sheet(pr) }, pr.label)),
+          h("td", null, h("span", { class: `chip ${pr.enabled ? "healthy" : "paused"}`, "data-status": pr.enabled ? "enabled" : "disabled" }, pr.enabled ? "Enabled" : pr.secret_set ? "Disabled" : "Not set up")),
+          h("td", { class: "mono-cell" }, pr.client_id || "—"),
+          h("td", { class: "actions-cell" }, canEdit ? h("button", { class: "small", onclick: () => sheet(pr) }, "Configure") : null)))))));
+  };
+  clear(body);
+  body.append(h("div", null, h("div", { class: "page-head" }, h("h1", null, "Sign-in providers")),
+    h("p", { class: "muted pagehint" }, "Let people sign in with an account they already have. Each provider needs an app registered with them; its client ID and secret go here."),
+    needAdmin(canEdit),
+    h("div", { class: "notice", id: "callback-note" }, h("strong", null, "Callback URL "), h("code", { class: "mono" }, cfg.callback_url || "—")),
+    slot));
+  draw();
+}
+
+async function authUrls(body, p, cfg, canEdit) {
+  const s = cfg.settings;
+  const site = h("input", { id: "auth-site-url", type: "url", placeholder: "https://myapp.example.com", value: s.site_url || "", autocomplete: "off", disabled: !canEdit });
+  const list = h("textarea", { id: "auth-redirects", class: "code", rows: 6, placeholder: "https://myapp.example.com/**\nmyapp://callback", disabled: !canEdit, spellcheck: "false" }, (s.redirect_urls || []).join("\n"));
+  clear(body);
+  body.append(h("div", { class: "stack" }, h("div", { class: "page-head" }, h("h1", null, "URL configuration")),
+    h("p", { class: "muted pagehint" }, "Where emailed links and provider sign-ins may send people back to. Anything else is refused, so a link cannot be pointed at someone else's site."),
+    needAdmin(canEdit),
+    h("div", { class: "card stack" },
+      formRow("Site URL", site, "Your app's main address. Links in emails go here when the app does not ask for somewhere else, and any address on the same origin is allowed."),
+      formRow("Redirect URLs", list, "More addresses that are allowed, one per line. End with * to allow everything that starts that way, for example https://preview.example.com/*. App deep links such as myapp://callback work too."),
+      h("div", { class: "row" }, h("button", { class: "primary", id: "save-urls", disabled: !canEdit, onclick: async () => {
+        try {
+          const lines = list.value.split("\n").map((x) => x.trim()).filter(Boolean);
+          const patch = { redirect_urls: lines };
+          if (site.value.trim()) patch.site_url = site.value.trim();
+          await saveAuthSettings(p, patch);
+          toast("URL configuration saved", "ok");
+        } catch (ex) { toast(ex.message, "bad"); }
+      } }, "Save")))));
+}
+
+async function authEmail(body, p, cfg, canEdit) {
+  const s = cfg.settings;
+  const KINDS = [["confirmation", "Confirm sign-up"], ["recovery", "Reset password"], ["magic_link", "Magic link"]];
+  const custom = JSON.parse(JSON.stringify(s.email_templates || {}));
+  const val = (k, f) => custom[k]?.[f] || cfg.templates[k][f];
+  const confirm = h("input", { type: "checkbox", id: "auth-email-confirm", checked: s.email_confirm === true, disabled: !canEdit || !cfg.email_delivery });
+  const from = h("input", { id: "auth-from-name", value: s.mailer_from_name || "", placeholder: "Shown as the sender's name", maxlength: 60, autocomplete: "off", disabled: !canEdit });
+  const kind = h("select", { id: "tpl-kind", "aria-label": "Template" }, KINDS.map(([v, l]) => h("option", { value: v }, l)));
+  const subject = h("input", { id: "tpl-subject", maxlength: 200, autocomplete: "off", disabled: !canEdit });
+  const text = h("textarea", { id: "tpl-body", class: "code", rows: 10, spellcheck: "false", disabled: !canEdit });
+  const load = () => { subject.value = val(kind.value, "subject"); text.value = val(kind.value, "body"); };
+  let last = kind.value;
+  const keep = () => { custom[last] = { subject: subject.value, body: text.value }; };
+  kind.addEventListener("change", () => { keep(); last = kind.value; load(); });
+  load();
+  clear(body);
+  body.append(h("div", { class: "stack" }, h("div", { class: "page-head" }, h("h1", null, "Email")),
+    cfg.email_delivery
+      ? h("div", { class: "notice", id: "mail-on" }, "Email delivery is set up on this server.")
+      : h("div", { class: "notice warn", id: "mail-off" }, "This server has no email delivery, so confirmation, password reset and magic-link emails are switched off and new users are confirmed automatically. The server's operator turns it on by setting SMTP_URL."),
+    needAdmin(canEdit),
+    h("div", { class: "card stack" }, h("h3", null, "Sign-up"),
+      h("label", { class: "check" }, confirm, "Require people to confirm their email address before they can sign in"),
+      formRow("Sender name", from, "Appears as the name on every email this project sends.")),
+    h("div", { class: "card stack" }, h("h3", null, "Templates"),
+      h("p", { class: "muted" }, "Plain text. Variables: {{ .ConfirmationURL }} is the link, {{ .Email }} the person's address, {{ .SiteURL }} your site URL."),
+      formRow("Email", kind), formRow("Subject", subject), formRow("Message", text),
+      h("div", { class: "row" },
+        h("button", { class: "primary", id: "save-email", disabled: !canEdit, onclick: async () => {
+          try {
+            keep();
+            const templates = {};
+            for (const [k] of KINDS) {
+              const c = custom[k] || {};
+              templates[k] = { subject: c.subject && c.subject !== cfg.templates[k].subject ? c.subject : "", body: c.body && c.body !== cfg.templates[k].body ? c.body : "" };
+            }
+            const patch = { mailer_from_name: from.value.trim(), email_templates: templates };
+            if (cfg.email_delivery) patch.email_confirm = confirm.checked;
+            await saveAuthSettings(p, patch);
+            toast("Email settings saved", "ok");
+          } catch (ex) { toast(ex.message, "bad"); }
+        } }, "Save"),
+        h("button", { id: "reset-template", disabled: !canEdit, onclick: () => { custom[last] = { subject: cfg.templates[last].subject, body: cfg.templates[last].body }; load(); } }, "Reset this template")))));
+}
+
+async function authSessions(body, p, cfg, canEdit) {
+  const s = cfg.settings;
+  const expiry = h("input", { id: "set-expiry", type: "number", min: 60, max: 604800, value: s.jwt_expiry ?? 3600, disabled: !canEdit });
+  const minpw = h("input", { id: "set-minpw", type: "number", min: 6, max: 64, value: s.password_min_length ?? 6, disabled: !canEdit });
+  const disable = h("input", { id: "set-disable", type: "checkbox", checked: s.disable_signup === true, disabled: !canEdit });
+  clear(body);
+  body.append(h("div", { class: "stack" }, h("div", { class: "page-head" }, h("h1", null, "Sessions and sign-ups")),
+    needAdmin(canEdit),
+    h("div", { class: "card stack" },
+      formRow("Access token lifetime", expiry, "In seconds, between 60 and 604800 (a week). Apps refresh it automatically with the longer-lived refresh token."),
+      formRow("Minimum password length", minpw, "Between 6 and 64 characters. Applies to new passwords."),
+      formRow("New sign-ups", h("label", { class: "check" }, disable, "Disable new sign-ups"), "Existing users can still sign in, and you can still create users here."),
+      h("div", { class: "row" }, h("button", { class: "primary", id: "save-settings", disabled: !canEdit, onclick: async () => {
+        try { await saveAuthSettings(p, { jwt_expiry: Number(expiry.value), password_min_length: Number(minpw.value), disable_signup: disable.checked }); toast("Settings saved", "ok"); } catch (ex) { toast(ex.message, "bad"); }
+      } }, "Save")))));
 }
 
 // ---------- storage ----------
@@ -2238,20 +2409,16 @@ async function settings(body, p) {
   const plans = await api("GET", "/v1/plans");
   const owner = S.me.role === "owner";
   const envText = Object.entries(s.function_env || {}).map(([k, v]) => `${k}=${v}`).join("\n");
-  const expiry = h("input", { id: "set-expiry", type: "number", min: 60, max: 604800, value: s.jwt_expiry ?? 3600 });
-  const disable = h("input", { id: "set-disable", type: "checkbox", checked: s.disable_signup === true });
   const env = h("textarea", { id: "set-env", class: "code", rows: 4, placeholder: "STRIPE_KEY=…" }, envText);
   clear(body);
   body.append(h("div", { class: "stack" },
-    h("div", { class: "card stack" }, h("h3", null, "Authentication"),
-      h("label", { class: "field" }, "Access token lifetime (seconds)", expiry),
-      h("label", { class: "check" }, disable, "Disable new sign-ups"),
-      h("h3", null, "Function environment"), env, h("p", { class: "muted" }, "One KEY=value per line. Available to functions as environment variables."),
+    h("div", { class: "card stack" }, h("h3", null, "Function environment"), env, h("p", { class: "muted" }, "One KEY=value per line. Available to functions as environment variables."),
+      h("p", { class: "muted" }, "Sign-in settings, such as token lifetime and sign-ups, are under ", h("a", { href: `#/p/${p.ref}/auth/sessions` }, "Authentication"), "."),
       h("div", { class: "row" }, h("button", { class: "primary", id: "save-settings", onclick: async () => {
         try {
           const fe = {};
           for (const line of env.value.split("\n").map((x) => x.trim()).filter(Boolean)) { const i = line.indexOf("="); if (i < 1) throw new Error(`Invalid line: ${line}`); fe[line.slice(0, i)] = line.slice(i + 1); }
-          await api("PATCH", `/v1/projects/${p.ref}/settings`, { jwt_expiry: Number(expiry.value), disable_signup: disable.checked, function_env: fe });
+          await api("PATCH", `/v1/projects/${p.ref}/settings`, { function_env: fe });
           toast("Settings saved", "ok");
         } catch (ex) { toast(ex.message, "bad"); }
       } }, "Save"))),

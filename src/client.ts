@@ -85,11 +85,61 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
   };
 
   const auth = {
-    async signUp(c: { email: string; password: string; options?: { data?: object } }): Promise<Result<{ user: User | null; session: Session | null }>> {
-      const { res, body } = await authCall("/signup", { method: "POST", body: JSON.stringify({ email: c.email, password: c.password, data: c.options?.data }) });
+    /** Resolves with a session, or with just the user when the project wants the email address confirmed first. */
+    async signUp(c: { email: string; password: string; options?: { data?: object; emailRedirectTo?: string } }): Promise<Result<{ user: User | null; session: Session | null }>> {
+      const q = c.options?.emailRedirectTo ? `?redirect_to=${encodeURIComponent(c.options.emailRedirectTo)}` : "";
+      const { res, body } = await authCall(`/signup${q}`, { method: "POST", body: JSON.stringify({ email: c.email, password: c.password, data: c.options?.data }) });
       if (!res.ok) return { data: null, error: err(res.status, body, "sign up failed"), status: res.status };
+      if (!body?.access_token) return { data: { user: body as User, session: null }, error: null, status: res.status };
       setSession(body as Session, "SIGNED_IN");
       return { data: { user: body.user, session: body }, error: null, status: res.status };
+    },
+    /** Email the user a link to choose a new password. The link ends on redirectTo with a recovery session in the URL fragment. */
+    async resetPasswordForEmail(email: string, o: { redirectTo?: string } = {}): Promise<Result<{}>> {
+      const q = o.redirectTo ? `?redirect_to=${encodeURIComponent(o.redirectTo)}` : "";
+      const { res, body } = await authCall(`/recover${q}`, { method: "POST", body: JSON.stringify({ email }) });
+      return res.ok ? { data: {}, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not send the email"), status: res.status };
+    },
+    /** Email a sign-in link. Creates the account on first use unless shouldCreateUser is false. */
+    async signInWithOtp(c: { email: string; options?: { emailRedirectTo?: string; shouldCreateUser?: boolean; data?: object } }): Promise<Result<{}>> {
+      const q = c.options?.emailRedirectTo ? `?redirect_to=${encodeURIComponent(c.options.emailRedirectTo)}` : "";
+      const { res, body } = await authCall(`/magiclink${q}`, { method: "POST", body: JSON.stringify({ email: c.email, create_user: c.options?.shouldCreateUser, data: c.options?.data }) });
+      return res.ok ? { data: {}, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not send the email"), status: res.status };
+    },
+    /** Trade the token from an email link for a session (for apps that handle the link themselves). */
+    async verifyOtp(c: { type: "signup" | "recovery" | "magiclink" | "email"; token: string }): Promise<Result<{ user: User; session: Session }>> {
+      const { res, body } = await authCall("/verify", { method: "POST", body: JSON.stringify({ type: c.type, token: c.token }) });
+      if (!res.ok) return { data: null, error: err(res.status, body, "verification failed"), status: res.status };
+      setSession(body as Session, "SIGNED_IN");
+      return { data: { user: body.user, session: body }, error: null, status: res.status };
+    },
+    async resend(c: { type: "signup"; email: string; options?: { emailRedirectTo?: string } }): Promise<Result<{}>> {
+      const q = c.options?.emailRedirectTo ? `?redirect_to=${encodeURIComponent(c.options.emailRedirectTo)}` : "";
+      const { res, body } = await authCall(`/resend${q}`, { method: "POST", body: JSON.stringify({ type: c.type, email: c.email }) });
+      return res.ok ? { data: {}, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not send the email"), status: res.status };
+    },
+    /** The address to send the browser to for "Sign in with …". In a browser it goes there unless skipBrowserRedirect is set. */
+    async signInWithOAuth(c: { provider: string; options?: { redirectTo?: string; skipBrowserRedirect?: boolean } }): Promise<Result<{ provider: string; url: string }>> {
+      const url = `${base}/auth/v1/authorize?provider=${encodeURIComponent(c.provider)}${c.options?.redirectTo ? `&redirect_to=${encodeURIComponent(c.options.redirectTo)}` : ""}`;
+      const w = (globalThis as { location?: { assign(u: string): void } }).location;
+      if (w && c.options?.skipBrowserRedirect !== true) w.assign(url);
+      return { data: { provider: c.provider, url }, error: null, status: 200 };
+    },
+    /**
+     * Read the session an email link or provider put in the URL fragment (call it on the page you redirected to) and sign in with it.
+     * Returns the error from the fragment instead when the sign-in failed.
+     */
+    async getSessionFromUrl(href?: string): Promise<Result<{ session: Session; type: string }>> {
+      const u = new URL(href ?? (globalThis as { location?: { href: string } }).location?.href ?? "");
+      const f = new URLSearchParams(u.hash.replace(/^#/, ""));
+      if (f.get("error")) return { data: null, error: { message: f.get("error_description") ?? f.get("error")!, code: f.get("error_code") ?? f.get("error")! }, status: 400 };
+      const access = f.get("access_token"), refresh = f.get("refresh_token");
+      if (!access || !refresh) return { data: null, error: { message: "no session in the URL" }, status: 400 };
+      const { res, body } = await authCall("/user", { headers: { authorization: `Bearer ${access}` } });
+      if (!res.ok) return { data: null, error: err(res.status, body, "could not read the user"), status: res.status };
+      const s: Session = { access_token: access, refresh_token: refresh, expires_at: Number(f.get("expires_at")), expires_in: Number(f.get("expires_in")), token_type: "bearer", user: body };
+      setSession(s, "SIGNED_IN");
+      return { data: { session: s, type: f.get("type") ?? "" }, error: null, status: 200 };
     },
     async signInWithPassword(c: { email: string; password: string }): Promise<Result<{ user: User; session: Session }>> {
       const { res, body } = await authCall("/token?grant_type=password", { method: "POST", body: JSON.stringify(c) });

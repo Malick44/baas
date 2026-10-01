@@ -354,3 +354,4 @@ a.integ-card:hover { border-color: var(--line-strong); text-decoration: none; }
 .menu button:disabled { opacity: .45; cursor: not-allowed; }
 #tst-sample { margin-top: 8px; }
 [hidden] { display: none !important; }
+.notice code { overflow-wrap: anywhere; word-break: break-all; }

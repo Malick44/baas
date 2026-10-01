@@ -30,7 +30,7 @@ Without Docker: `npm ci && npm run build`, set the variables in `.env.example`, 
 | **Control plane** | Organisations, role-scoped API tokens (developer < admin < owner), project lifecycle (create, pause, resume, soft delete, purge), settings, audit log | `src/control.ts`, `src/api.ts` |
 | **Gateway** | Routes `<ref>.domain` to the project; verifies its keys; per-project rate limits and quotas | `src/gateway.ts`, `src/usage.ts` |
 | **REST** | PostgREST-compatible subset: filters, `or`, order, pagination, counts, upsert, single-object, RPC | `src/rest.ts` |
-| **Auth** | GoTrue-compatible: sign-up, password login, refresh-token rotation with reuse detection, user admin, bans | `src/authsvc.ts` |
+| **Auth** | GoTrue-compatible: sign-up, password login, refresh-token rotation with reuse detection, user admin, bans; email confirmation, password reset and magic links (with an SMTP server); sign in with Google, GitHub, GitLab, Discord or Microsoft | `src/authsvc.ts`, `src/oauth.ts`, `src/mailer.ts` |
 | **Realtime** | Row changes over WebSocket, delivered only if the subscriber's own role can read the row | `src/realtime.ts` |
 | **Storage** | Buckets and objects governed by RLS policies, signed URLs, public buckets, size/type/quota limits | `src/storage.ts` |
 | **Functions** | Your JavaScript in an isolated Node process with a timeout, memory cap and no filesystem/subprocess access | `src/functions.ts`, `src/sandbox.ts` |
@@ -139,7 +139,7 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 - **Functions can reach the network.** Node 22 cannot restrict outbound connections, so function code can call anything the host can (including internal services). Filesystem, subprocess and worker access are blocked and tested, but this is defence in depth, not a hardened multi-tenant sandbox. Only run code from people you trust, or run the platform where egress is firewalled, or replace `src/sandbox.ts` with a Deno/gVisor/Firecracker runner.
 - **The assistant is only as good as the model, and has only been tested against a scripted one.** The safety properties above are enforced by the database and server and are tested adversarially, but the live call to Anthropic (request shape is tested against the SDK's types and a stubbed client) had no API key available to run against. Try it on a non-critical project first. Its answers can be wrong: check the queries it shows before relying on a number. In "everyone" mode (owner-enabled) it sees all rows, like the SQL editor.
 - **Enabling the assistant revokes `set_config` from `anon` and `authenticated`** in that project's database (see above). A function of yours that calls `set_config` while running as one of those roles will fail with "permission denied". `current_setting`, `SET LOCAL` inside your own `SECURITY DEFINER` functions, and everything `service_role` does are unaffected. Turning the assistant off restores it.
-- **No email or OAuth.** Password auth only; sign-ups are auto-confirmed, and password recovery, magic links and OTP return 501.
+- **Email needs an SMTP server.** Without `SMTP_URL`, sign-ups are confirmed automatically and password reset and magic links answer 501. There are no numeric one-time codes (links only), no phone sign-in, and no custom OIDC provider.
 - **REST subset.** No embedded resources (joins in `select`), JSON-path operators, casts, or full-text operators. Unfiltered `PATCH`/`DELETE` are rejected.
 - **No point-in-time recovery.** Backups are logical dumps; enable WAL archiving on the cluster if you need PITR. Stored files are not part of backups.
 - **Bulk inserts** fill keys missing from some rows with `NULL` rather than defaults (PostgREST does the same without `missing=default`).
@@ -154,7 +154,7 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 ```bash
 npm ci
 export BAAS_TEST_PG_URL=postgres://postgres:…@localhost:5432/postgres   # a superuser on a throwaway Postgres
-npm test            # 200 tests: isolation, control plane, REST/Auth, Storage, Functions, Realtime, ops, SDK, CLI, hardening, AI assistant
+npm test            # about 250 tests: isolation, control plane, REST/Auth, Storage, Functions, Realtime, ops, SDK, CLI, hardening, AI assistant
 npm run e2e         # drives the dashboard in headless Chromium (needs a Chromium; set CHROMIUM_PATH)
 npx tsx scripts/load.ts 8 32     # throughput and latency per workload
 ```
@@ -164,6 +164,25 @@ Tests create and drop their own databases. Without `BAAS_TEST_PG_URL` the databa
 Rough numbers from `scripts/load.ts` on one small machine with Postgres and the platform side by side (32 connections): REST reads 7–9k req/s (p95 5–10 ms), inserts with an RLS check ~7k req/s, public file download ~7k req/s, password login ~130/s (scrypt-bound), function calls ~30/s (a fresh process each). Treat these as an order of magnitude, not a benchmark.
 
 See [PLAN.md](PLAN.md) for the architecture notes and how the build differs from the original plan.
+
+## Authentication: email and providers
+
+Set these on the server to turn on email (confirmation, password reset, magic links); without them those flows are off:
+
+```
+SMTP_URL=smtps://user:password@smtp.example.com:465
+MAIL_FROM="My App <no-reply@example.com>"
+```
+
+Then, per project (dashboard → Authentication, or `PATCH /v1/projects/:ref/settings`; `GET /v1/projects/:ref/auth-config` shows everything in one call):
+
+- **Require email confirmation** (`email_confirm`): sign-up returns the user without a session, a link is emailed, and sign-in is refused until it is used. Links work once, expire (24 hours for confirmation, 1 hour otherwise), and only the newest of each kind works. Emails are limited to one per address per minute and 100 per project per hour. Changing your address also needs confirming.
+- **URL configuration** (`site_url`, `redirect_urls`): where emailed links and provider sign-ins may send the browser. The site URL's origin is always allowed; add others (a trailing `*` is a prefix match, and app deep links like `myapp://callback` work). Anything else is refused. The redirect is chosen when the link is made (`?redirect_to=` on `/signup`, `/recover`, `/magiclink`, `/resend`), never taken from the link itself, and the session arrives in the URL fragment (`#access_token=…&type=signup|recovery|magiclink|oauth`).
+- **Templates** (`email_templates`, `mailer_from_name`): subject and plain-text body per email, with `{{ .ConfirmationURL }}`, `{{ .Email }}` and `{{ .SiteURL }}`.
+- **Providers** (`auth_providers`): client ID and secret per provider, with the callback URL `http://<ref>.<domain>/auth/v1/callback` for the provider's console. Secrets are stored encrypted and never returned. The flow is the authorization-code flow with a signed state tied to the browser by a cookie, plus PKCE where the provider supports it. A sign-in links to an existing account only when the provider says the address is verified; if that account was never confirmed, the password it was registered with is removed.
+- **Other:** `password_min_length` (6 to 64), `jwt_expiry`, `disable_signup`. A signed-in user cannot set their own `app_metadata`, confirm their own address or ban themselves.
+
+In the client: `auth.signUp` (a session, or only the user when confirmation is required), `resetPasswordForEmail`, `signInWithOtp`, `verifyOtp`, `resend`, `signInWithOAuth` and `getSessionFromUrl` (reads the fragment on the page you redirected to).
 
 ## Pipelines and extensions
 

@@ -10,6 +10,7 @@ import { chromium, type Browser, type BrowserContext, type Page } from "playwrig
 import { Agent, fetch as ufetch } from "undici";
 import { text, use } from "../src/ai-testkit.js";
 import type { LlmClient, LlmRequest, LlmResponse } from "../src/ai/llm.js";
+import { MemoryMailer } from "../src/mailer.js";
 import { makePlatform } from "../src/platform-testkit.js";
 
 /** A tiny rule-based stand-in for the model, so the dashboard's AI tab can be driven end to end. */
@@ -51,6 +52,7 @@ const freePort = () => new Promise<number>((res) => {
 
 describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
   let t: Awaited<ReturnType<typeof makePlatform>>;
+  const mailer = new MemoryMailer();
   let browser: Browser;
   let ctx: BrowserContext;
   let page: Page;
@@ -64,12 +66,13 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
   const shot = (name: string) => page.screenshot({ path: join(SHOTS, `${name}.png`), fullPage: true });
   const toast = (text: string | RegExp) => page.locator(".toast", { hasText: text }).first().waitFor({ timeout: 8000 });
   /** Open a section the way a person would: rail icon, then the section sidebar for database pages. */
+  const SUBS: Record<string, string> = { database: "schema", auth: "users" }; // sections with a second sidebar, and the page each opens on
   const tab = async (id: string, sub?: string) => {
     const section = id === "backups" ? "database" : id;
     const subPage = id === "backups" ? "backups" : sub;
     await page.click(`nav.rail a[data-tab=${section}]`);
-    if (section === "database" && subPage) await page.click(`nav.sub a[data-dbpage=${subPage}]`);
-    const want = section === "database" ? `database/${subPage ?? "schema"}` : section;
+    if (SUBS[section] && subPage) await page.click(`nav.sub a[data-dbpage=${subPage}]`);
+    const want = SUBS[section] ? `${section}/${subPage ?? SUBS[section]}` : section;
     await page.waitForFunction((w) => { const b = document.querySelector("#tab-body"); return b?.getAttribute("data-page") === w && !b.textContent?.startsWith("Loading"); }, want);
   };
   const rest = async (path: string, init: any = {}, key = anon) =>
@@ -92,7 +95,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
   before(async () => {
     await mkdir(SHOTS, { recursive: true });
     [apiPort, gwPort] = [await freePort(), await freePort()];
-    t = await makePlatform(ADMIN!, { publicPort: gwPort, ai: { llm: new RuleLlm() }, pipelines: { allowPrivateTargets: true, tickMs: 60_000, backoffBaseMs: 10 } });
+    t = await makePlatform(ADMIN!, { publicPort: gwPort, ai: { llm: new RuleLlm() }, pipelines: { allowPrivateTargets: true, tickMs: 60_000, backoffBaseMs: 10 }, mail: { mailer }, auth: { emailCooldownMs: 0 } });
     await t.platform.listen({ api: apiPort, gateway: gwPort, host: "127.0.0.1" });
     owner = await t.org("e2e-org");
     browser = await chromium.launch({ executablePath: CHROME, args: ["--no-sandbox"] });
@@ -1062,6 +1065,129 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await page.waitForSelector(".ext-card[data-ext=pg_trgm] [data-action=install]");
   });
 
+  step("configures sign-in providers and URLs", async () => {
+    await tab("auth", "providers");
+    await page.waitForSelector("#provider-table");
+    assert.deepEqual(await page.locator("#provider-table tbody tr td:first-child").allTextContents(), ["Email", "Google", "GitHub", "GitLab", "Discord", "Microsoft"]);
+    assert.match((await page.textContent("#callback-note"))!, new RegExp(`http://${ref}\\.localhost:${gwPort}/auth/v1/callback`));
+    await shot("06k-auth-providers");
+
+    // A provider needs both halves of its credentials before it can be switched on.
+    await page.click("tr[data-row=google] [data-action=configure]");
+    await page.waitForSelector("#prov-client-id");
+    await page.check("#prov-enabled");
+    await page.click("dialog button[type=submit]");
+    await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+    assert.match((await page.textContent("dialog .notice.bad"))!, /needs a client id and a client secret/);
+    await page.click("dialog button:has-text('Cancel')");
+
+    await page.click("tr[data-row=github] [data-action=configure]");
+    assert.match((await page.textContent("dialog"))!, /Developer settings/);
+    await page.check("#prov-enabled");
+    await page.fill("#prov-client-id", "gh-client");
+    await page.fill("#prov-secret", "super-secret-value");
+    await page.click("dialog button[type=submit]");
+    await toast("GitHub saved");
+    await page.waitForFunction(() => document.querySelector("tr[data-row=github] .chip")?.getAttribute("data-status") === "enabled");
+    assert.match((await page.textContent("tr[data-row=github]"))!, /gh-client/);
+    await page.click("tr[data-row=github] [data-action=configure]");
+    assert.match((await page.getAttribute("#prov-secret", "placeholder"))!, /A secret is saved/);
+    assert.equal(await page.inputValue("#prov-secret"), "", "the secret is never sent back to the page");
+    await page.click("dialog button:has-text('Cancel')");
+    const stored = await t.api("GET", `/v1/projects/${ref}/settings`, { token: owner });
+    assert.ok(!stored.text.includes("super-secret-value"));
+    assert.deepEqual(stored.json.auth_providers.github, { enabled: true, client_id: "gh-client", secret_set: true });
+    t.platform.dir.forget(ref);
+    assert.equal((await (await rest("/auth/v1/settings")).json()).external.github, true);
+    await page.click("tr[data-row=github] [data-action=configure]");
+    await page.uncheck("#prov-enabled");
+    await page.click("dialog button[type=submit]");
+    await toast("GitHub saved");
+    await page.waitForFunction(() => document.querySelector("tr[data-row=github] .chip")?.getAttribute("data-status") === "disabled");
+
+    // ---- where emailed links and sign-ins may return to ----
+    await tab("auth", "urls");
+    await page.fill("#auth-site-url", "ftp://nope");
+    await page.click("#save-urls");
+    await toast("invalid value for site_url");
+    await page.fill("#auth-site-url", "https://app.example.com");
+    await page.fill("#auth-redirects", "https://preview.example.com/*\nmyapp://callback");
+    await page.click("#save-urls");
+    await toast("URL configuration saved");
+    const s = (await t.api("GET", `/v1/projects/${ref}/settings`, { token: owner })).json;
+    assert.equal(s.site_url, "https://app.example.com");
+    assert.deepEqual(s.redirect_urls, ["https://preview.example.com/*", "myapp://callback"]);
+    await page.reload();
+    await page.waitForSelector("#auth-redirects");
+    assert.equal(await page.inputValue("#auth-site-url"), "https://app.example.com");
+    assert.match(await page.inputValue("#auth-redirects"), /myapp:\/\/callback/);
+    await shot("06k-auth-urls");
+  });
+
+  step("manages confirmation emails, templates and the email actions on users", async () => {
+    await tab("auth", "email");
+    await page.waitForSelector("#mail-on");
+    await page.fill("#auth-from-name", "Shop team");
+    await page.selectOption("#tpl-kind", "recovery");
+    assert.match(await page.inputValue("#tpl-subject"), /Reset your password/, "shows the default until it is changed");
+    await page.fill("#tpl-subject", "Choose a new password for Shop");
+    await page.selectOption("#tpl-kind", "confirmation");
+    assert.match(await page.inputValue("#tpl-subject"), /Confirm your email address/, "each template keeps its own text");
+    await page.selectOption("#tpl-kind", "recovery");
+    assert.equal(await page.inputValue("#tpl-subject"), "Choose a new password for Shop", "switching back keeps the edit");
+    await page.check("#auth-email-confirm");
+    await page.click("#save-email");
+    await toast("Email settings saved");
+    t.platform.dir.forget(ref);
+    const saved = (await t.api("GET", `/v1/projects/${ref}/settings`, { token: owner })).json;
+    assert.equal(saved.email_confirm, true);
+    assert.equal(saved.mailer_from_name, "Shop team");
+    assert.equal(saved.email_templates.recovery.subject, "Choose a new password for Shop");
+    assert.equal(saved.email_templates.confirmation.subject, "", "an unchanged template stays on the default");
+    await shot("06k-auth-email");
+
+    // Sign-ups now need confirming; the dashboard shows who has not.
+    const su = await rest("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email: "pending@example.com", password: "secret123" }) });
+    assert.equal((await su.json()).access_token, undefined);
+    assert.match(mailer.last("pending@example.com")!.text, /\/auth\/v1\/verify\?token=/);
+    await tab("auth", "users");
+    await page.waitForSelector("#users tr[data-email='pending@example.com'] [data-status=unconfirmed]");
+    await page.locator("#users tr[data-email='pending@example.com'] button[aria-label='Row actions']").click();
+    const items = await page.locator(".menu button").allTextContents();
+    assert.deepEqual(items, ["Send password recovery", "Send magic link", "Resend confirmation email", "Mark email as confirmed"]);
+    await page.click(".menu [data-action=send-recovery]");
+    await toast("Recovery email sent to pending@example.com");
+    assert.equal(mailer.last("pending@example.com")!.subject, "Choose a new password for Shop", "the template is used");
+    assert.equal(mailer.last("pending@example.com")!.fromName, "Shop team");
+    await page.locator("#users tr[data-email='pending@example.com'] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=confirm-email]");
+    await toast("Email confirmed");
+    await page.waitForFunction(() => !document.querySelector("#users tr[data-email='pending@example.com'] [data-status=unconfirmed]"));
+    assert.equal((await rest("/auth/v1/token?grant_type=password", { method: "POST", body: JSON.stringify({ email: "pending@example.com", password: "secret123" }) })).status, 200);
+    await t.sql(owner, ref, "delete from auth.users where email = 'pending@example.com'");
+
+    // A user created in the dashboard can be left unconfirmed.
+    await page.click("#new-user");
+    await page.fill("#user-email", "manual@example.com");
+    await page.fill("#user-password", "secret123");
+    await page.uncheck("#user-confirm");
+    await page.click("dialog button[type=submit]");
+    await toast("User created");
+    await page.waitForSelector("#users tr[data-email='manual@example.com'] [data-status=unconfirmed]");
+    await t.sql(owner, ref, "delete from auth.users where email = 'manual@example.com'");
+
+    // Back to the default so later steps sign up as before; a reset template returns to the default text.
+    await tab("auth", "email");
+    await page.uncheck("#auth-email-confirm");
+    await page.selectOption("#tpl-kind", "recovery");
+    await page.click("#reset-template");
+    assert.match(await page.inputValue("#tpl-subject"), /Reset your password/);
+    await page.click("#save-email");
+    await toast("Email settings saved");
+    t.platform.dir.forget(ref);
+    assert.equal((await t.api("GET", `/v1/projects/${ref}/settings`, { token: owner })).json.email_templates.recovery.subject, "");
+  });
+
   step("lists request logs and activity", async () => {
     await tab("logs");
     await page.waitForSelector("#request-log tbody tr");
@@ -1093,10 +1219,9 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
   });
 
   step("saves settings that the API enforces, and changes the plan", async () => {
-    await tab("settings");
+    await tab("auth", "sessions");
     await page.fill("#set-expiry", "900");
     await page.check("#set-disable");
-    await page.fill("#set-env", "GREETING=hola");
     await page.click("#save-settings");
     await toast("Settings saved");
     t.platform.dir.forget(ref);
@@ -1108,6 +1233,24 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     t.platform.dir.forget(ref);
     const ok = await rest("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email: "late@example.com", password: "secret123" }) });
     assert.equal((await ok.json()).expires_in, 900);
+    await page.fill("#set-minpw", "3");
+    await page.click("#save-settings");
+    await toast("invalid value for password_min_length");
+    await page.fill("#set-minpw", "8");
+    await page.click("#save-settings");
+    await toast("Settings saved");
+    t.platform.dir.forget(ref);
+    const short = await rest("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email: "short@example.com", password: "secret1" }) });
+    assert.equal(short.status, 422);
+    await page.fill("#set-minpw", "6");
+    await page.click("#save-settings");
+    await toast("Settings saved");
+    t.platform.dir.forget(ref);
+
+    await tab("settings");
+    await page.fill("#set-env", "GREETING=hola");
+    await page.click("#save-settings");
+    await toast("Settings saved");
     await page.selectOption("#set-plan", "pro");
     await page.click("#save-plan");
     await toast("Plan updated");
@@ -1171,7 +1314,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     const overflow = () => p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     assert.ok((await overflow()) <= 1, `project list scrolls horizontally by ${await overflow()}px`);
     await p.screenshot({ path: join(SHOTS, "15-mobile.png"), fullPage: true });
-    for (const tabName of ["overview", "tables", "sql", "settings", "database/pipelines", "integrations", "advisors"]) {
+    for (const tabName of ["overview", "tables", "sql", "settings", "database/pipelines", "integrations", "advisors", "auth/providers", "auth/email", "auth/urls", "auth/sessions"]) {
       await p.goto(`http://127.0.0.1:${apiPort}/#/p/${ref}/${tabName}`);
       await p.waitForFunction((n) => document.querySelector(`nav.rail a[data-tab=${n.split("/")[0]}]`)?.classList.contains("on") && !document.querySelector("#tab-body")?.textContent?.startsWith("Loading"), tabName);
       assert.ok((await overflow()) <= 1, `${tabName} scrolls horizontally by ${await overflow()}px`);

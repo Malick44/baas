@@ -3,6 +3,7 @@ import { after, before, describe, it } from "node:test";
 import { Agent, fetch as ufetch } from "undici";
 import { WebSocket as WS } from "ws";
 import { createClient, type BaasClient } from "./client.js";
+import { MemoryMailer } from "./mailer.js";
 import { makePlatform } from "./platform-testkit.js";
 
 const ADMIN = process.env.BAAS_TEST_PG_URL;
@@ -190,5 +191,76 @@ describe("client sdk", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     // The old refresh token no longer works.
     const dead = await (dnsFetch(`${url}/auth/v1/token?grant_type=refresh_token`, { method: "POST", headers: { apikey: keys.anon, "content-type": "application/json" }, body: JSON.stringify({ refresh_token: refreshed.refresh_token }) }));
     assert.equal(dead.status, 400);
+  });
+});
+
+describe("client sdk: email and provider sign-in", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
+  let t: Awaited<ReturnType<typeof makePlatform>>;
+  let c: BaasClient;
+  let owner: string;
+  let ref: string;
+  let gwPort: number;
+  const mail = new MemoryMailer();
+  const noRedirect: typeof fetch = ((input: any, init: any) => ufetch(input, { ...init, redirect: "manual", dispatcher: agent })) as unknown as typeof fetch;
+
+  before(async () => {
+    t = await makePlatform(ADMIN!, { mail: { mailer: mail }, auth: { emailCooldownMs: 0 } });
+    const ports = await t.platform.listen({ api: 0, gateway: 0, host: "127.0.0.1" });
+    gwPort = ports.gateway;
+    owner = await t.org();
+    const p = await t.project(owner, "sdk-auth");
+    ref = p.ref;
+    await t.api("PATCH", `/v1/projects/${ref}/settings`, { token: owner, body: { email_confirm: true, site_url: "https://app.example.com" } });
+    t.platform.dir.forget(ref);
+    c = createClient(`http://${ref}.localhost:${gwPort}`, p.anon, { fetch: dnsFetch });
+  });
+  after(() => t?.close());
+
+  const link = (to: string) => /(http:\/\/\S+\/auth\/v1\/verify\?token=[\w-]+&type=\w+)/.exec(mail.last(to)!.text)![1]!;
+  const follow = async (u: string) => (await noRedirect(u.replace(":8081", `:${gwPort}`), { redirect: "manual" } as any)).headers.get("location")!; // the link names the configured public port
+
+  it("signs up without a session, then confirms through the emailed link and reads the session from the URL", async () => {
+    const s = await c.auth.signUp({ email: "sdk@example.com", password: "password-123", options: { emailRedirectTo: "https://app.example.com/welcome" } });
+    assert.equal(s.error, null);
+    assert.equal(s.data!.session, null);
+    assert.equal(s.data!.user!.email, "sdk@example.com");
+    assert.equal((await c.auth.getSession()).data!.session, null);
+    assert.equal((await c.auth.signInWithPassword({ email: "sdk@example.com", password: "password-123" })).error!.code, "email_not_confirmed");
+    const landed = await follow(link("sdk@example.com"));
+    assert.match(landed, /^https:\/\/app\.example\.com\/welcome#access_token=/);
+    const r = await c.auth.getSessionFromUrl(landed);
+    assert.equal(r.error, null, JSON.stringify(r.error));
+    assert.equal(r.data!.type, "signup");
+    assert.equal((await c.auth.getUser()).data!.user.email, "sdk@example.com");
+    assert.equal((await c.auth.getSession()).data!.session!.user.email, "sdk@example.com");
+    await c.auth.signOut();
+  });
+
+  it("resets a password, signs in with a magic link, and verifies a token directly", async () => {
+    assert.equal((await c.auth.resetPasswordForEmail("sdk@example.com")).error, null);
+    const recovered = await c.auth.getSessionFromUrl(await follow(link("sdk@example.com")));
+    assert.equal(recovered.data!.type, "recovery");
+    assert.equal((await c.auth.updateUser({ password: "brand-new-pass" })).error, null);
+    await c.auth.signOut();
+    assert.equal((await c.auth.signInWithPassword({ email: "sdk@example.com", password: "brand-new-pass" })).error, null);
+    await c.auth.signOut();
+
+    assert.equal((await c.auth.signInWithOtp({ email: "otp@example.com" })).error, null);
+    const token = /token=([\w-]+)/.exec(mail.last("otp@example.com")!.text)![1]!;
+    const v = await c.auth.verifyOtp({ type: "magiclink", token });
+    assert.equal(v.error, null, JSON.stringify(v.error));
+    assert.equal(v.data!.user.email, "otp@example.com");
+    assert.equal((await c.auth.verifyOtp({ type: "magiclink", token })).error!.status, 403, "once only");
+    assert.equal((await c.auth.signInWithOtp({ email: "ghost@example.com", options: { shouldCreateUser: false } })).error, null);
+    assert.equal(mail.last("ghost@example.com"), undefined);
+    assert.equal((await c.auth.resend({ type: "signup", email: "sdk@example.com" })).error, null);
+  });
+
+  it("builds the provider address and reads a failure from the URL", async () => {
+    const r = await c.auth.signInWithOAuth({ provider: "github", options: { redirectTo: "https://app.example.com/cb", skipBrowserRedirect: true } });
+    assert.equal(r.data!.url, `http://${ref}.localhost:${gwPort}/auth/v1/authorize?provider=github&redirect_to=${encodeURIComponent("https://app.example.com/cb")}`);
+    const bad = await c.auth.getSessionFromUrl("https://app.example.com/cb?error=access_denied#error=access_denied&error_code=access_denied&error_description=Nope");
+    assert.deepEqual([bad.error!.code, bad.error!.message], ["access_denied", "Nope"]);
+    assert.equal((await c.auth.getSessionFromUrl("https://app.example.com/cb")).error!.message, "no session in the URL");
   });
 });
