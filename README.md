@@ -151,6 +151,8 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 
 ## Development and tests
 
+CI (`.github/workflows/ci.yml`) runs the typecheck, unit tests and browser tests against a Postgres service, and a second job runs `scripts/smoke.sh`: it builds the images, starts the real Compose stack, creates an organisation and a project, and exercises REST with row-level security, auth, storage, a function, metrics, a backup and a restart. Run it yourself with `scripts/smoke.sh` (needs docker, curl and jq).
+
 ```bash
 npm ci
 export BAAS_TEST_PG_URL=postgres://postgres:…@localhost:5432/postgres   # a superuser on a throwaway Postgres

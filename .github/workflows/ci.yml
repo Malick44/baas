@@ -1,0 +1,55 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+concurrency: { group: "ci-${{ github.ref }}", cancel-in-progress: true }
+permissions: { contents: read }
+
+jobs:
+  test:
+    name: typecheck, unit tests, browser tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env: { POSTGRES_PASSWORD: postgres }
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 20
+        ports: ["5432:5432"]
+    env:
+      BAAS_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+      BAAS_TEST_PG_BIN: /usr/lib/postgresql/16/bin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - name: Give Postgres headroom (every test creates its own databases and roles)
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -c "ALTER SYSTEM SET max_connections = 500" -c "ALTER SYSTEM SET fsync = off"
+          docker restart "$(docker ps -q --filter ancestor=postgres:16-bookworm)"
+          until PGPASSWORD=postgres pg_isready -h localhost -U postgres; do sleep 1; done
+      - name: pg_dump / pg_restore for the backup tests (same major version as the server)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-16
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: node --check dashboard/app.js
+      - run: npm test
+      - name: Install Chromium for the browser tests
+        run: |
+          npx playwright-core install --with-deps chromium
+          echo "CHROMIUM_PATH=$(node -e "console.log(require('playwright-core').chromium.executablePath())")" >> "$GITHUB_ENV"
+      - run: npm run e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: e2e-screenshots, path: e2e/screenshots, if-no-files-found: ignore, retention-days: 7 }
+
+  compose-smoke:
+    name: docker compose smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq jq curl
+      - run: scripts/smoke.sh
