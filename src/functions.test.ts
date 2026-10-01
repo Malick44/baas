@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { after, before, describe, it } from "node:test";
+import zlib from "node:zlib";
 import { FunctionService } from "./functions.js";
 import { makeHarness, type Harness, type TestProject } from "./testkit.js";
 import { checkSyntax } from "./sandbox.js";
@@ -32,7 +35,8 @@ describe("edge functions", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
 
   before(async () => {
     h = await makeHarness(ADMIN!, (_pm, control) => {
-      svc = new FunctionService(control, { publicUrl: (ref) => `http://${ref}.localhost:8081`, timeoutMs: 1500, perProject: 1 });
+      // The in-process egress guard is off here so this suite tests the permission model and the service on their own; the next suite tests the guard.
+      svc = new FunctionService(control, { publicUrl: (ref) => `http://${ref}.localhost:8081`, timeoutMs: 1500, perProject: 1, egress: "off" });
       return { services: { functions: svc } };
     });
     [a, b] = await Promise.all([h.project(), h.project()]);
@@ -167,5 +171,135 @@ describe("edge functions", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     assert.equal((await invoke(p, "f")).status, 200);
     await h.control.pauseProject(h.owner, p.ref);
     assert.equal((await invoke(p, "f")).status, 503);
+  });
+});
+
+describe("edge functions: what they may reach", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
+  let h: Harness;
+  let a: TestProject;
+  let guarded: FunctionService;
+  let target: http.Server;
+  let other: http.Server;
+  let targetHost: string;
+  let otherHost: string;
+  const seen: { method: string; url: string; body: string; headers: http.IncomingHttpHeaders }[] = [];
+
+  const deploy = (p: TestProject, name: string, source: string) => h.control.deployFunction(h.owner, p.ref, name, source, false);
+  const run = async (name: string, source: string, p = a) => {
+    await deploy(p, name, source);
+    return h.call(p, "POST", `/functions/v1/${name}`, { key: p.anon });
+  };
+  /** A function that tries something and reports what happened instead of crashing. */
+  const attempt = (body: string) => `export default async () => { const out = {}; try { out.value = await (async () => { ${body} })(); } catch (e) { out.error = String(e && e.message || e); } return Response.json(out); };`;
+
+  before(async () => {
+    const mk = (fn: http.RequestListener) => new Promise<http.Server>((r) => { const s = http.createServer(fn); s.listen(0, "127.0.0.1", () => r(s)); });
+    other = await mk((_req, res) => res.end("other"));
+    otherHost = `127.0.0.1:${(other.address() as AddressInfo).port}`;
+    target = await mk((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (d) => chunks.push(d));
+      req.on("end", () => {
+        seen.push({ method: req.method!, url: req.url!, body: Buffer.concat(chunks).toString(), headers: req.headers });
+        if (req.url === "/redirect-inside") { res.statusCode = 302; res.setHeader("location", "/landed"); return res.end(); }
+        if (req.url === "/redirect-out") { res.statusCode = 302; res.setHeader("location", `http://${otherHost}/`); return res.end(); }
+        if (req.url === "/gzip") { res.setHeader("content-encoding", "gzip"); return res.end(zlib.gzipSync("zipped hello")); }
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ hello: req.url, got: Buffer.concat(chunks).toString() }));
+      });
+    });
+    targetHost = `127.0.0.1:${(target.address() as AddressInfo).port}`;
+    h = await makeHarness(ADMIN!, (_pm, control) => {
+      const publicUrl = (ref: string) => `http://${ref}.localhost:8081`;
+      guarded = new FunctionService(control, { publicUrl, timeoutMs: 4000, perProject: 8, egressAllow: [targetHost] });
+      return { services: { functions: guarded } };
+    });
+    a = await h.project();
+  });
+  after(async () => {
+    target?.close();
+    other?.close();
+    await h?.close();
+  });
+
+  it("refuses private, loopback and link-local destinations by default, including by name and by IPv6 and mapped forms", async () => {
+    for (const url of [`http://${otherHost}/`, "http://127.0.0.1:1/", "http://localhost:1/", "http://[::1]:1/", "http://[::ffff:127.0.0.1]:1/", "http://169.254.169.254/latest/meta-data/", "http://10.0.0.1/", "http://192.168.1.1/", "http://0.0.0.0:1/", "http://2130706433:1/"]) {
+      const r = await run("blocked", attempt(`return (await fetch(${JSON.stringify(url)})).status`));
+      assert.match(r.json.error ?? "", /private or local network|could not resolve|only http/, `${url}: ${JSON.stringify(r.json)}`);
+    }
+    assert.equal((await run("blocked", attempt(`return (await fetch("file:///etc/passwd")).status`))).json.error?.includes("only http"), true);
+    assert.equal((await run("blocked", attempt(`return (await fetch("ftp://example.com/")).status`))).json.error?.includes("only http"), true);
+  });
+
+  it("allows what the operator listed, plus the project's own address, and still behaves like fetch", async () => {
+    const r = await run("ok", attempt(`
+      const a = await (await fetch("http://${targetHost}/hi?x=1")).json();
+      const b = await (await fetch("http://${targetHost}/post", { method: "POST", body: "payload", headers: { "content-type": "text/plain", "x-mine": "1" } })).json();
+      const c = await (await fetch("http://${targetHost}/redirect-inside")).json();
+      const d = await (await fetch("http://${targetHost}/gzip")).text();
+      const e = await fetch("http://${targetHost}/redirect-inside", { redirect: "manual" });
+      return { a, b, c, d, manual: [e.status, e.headers.get("location")] };`));
+    assert.equal(r.json.error, undefined, r.text);
+    assert.equal(r.json.value.a.hello, "/hi?x=1");
+    assert.deepEqual(r.json.value.b, { hello: "/post", got: "payload" });
+    assert.equal(r.json.value.c.hello, "/landed", "redirects inside an allowed host are followed");
+    assert.equal(r.json.value.d, "zipped hello", "compressed responses are decoded");
+    assert.deepEqual(r.json.value.manual, [302, "/landed"]);
+    const post = seen.find((s) => s.url === "/post")!;
+    assert.equal(post.method, "POST");
+    assert.equal(post.headers["x-mine"], "1");
+    // The project's own URL (what SUPABASE_URL points at) is always reachable, so functions can call their own API.
+    const own = await run("own", attempt(`try { await fetch(process.env.SUPABASE_URL + "/rest/v1/"); return "reached"; } catch (e) { return String(e.cause?.code || e.message); }`));
+    assert.doesNotMatch(own.json.value ?? own.json.error, /private or local/);
+  });
+
+  it("re-checks every redirect, so an allowed host cannot send a function to a forbidden one", async () => {
+    const r = await run("hop", attempt(`return (await fetch("http://${targetHost}/redirect-out")).status`));
+    assert.match(r.json.error ?? "", /private or local network/, r.text);
+    assert.equal(seen.some((s) => s.url === "/redirect-out"), true);
+  });
+
+  it("cannot open sockets, spawn, signal the server, or reach other internals through imports", async () => {
+    for (const mod of ["node:net", "net", "node:http", "node:https", "node:http2", "node:tls", "node:dns", "node:dns/promises", "node:dgram", "node:child_process", "node:cluster",
+      "node:worker_threads", "node:module", "node:inspector", "node:os", "node:fs", "node:vm", "node:v8", "node:repl"]) {
+      const r = await run("imp", attempt(`await import(${JSON.stringify(mod)}); return "imported"`));
+      assert.match(r.json.error ?? "", /not available in functions|Access to this API has been restricted|ERR_ACCESS_DENIED/, `${mod}: ${r.text}`);
+    }
+    // The ways around a plain import.
+    const via = await run("via", attempt(`return typeof process.getBuiltinModule`));
+    assert.equal(via.json.value, "undefined");
+    const data = await run("data", attempt(`await import("data:text/javascript,import 'node:net'; export default 1"); return "imported"`));
+    assert.match(data.json.error ?? "", /not available in functions/, data.text);
+    const bind = await run("bind", attempt(`return process.binding("tcp_wrap") && "reached"`));
+    assert.ok(bind.json.error, "process.binding stays blocked");
+    for (const g of ["WebSocket", "EventSource", "XMLHttpRequest"]) assert.equal((await run("g", attempt(`return typeof globalThis.${g}`))).json.value, "undefined", g);
+    // Ordinary code is unaffected.
+    const fine = await run("fine", attempt(`
+      const { createHash } = await import("node:crypto"); const { Buffer } = await import("node:buffer"); const u = await import("node:util"); const z = await import("node:zlib");
+      return [createHash("sha256").update("x").digest("hex").slice(0, 8), Buffer.from("hi").toString("base64"), typeof u.inspect, z.gzipSync("a").length > 0, crypto.randomUUID().length];`));
+    assert.deepEqual(fine.json.value, ["2d711642", "aGk=", "function", true, 36], fine.text);
+  });
+
+  it("cannot signal the server process", async () => {
+    const r = await run("kill", attempt(`process.kill(process.ppid, "SIGKILL"); return "sent"`));
+    assert.match(r.json.error ?? "", /process\.kill is not available/, r.text);
+    // The server (this process) is still here.
+    assert.equal((await h.call(a, "POST", "/functions/v1/kill", { key: a.anon })).status, 200);
+  });
+
+  it('"open" mode lifts the address restriction for operators who want it, but keeps the module and signal protections', async () => {
+    const h2 = await makeHarness(ADMIN!, (_pm, control) => ({ services: { functions: new FunctionService(control, { publicUrl: (ref) => `http://${ref}.localhost:8081`, timeoutMs: 4000, egress: "open" }) } }));
+    try {
+      const p2 = await h2.project();
+      const call = async (name: string, source: string) => {
+        await h2.control.deployFunction(h2.owner, p2.ref, name, source, false);
+        return h2.call(p2, "POST", `/functions/v1/${name}`, { key: p2.anon });
+      };
+      assert.equal((await call("openreach", attempt(`return (await fetch("http://${otherHost}/")).status`))).json.value, 200);
+      assert.match((await call("openimp", attempt(`await import("node:net"); return "imported"`))).json.error ?? "", /not available in functions/);
+      assert.match((await call("openkill", attempt(`process.kill(process.ppid, 0); return "sent"`))).json.error ?? "", /process\.kill/);
+    } finally {
+      await h2.close();
+    }
   });
 });

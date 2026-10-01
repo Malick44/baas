@@ -95,7 +95,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
   before(async () => {
     await mkdir(SHOTS, { recursive: true });
     [apiPort, gwPort] = [await freePort(), await freePort()];
-    t = await makePlatform(ADMIN!, { publicPort: gwPort, ai: { llm: new RuleLlm() }, pipelines: { allowPrivateTargets: true, tickMs: 60_000, backoffBaseMs: 10 }, mail: { mailer }, auth: { emailCooldownMs: 0 } });
+    t = await makePlatform(ADMIN!, { publicPort: gwPort, dashboardOrigins: [`http://127.0.0.1:${apiPort}`], ai: { llm: new RuleLlm() }, pipelines: { allowPrivateTargets: true, tickMs: 60_000, backoffBaseMs: 10 }, mail: { mailer }, auth: { emailCooldownMs: 0 } });
     await t.platform.listen({ api: apiPort, gateway: gwPort, host: "127.0.0.1" });
     owner = await t.org("e2e-org");
     browser = await chromium.launch({ executablePath: CHROME, args: ["--no-sandbox"] });
@@ -1153,6 +1153,24 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     assert.equal(await page.inputValue("#auth-site-url"), "https://app.example.com");
     assert.match(await page.inputValue("#auth-redirects"), /myapp:\/\/callback/);
     await shot("06k-auth-urls");
+
+    // Browser origins: restricting them must not lock the dashboard itself out.
+    await page.fill("#auth-cors", "https://only-this.example.com");
+    await page.click("#save-urls");
+    await toast("URL configuration saved");
+    t.platform.dir.forget(ref);
+    const preflight = (origin: string) => dnsFetch(`http://${ref}.localhost:${gwPort}/rest/v1/`, { method: "OPTIONS", headers: { origin, "access-control-request-method": "GET" } });
+    assert.equal((await preflight("https://only-this.example.com")).headers.get("access-control-allow-origin"), "https://only-this.example.com");
+    assert.equal((await preflight("https://elsewhere.example.com")).headers.get("access-control-allow-origin"), null);
+    assert.equal((await preflight(`http://127.0.0.1:${apiPort}`)).headers.get("access-control-allow-origin"), `http://127.0.0.1:${apiPort}`, "the dashboard's own origin is always allowed");
+    await tab("auth", "users");
+    await page.waitForSelector("#users");
+    await tab("auth", "urls");
+    await page.fill("#auth-cors", "");
+    await page.click("#save-urls");
+    await toast("URL configuration saved");
+    t.platform.dir.forget(ref);
+    assert.equal((await preflight("https://elsewhere.example.com")).headers.get("access-control-allow-origin"), "*");
   });
 
   step("manages confirmation emails, templates and the email actions on users", async () => {

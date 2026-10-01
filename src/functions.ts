@@ -9,6 +9,10 @@ export type FunctionOptions = {
   /** Public origin of a project, e.g. http://<ref>.localhost:8081, given to functions as SUPABASE_URL. */
   publicUrl: (ref: string) => string;
   timeoutMs?: number;
+  /** What functions may reach over the network: "public" (default) refuses private and local addresses, "open" does not restrict. A project's own URL is always allowed. */
+  egress?: "public" | "open" | "off";
+  /** Extra host:port destinations functions may reach even if they are on a private network. */
+  egressAllow?: string[];
   perProject?: number;
   global?: number;
 };
@@ -63,6 +67,7 @@ export class FunctionService implements Mountable {
         const out = await runFunction({
           ref, name, version: fn.version, source: fn.source, method: req.method, url, headers,
           body: (req.body as Buffer | undefined) ?? Buffer.alloc(0), env, timeoutMs: this.opts.timeoutMs ?? 10_000,
+          egress: { mode: this.opts.egress ?? "public", allow: [new URL(this.opts.publicUrl(ref)).host, ...(this.opts.egressAllow ?? [])] },
         });
         for (const [k, v] of out.headers) if (!SKIP_RES_HEADERS.has(k.toLowerCase())) reply.header(k, v);
         this.log(ref, { name, status: out.status, ms: Date.now() - t0 });

@@ -9,12 +9,14 @@ import { fileURLToPath } from "node:url";
  * no filesystem beyond the function's own file, no subprocesses, no workers, no native addons,
  * an empty environment, a heap cap and a wall-clock kill.
  *
- * NOT restricted: outbound network access. Node 22 cannot limit it, so a function can reach anything
- * this host can. Production deployments should run this on a host with no route to internal services,
- * or replace this module with a Deno/gVisor/Firecracker runner behind the same interface.
+ * Outbound network access cannot be turned off in Node 22, so egress-guard.mjs narrows it from inside the process: fetch() refuses private
+ * and local addresses (pinned against DNS tricks, re-checked on redirects), and modules that open sockets are not importable. That is defence in
+ * depth, not isolation: for untrusted tenants also run this on a host with no route to internal services, or replace this module with a
+ * Deno/gVisor/Firecracker runner behind the same interface.
  */
 
 const RUNNER = fileURLToPath(new URL("./function-runner.mjs", import.meta.url));
+const GUARD = fileURLToPath(new URL("./egress-guard.mjs", import.meta.url));
 const MAX_STDOUT = 8 * 1024 * 1024;
 
 let rootPromise: Promise<string> | undefined;
@@ -32,6 +34,8 @@ export type Invocation = {
   env: Record<string, string>;
   timeoutMs: number;
   memoryMb?: number;
+  /** Outbound network policy. "public" (default) refuses private and local destinations except those listed in `allow` (host:port); "open" does not restrict addresses; "off" installs no guard at all, leaving only the permission model (for testing that layer on its own). */
+  egress?: { mode: "public" | "open" | "off"; allow?: string[] };
 };
 export type Result = { status: number; headers: [string, string][]; body: Buffer };
 
@@ -67,7 +71,7 @@ export async function runFunction(inv: Invocation): Promise<Result> {
   const file = await materialise(inv);
   const child = spawn(
     process.execPath,
-    ["--permission", `--allow-fs-read=${file}`, `--allow-fs-read=${RUNNER}`, `--max-old-space-size=${inv.memoryMb ?? 128}`, RUNNER],
+    ["--permission", `--allow-fs-read=${file}`, `--allow-fs-read=${RUNNER}`, `--allow-fs-read=${GUARD}`, `--max-old-space-size=${inv.memoryMb ?? 128}`, RUNNER],
     { env: {}, stdio: ["pipe", "pipe", "pipe"] },
   );
   return new Promise<Result>((resolve, reject) => {
@@ -108,6 +112,6 @@ export async function runFunction(inv: Invocation): Promise<Result> {
       }),
     );
     child.stdin.on("error", () => {});
-    child.stdin.end(JSON.stringify({ file, method: inv.method, url: inv.url, headers: inv.headers, body: inv.body.toString("base64"), env: inv.env }));
+    child.stdin.end(JSON.stringify({ file, method: inv.method, url: inv.url, headers: inv.headers, body: inv.body.toString("base64"), env: inv.env, egress: inv.egress ?? { mode: "public" }, egressGuard: GUARD }));
   });
 }

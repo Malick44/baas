@@ -39,7 +39,11 @@ export type PlatformConfig = {
   dashboardDir?: string;
   /** Hostname the dashboard is served on behind a TLS proxy (for certificate checks). */
   dashboardHost?: string;
+  /** Origins the dashboard runs on. Always allowed by the data plane's CORS, so restricting a project's cors_origins cannot lock the dashboard out. */
+  dashboardOrigins?: string[];
   realtimeCheckMs?: number;
+  /** Edge function network policy: "public" (default) refuses private and local addresses; "open" does not. `allow` lists host:port exceptions. */
+  functions?: { egress?: "public" | "open"; egressAllow?: string[] };
   /** Outgoing email for confirmation, password reset and magic links. Leave out to switch those flows off. Give `mailer` to supply your own (tests do). */
   mail?: { smtpUrl?: string; from?: string; mailer?: Mailer };
   auth?: Pick<AuthOptions, "providerOverrides" | "emailCooldownMs" | "maxEmailsPerHour" | "fetch">;
@@ -81,7 +85,7 @@ export async function createPlatform(cfg: PlatformConfig) {
   });
   const usage = new UsageService(control, cfg.pgAdminUrl, storage);
   const publicUrl = (ref: string) => `${cfg.publicScheme}://${ref}.${cfg.gatewayDomain}${cfg.publicPort ? `:${cfg.publicPort}` : ""}`;
-  const functions = new FunctionService(control, { publicUrl });
+  const functions = new FunctionService(control, { publicUrl, ...cfg.functions });
   const auth = new AuthService(pm, {
     adminUrl: cfg.pgAdminUrl, vault, mailer: mailerFrom(cfg.mail), publicUrl, secureCookies: cfg.publicScheme === "https",
     log: (m) => console.error(`[auth] ${m}`), ...cfg.auth,
@@ -94,7 +98,10 @@ export async function createPlatform(cfg: PlatformConfig) {
   const llm = cfg.ai?.llm ?? (cfg.ai?.model ? new AnthropicLlm({ model: cfg.ai.model, effort: cfg.ai.effort, serverFallbacks: cfg.ai.serverFallbacks }) : undefined);
   const ai = new AiAssistant(control, pm, llm, { queryTimeoutMs: cfg.ai?.queryTimeoutMs, totalTimeoutMs: cfg.ai?.totalTimeoutMs });
 
-  const gateway: FastifyInstance = buildGateway(pm, { auth, storage, functions, realtime }, { domain: cfg.gatewayDomain, hooks: usage.hooks() });
+  const gateway: FastifyInstance = buildGateway(pm, { auth, storage, functions, realtime }, {
+    domain: cfg.gatewayDomain, hooks: usage.hooks(), settingsFor: async (ref) => (await dir.get(ref))?.settings,
+    alwaysAllow: [...(cfg.dashboardOrigins ?? []), ...(cfg.dashboardHost ? [`https://${cfg.dashboardHost}`] : [])],
+  });
   const api: FastifyInstance = buildApi(control, cfg.bootstrapToken, {
     admin, usage, backups, functions, ai, pipelines, extensions, auth,
     gateway: { domain: cfg.gatewayDomain, scheme: cfg.publicScheme, port: cfg.publicPort },

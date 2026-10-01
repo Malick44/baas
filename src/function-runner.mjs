@@ -8,6 +8,9 @@ const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 
 for (const [k, v] of Object.entries(input.env)) process.env[k] = v;
 
+// Narrow what the function can reach before it is loaded. "open" keeps fetch unrestricted but still removes the escape hatches.
+if (input.egress && input.egress.mode !== "off") (await import(pathToFileURL(input.egressGuard).href)).installEgressGuard(input.egress);
+
 const mod = await import(pathToFileURL(input.file).href);
 const handler = mod.default ?? mod.handler;
 if (typeof handler !== "function") throw new Error("function must export a default handler");

@@ -39,7 +39,26 @@ export interface GatewayServices {
   realtime?: Mountable;
 }
 
-export type GatewayOptions = { domain: string; hooks?: GatewayHooks };
+export type GatewayOptions = {
+  domain: string;
+  hooks?: GatewayHooks;
+  /** A project's settings, for per-project CORS. Without it every origin is allowed. */
+  settingsFor?: (ref: string) => Promise<Record<string, unknown> | null | undefined>;
+  /** Origins that are always allowed even when a project restricts them, such as the dashboard that manages the project. */
+  alwaysAllow?: string[];
+};
+
+/** Does an allowed-origin entry match this origin? Exact (case-insensitive), "*" for everything, or a subdomain wildcard like https://*.example.com. */
+export function originMatches(pattern: string, origin: string): boolean {
+  const p = pattern.trim().toLowerCase();
+  const o = origin.toLowerCase();
+  if (p === "*") return true;
+  if (!p.includes("*")) return p === o;
+  const m = /^(https?):\/\/\*\.([a-z0-9.-]+(?::\d+)?)$/.exec(p);
+  if (!m) return false;
+  const rest = m[2]!.replace(/\./g, "\\.");
+  return new RegExp(`^${m[1]}://[a-z0-9-]+(\\.[a-z0-9-]+)*\\.${rest}$`).test(o);
+}
 
 const CORS = {
   "access-control-allow-origin": "*",
@@ -74,8 +93,26 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
   app.removeAllContentTypeParsers();
   app.addContentTypeParser(/.*/, { parseAs: "buffer" }, (_req, body, done) => done(null, body));
 
-  app.setErrorHandler((err: Error & { statusCode?: number }, _req, reply) => {
-    reply.headers(CORS);
+  /**
+   * Browsers only read a cross-origin response if the server says so. With no cors_origins set, any origin may (the default for an API
+   * used from many sites). With a list, only those origins (and the dashboard) get the permission; others are simply not granted it.
+   * This protects users' browsers; it does not stop a server or script from calling the API, which an API key governs.
+   */
+  async function corsHeaders(req: FastifyRequest): Promise<Record<string, string>> {
+    const out: Record<string, string> = { ...CORS };
+    const ref = refFromHost(req.headers.host, opts.domain);
+    const settings = ref && opts.settingsFor ? await opts.settingsFor(ref).catch(() => null) : null;
+    const list = Array.isArray(settings?.cors_origins) ? (settings!.cors_origins as unknown[]).filter((x): x is string => typeof x === "string" && x.trim() !== "") : [];
+    if (!list.length) return out;
+    delete out["access-control-allow-origin"];
+    out.vary = "Origin";
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : "";
+    if (origin && ((opts.alwaysAllow ?? []).some((x) => x.toLowerCase() === origin.toLowerCase()) || list.some((x) => originMatches(x, origin)))) out["access-control-allow-origin"] = origin;
+    return out;
+  }
+
+  app.setErrorHandler(async (err: Error & { statusCode?: number }, req, reply) => {
+    reply.headers(await corsHeaders(req));
     if (err instanceof AuthError) return reply.code(err.status).send({ code: err.status, error_code: err.errorCode, msg: err.message });
     if (err instanceof HttpError) return reply.headers(err.headers ?? {}).code(err.status).send({ message: err.message });
     if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ message: err.message });
@@ -85,7 +122,7 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
   });
 
   app.addHook("onRequest", async (req, reply) => {
-    reply.headers(CORS);
+    reply.headers(await corsHeaders(req));
     if (req.method === "OPTIONS") return reply.code(204).send();
     if (req.url === "/healthz") return;
     const ref = refFromHost(req.headers.host, opts.domain);

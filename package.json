@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Self-hosted, multi-project Supabase-style platform",
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp src/function-runner.mjs dist/",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp src/function-runner.mjs src/egress-guard.mjs dist/",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
     "typecheck": "tsc --noEmit",

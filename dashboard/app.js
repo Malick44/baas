@@ -2181,6 +2181,7 @@ async function authUrls(body, p, cfg, canEdit) {
   const s = cfg.settings;
   const site = h("input", { id: "auth-site-url", type: "url", placeholder: "https://myapp.example.com", value: s.site_url || "", autocomplete: "off", disabled: !canEdit });
   const list = h("textarea", { id: "auth-redirects", class: "code", rows: 6, placeholder: "https://myapp.example.com/**\nmyapp://callback", disabled: !canEdit, spellcheck: "false" }, (s.redirect_urls || []).join("\n"));
+  const cors = h("textarea", { id: "auth-cors", class: "code", rows: 4, placeholder: "https://myapp.example.com\nhttps://*.preview.example.com", disabled: !canEdit, spellcheck: "false" }, (s.cors_origins || []).join("\n"));
   clear(body);
   body.append(h("div", { class: "stack" }, h("div", { class: "page-head" }, h("h1", null, "URL configuration")),
     h("p", { class: "muted pagehint" }, "Where emailed links and provider sign-ins may send people back to. Anything else is refused, so a link cannot be pointed at someone else's site."),
@@ -2188,10 +2189,11 @@ async function authUrls(body, p, cfg, canEdit) {
     h("div", { class: "card stack" },
       formRow("Site URL", site, "Your app's main address. Links in emails go here when the app does not ask for somewhere else, and any address on the same origin is allowed."),
       formRow("Redirect URLs", list, "More addresses that are allowed, one per line. End with * to allow everything that starts that way, for example https://preview.example.com/*. App deep links such as myapp://callback work too."),
+      formRow("Browser origins (CORS)", cors, "Websites allowed to read this project's API from a browser. Leave empty to allow every website. One origin per line, like https://myapp.example.com; https://*.example.com matches subdomains. This protects your users' browsers; it does not stop servers or scripts, which your API keys control. This dashboard is always allowed."),
       h("div", { class: "row" }, h("button", { class: "primary", id: "save-urls", disabled: !canEdit, onclick: async () => {
         try {
           const lines = list.value.split("\n").map((x) => x.trim()).filter(Boolean);
-          const patch = { redirect_urls: lines };
+          const patch = { redirect_urls: lines, cors_origins: cors.value.split("\n").map((x) => x.trim()).filter(Boolean) };
           if (site.value.trim()) patch.site_url = site.value.trim();
           await saveAuthSettings(p, patch);
           toast("URL configuration saved", "ok");
