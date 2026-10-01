@@ -285,7 +285,8 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await tab("database", "policies");
     await page.waitForSelector("tr[data-row='anyone reads']");
     assert.match((await page.textContent("tr[data-row='anyone reads']"))!, /notes\s*SELECT\s*anon/);
-    await page.locator("tr[data-row='anyone reads'] button:has-text('Definition')").click();
+    await page.locator("tr[data-row='anyone reads'] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=definition]");
     assert.match((await page.textContent("dialog pre"))!, /create policy "anyone reads" on "public"\."notes"[\s\S]*to anon[\s\S]*using \(true\)/);
     await page.click("dialog button:has-text('Close')");
     await shot("06d-db-policies");
@@ -312,6 +313,179 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await tab("database", "migrations");
     await page.waitForSelector("#catalog-table .empty");
     assert.match((await page.textContent("#catalog-table"))!, /No migrations applied yet/);
+  });
+
+  step("edits policies, triggers, indexes and enum types from the database pages", async () => {
+    await t.sql(owner, ref, "create table public.todos (id serial primary key, user_id uuid, title text); grant select, insert on public.todos to anon, authenticated; create function public.shout() returns trigger language plpgsql as $$ begin new.title := upper(new.title); return new; end $$");
+    const signup = async (email: string) => (await t.gw(ref, "POST", "/auth/v1/signup", { key: anon, body: { email, password: "password-123" } })).json.user.id as string;
+    const ann = await signup("editor-ann@example.com"), bob = await signup("editor-bob@example.com");
+    await t.sql(owner, ref, `insert into public.todos (user_id, title) values ('${ann}', 'ann todo'), ('${bob}', 'bob todo')`);
+
+    // ---- policies ----
+    await tab("database", "policies");
+    await page.click("#new-policy");
+    await page.waitForSelector("dialog.sheet #pol-name");
+    await page.selectOption("#pol-table", "todos");
+    await page.selectOption("#pol-template", "own_read");
+    assert.equal(await page.inputValue("#pol-using"), "auth.uid() = user_id", "the template finds the owner column");
+    assert.equal(await page.inputValue("#pol-cmd"), "SELECT");
+    assert.equal(await page.isVisible("#pol-check"), false, "a select policy has no check expression");
+    assert.match((await page.textContent("#pol-rls-note"))!, /Row-level security is off/);
+    const preview = (await page.textContent("#sql-preview"))!;
+    assert.match(preview, /alter table "public"\."todos" enable row level security;\ncreate policy "Users can only read their own rows" on "public"\."todos"\n  as permissive for select to authenticated\n  using \(auth\.uid\(\) = user_id\);/);
+    await page.fill("#pol-name", "");
+    await page.click("dialog button[type=submit]");
+    await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+    assert.match((await page.textContent("dialog .notice.bad"))!, /name/);
+    await page.fill("#pol-name", "owners read");
+    await page.fill("#pol-using", "auth.uid() = user_id; drop table todos");
+    await page.click("dialog button[type=submit]");
+    assert.match((await page.textContent("dialog .notice.bad"))!, /single expression/);
+    await page.fill("#pol-using", "auth.uid() = user_id");
+    await shot("06j-policy-editor");
+    await page.click("dialog button[type=submit]");
+    await toast("Policy created");
+    await page.waitForSelector("tr[data-row='owners read']");
+    assert.equal((await t.sql(owner, ref, "select relrowsecurity from pg_class where relname = 'todos'")).json.results[0].rows[0][0], true, "row-level security was turned on");
+
+    // ---- test access ----
+    await page.click("#test-access");
+    await page.selectOption("#tst-table", "todos");
+    await page.click("#tst-run");
+    await page.waitForSelector("#tst-summary");
+    assert.match((await page.textContent("#tst-summary"))!, /anonymous visitor can see 0 of 2 rows in todos/);
+    await page.selectOption("#tst-who", "user");
+    await page.fill("#tst-user-search", "editor-ann");
+    await page.click("#tst-user-results [data-user='editor-ann@example.com']");
+    await page.click("#tst-run");
+    await page.waitForFunction(() => /editor-ann@example\.com can see 1 of 2/.test(document.querySelector("#tst-summary")?.textContent ?? ""));
+    assert.match((await page.textContent("#tst-sample"))!, /ann todo/);
+    assert.doesNotMatch((await page.textContent("#tst-sample"))!, /bob todo/);
+    await shot("06j-test-access");
+    await page.click("dialog button[type=submit]");
+
+    // ---- edit: the policy now also applies to anonymous visitors ----
+    await page.locator("tr[data-row='owners read'] .linkish").click();
+    await page.waitForSelector("dialog.sheet");
+    assert.equal(await page.isDisabled("#pol-table"), true);
+    assert.equal(await page.isDisabled("#pol-cmd"), true);
+    assert.equal(await page.inputValue("#pol-using"), "(auth.uid() = user_id)");
+    await page.check("#pol-roles input[data-role=anon]");
+    await page.fill("#pol-using", "true");
+    await page.fill("#pol-name", "everyone reads");
+    assert.match((await page.textContent("#sql-preview"))!, /alter policy "owners read" on "public"\."todos"\n  to anon, authenticated\n  using \(true\);\nalter policy "owners read" on "public"\."todos" rename to "everyone reads";/);
+    await page.click("dialog button[type=submit]");
+    await toast("Policy saved");
+    await page.waitForSelector("tr[data-row='everyone reads']");
+    await page.click("#test-access");
+    await page.selectOption("#tst-table", "todos");
+    await page.click("#tst-run");
+    await page.waitForFunction(() => /anonymous visitor can see 2 of 2/.test(document.querySelector("#tst-summary")?.textContent ?? ""));
+    await page.click("dialog button[type=submit]");
+
+    await page.locator("tr[data-row='everyone reads'] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=drop-policy]");
+    await page.click("dialog button[type=submit]");
+    await toast("Policy deleted");
+    await page.waitForFunction(() => !document.querySelector("tr[data-row='everyone reads']"));
+
+    // ---- triggers ----
+    await tab("database", "triggers");
+    await page.click("#new-trigger");
+    await page.waitForSelector("dialog.sheet #trg-name");
+    await page.fill("#trg-name", "shout_titles");
+    await page.selectOption("#trg-table", "todos");
+    await page.selectOption("#trg-timing", "BEFORE");
+    await page.selectOption("#trg-fn", "public.shout");
+    assert.match((await page.textContent("#sql-preview"))!, /create trigger "shout_titles" before insert\n  on "public"\."todos"\n  for each row\n  execute function "public"\."shout"\(\);/);
+    await page.fill("#trg-name", "1 bad");
+    await page.click("dialog button[type=submit]");
+    assert.match((await page.textContent("dialog .notice.bad"))!, /name/);
+    await page.fill("#trg-name", "shout_titles");
+    await page.click("dialog button[type=submit]");
+    await toast("Trigger created");
+    await page.waitForSelector("tr[data-row=shout_titles]");
+    assert.equal(await page.locator("tr[data-row=baas_realtime]").count(), 0, "platform triggers are not listed");
+    await t.sql(owner, ref, "insert into public.todos (title) values ('quiet')");
+    const titles = async () => (await t.sql(owner, ref, "select title from public.todos where title ilike 'quiet' or title ilike 'loud' order by id")).json.results[0].rows.map((r: any) => r[0]);
+    assert.deepEqual(await titles(), ["QUIET"], "the trigger runs");
+    await page.locator("tr[data-row=shout_titles] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=toggle-trigger]");
+    await toast("Trigger disabled");
+    await t.sql(owner, ref, "insert into public.todos (title) values ('loud')");
+    assert.deepEqual(await titles(), ["QUIET", "loud"], "a disabled trigger does nothing");
+    await page.locator("tr[data-row=shout_titles] .linkish").click();
+    await page.waitForSelector("dialog.sheet");
+    assert.equal(await page.inputValue("#trg-timing"), "BEFORE");
+    assert.equal(await page.inputValue("#trg-fn"), "public.shout");
+    assert.equal(await page.isChecked("#trg-events input[data-event=INSERT]"), true);
+    await page.check("#trg-events input[data-event=UPDATE]");
+    await page.click("dialog button[type=submit]");
+    await toast("Trigger saved");
+    await page.waitForFunction(() => /INSERT, UPDATE/.test(document.querySelector("tr[data-row=shout_titles]")?.textContent ?? ""));
+    await page.locator("tr[data-row=shout_titles] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=drop-trigger]");
+    await page.fill("dialog input[name=typed]", "shout_titles");
+    await page.click("dialog button[type=submit]");
+    await toast("Trigger deleted");
+    await page.waitForFunction(() => !document.querySelector("tr[data-row=shout_titles]"));
+
+    // ---- indexes ----
+    await tab("database", "indexes");
+    await page.click("#new-index");
+    await page.waitForSelector("dialog.sheet #idx-table");
+    await page.selectOption("#idx-table", "todos");
+    await page.click("dialog button[type=submit]");
+    assert.match((await page.textContent("dialog .notice.bad"))!, /at least one column/);
+    await page.selectOption("#idx-add", "title");
+    await page.selectOption("#idx-add", "user_id");
+    assert.deepEqual(await page.locator("#idx-cols .chip-col").evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.col)), ["title", "user_id"]);
+    await page.click("#idx-cols [aria-label='Move user_id earlier']");
+    await page.check("#idx-unique");
+    await page.fill("#idx-name", "todos_user_title_uq");
+    assert.match((await page.textContent("#sql-preview"))!, /create unique index "todos_user_title_uq" on "public"\."todos"\n  using btree \("user_id", "title"\);/);
+    await page.click("dialog button[type=submit]");
+    await toast("Index created");
+    await page.waitForSelector("tr[data-row=todos_user_title_uq]");
+    assert.match((await page.textContent("tr[data-row=todos_user_title_uq]"))!, /CREATE UNIQUE INDEX[\s\S]*\(user_id, title\)/);
+    await page.locator("tr[data-row=todos_pkey] button[aria-label='Row actions']").click();
+    assert.equal(await page.isDisabled(".menu [data-action=drop-index]"), true, "an index that backs a constraint cannot be dropped here");
+    await page.mouse.click(5, 300);
+    await page.locator("tr[data-row=todos_user_title_uq] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=drop-index]");
+    await page.fill("dialog input[name=typed]", "todos_user_title_uq");
+    await page.click("dialog button[type=submit]");
+    await toast("Index deleted");
+    await page.waitForFunction(() => !document.querySelector("tr[data-row=todos_user_title_uq]"));
+
+    // ---- enumerated types ----
+    await tab("database", "enums");
+    await page.click("#new-enum");
+    await page.waitForSelector("dialog.sheet #enum-name");
+    await page.fill("#enum-name", "mood");
+    await page.fill("#enum-values", "sad\nhappy");
+    assert.match((await page.textContent("#sql-preview"))!, /create type "public"\."mood" as enum \('sad', 'happy'\);/);
+    await page.fill("#enum-values", "sad\nsad");
+    await page.click("dialog button[type=submit]");
+    assert.match((await page.textContent("dialog .notice.bad"))!, /different/);
+    await page.fill("#enum-values", "sad\nhappy");
+    await page.click("dialog button[type=submit]");
+    await toast("Type created");
+    await page.waitForSelector("tr[data-row=mood]");
+    await page.locator("tr[data-row=mood] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=add-enum-value]");
+    await page.fill("#enum-new-value", "meh");
+    await page.selectOption("#enum-where", "before:happy");
+    await page.click("dialog button[type=submit]");
+    await toast("Value added");
+    assert.equal((await t.sql(owner, ref, "select enum_range(null::public.mood)::text")).json.results[0].rows[0][0], "{sad,meh,happy}");
+    await page.locator("tr[data-row=mood] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=drop-enum]");
+    await page.fill("dialog input[name=typed]", "mood");
+    await page.click("dialog button[type=submit]");
+    await toast("Type deleted");
+    await page.waitForFunction(() => !document.querySelector("tr[data-row=mood]"));
+    await t.sql(owner, ref, "drop table public.todos; drop function public.shout(); delete from auth.users where email like 'editor-%'");
   });
 
   step("creates, edits, calls and deletes a database function", async () => {

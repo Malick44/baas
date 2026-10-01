@@ -202,7 +202,7 @@ function rowMenu(items) {
     if (open && open.dataset.owner === e.currentTarget.dataset.id) return;
     const box = e.currentTarget.getBoundingClientRect();
     const menu = h("div", { class: "menu row-menu", role: "menu" }, items.map(([label, run, o = {}]) =>
-      h("button", { role: "menuitem", class: o.danger ? "danger-item" : "", "data-action": o.action || "", onclick: () => { closeMenus(); run(); } }, label)));
+      h("button", { role: "menuitem", class: o.danger ? "danger-item" : "", "data-action": o.action || "", disabled: !!o.disabled, title: o.why || "", onclick: () => { closeMenus(); run(); } }, label)));
     menu.style.position = "fixed";
     menu.style.top = `${Math.round(box.bottom + 4)}px`;
     menu.style.right = `${Math.round(window.innerWidth - box.right)}px`;
@@ -1050,6 +1050,302 @@ async function listPage(body, p, cfg) {
 
 const definitionDialog = (title, sqlText, extra) => dialog(title, () => h("div", { class: "stack" }, h("pre", { class: "sql" }, sqlText), extra), { confirmLabel: "Close" });
 
+/** Quote an identifier for SQL, whatever characters it has. */
+const qid = (x) => `"${String(x).replace(/"/g, '""')}"`;
+const qlit = (x) => `'${String(x).replace(/'/g, "''")}'`;
+const formRow = (label, el, hint) => h("div", { class: "form-row" }, h("label", null, label), h("div", null, el, hint ? h("p", { class: "muted hint" }, hint) : null));
+/** A read-only box showing the SQL a form will run, so nothing is hidden. */
+function sqlPreview() {
+  const pre = h("pre", { class: "sql-preview", id: "sql-preview" });
+  return { el: pre, set: (t) => { pre.textContent = t; } };
+}
+const tablesIn = async (schema) => catalog(`select c.relname as name, c.relrowsecurity as rls from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = ${pgLit(schema)} and c.relkind in ('r', 'p') order by c.relname`);
+const columnsOf = async (schema, table) => (await catalog(`select a.attname as name, format_type(a.atttypid, a.atttypmod) as type from pg_attribute a join pg_class c on c.oid = a.attrelid join pg_namespace n on n.oid = c.relnamespace where n.nspname = ${pgLit(schema)} and c.relname = ${pgLit(table)} and a.attnum > 0 and not a.attisdropped order by a.attnum`));
+const NO_SEMI = (what, v) => { if (/;/.test(v)) throw new Error(`${what} must be a single expression: remove the semicolon.`); return v.trim(); };
+
+// ---------- policies ----------
+const POLICY_TEMPLATES = {
+  "": { label: "Start from a template…" },
+  public_read: { label: "Anyone can read every row", cmd: "SELECT", roles: ["anon", "authenticated"], using: "true", check: "" },
+  signed_in_read: { label: "Signed-in users can read every row", cmd: "SELECT", roles: ["authenticated"], using: "true", check: "" },
+  own_rows: { label: "Users can only see and change their own rows", cmd: "ALL", roles: ["authenticated"], using: "auth.uid() = {owner}", check: "auth.uid() = {owner}" },
+  own_read: { label: "Users can only read their own rows", cmd: "SELECT", roles: ["authenticated"], using: "auth.uid() = {owner}", check: "" },
+  own_insert: { label: "Users can insert rows as themselves", cmd: "INSERT", roles: ["authenticated"], using: "", check: "auth.uid() = {owner}" },
+};
+
+/** The right-hand panel for creating or editing a row-level security policy. */
+async function policySheet(pol, reload, ctx) {
+  const schema = pol ? pol.schema : ctx.state.schema;
+  const tables = await tablesIn(schema);
+  if (!tables.length) { toast(`There are no tables in schema ${schema} yet. Create a table first.`, "bad"); return; }
+  const prev = sqlPreview();
+  const name = h("input", { id: "pol-name", placeholder: "e.g. Users can read their own rows", autocomplete: "off", value: pol ? pol.name : "" });
+  const table = h("select", { id: "pol-table", disabled: !!pol }, tables.map((t) => h("option", { value: t.name }, t.name)));
+  if (pol) table.value = pol.table;
+  const cmd = h("select", { id: "pol-cmd", disabled: !!pol }, ["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"].map((c) => h("option", { value: c }, c)));
+  cmd.value = pol ? pol.command : "SELECT";
+  const kind = h("select", { id: "pol-kind", disabled: !!pol }, [["PERMISSIVE", "Permissive (any matching policy grants access)"], ["RESTRICTIVE", "Restrictive (must also pass, narrows other policies)"]].map(([v, l]) => h("option", { value: v }, l)));
+  kind.value = pol ? pol.permissive.toUpperCase() : "PERMISSIVE";
+  const wantRoles = pol ? pol.roles.split(",").map((x) => x.trim()) : ["authenticated"];
+  const roleBoxes = [["anon", "anon (not signed in)"], ["authenticated", "authenticated (signed in)"], ["public", "public (everyone)"]].map(([r, label]) =>
+    h("label", { class: "check" }, h("input", { type: "checkbox", "data-role": r, checked: wantRoles.includes(r) }), label));
+  const using = h("textarea", { id: "pol-using", class: "code", rows: 3, spellcheck: "false", placeholder: "auth.uid() = user_id" }, pol?.using || "");
+  const check = h("textarea", { id: "pol-check", class: "code", rows: 3, spellcheck: "false", placeholder: "auth.uid() = user_id" }, pol?.check || "");
+  const usingRow = formRow("Using expression", using, "Which existing rows the policy applies to. For reads, updates and deletes.");
+  const checkRow = formRow("With check expression", check, "Which new or changed rows are allowed. For inserts and updates. If left empty on an update, the using expression is used.");
+  const enableRls = h("input", { type: "checkbox", id: "pol-enable-rls", checked: true });
+  const rlsRow = h("div", { class: "notice warn", id: "pol-rls-note", hidden: true }, h("label", { class: "check" }, enableRls, "Row-level security is off on this table, so this policy would do nothing. Turn it on."));
+  const tpl = h("select", { id: "pol-template", "aria-label": "Template" }, Object.entries(POLICY_TEMPLATES).map(([k, v]) => h("option", { value: k }, v.label)));
+  let cols = [];
+  const owner = () => (cols.find((c) => /^(user_id|owner_id|owner|created_by|author_id)$/.test(c.name)) || { name: "user_id" }).name;
+
+  const roles = () => roleBoxes.map((l) => l.querySelector("input")).filter((i) => i.checked).map((i) => i.dataset.role);
+  const wants = () => ({ using: cmd.value !== "INSERT", check: cmd.value === "INSERT" || cmd.value === "ALL" || cmd.value === "UPDATE" });
+  const sqlText = () => {
+    const t = `${qid(schema)}.${qid(table.value)}`;
+    const w = wants();
+    const to = roles().length ? roles().join(", ") : "public";
+    const u = w.using && using.value.trim() ? `\n  using (${using.value.trim()})` : "";
+    const c = w.check && check.value.trim() ? `\n  with check (${check.value.trim()})` : "";
+    const head = [];
+    if (!pol && enableRls.checked && !rlsRow.hidden) head.push(`alter table ${t} enable row level security;`);
+    if (!pol) return [...head, `create policy ${qid(name.value || "policy name")} on ${t}\n  as ${kind.value.toLowerCase()} for ${cmd.value.toLowerCase()} to ${to}${u}${c};`].join("\n");
+    const out = [`alter policy ${qid(pol.name)} on ${t}\n  to ${to}${u}${c};`];
+    if (name.value.trim() && name.value.trim() !== pol.name) out.push(`alter policy ${qid(pol.name)} on ${t} rename to ${qid(name.value.trim())};`);
+    return out.join("\n");
+  };
+  const refresh = () => {
+    const w = wants();
+    usingRow.hidden = !w.using; checkRow.hidden = !w.check;
+    const t = tables.find((x) => x.name === table.value);
+    rlsRow.hidden = !!pol || !t || t.rls;
+    prev.set(sqlText());
+  };
+  const loadCols = async () => { cols = await columnsOf(schema, table.value); refresh(); };
+  tpl.addEventListener("change", () => {
+    const x = POLICY_TEMPLATES[tpl.value];
+    if (!tpl.value || !x) return;
+    if (!pol) cmd.value = x.cmd;
+    for (const l of roleBoxes) { const i = l.querySelector("input"); i.checked = x.roles.includes(i.dataset.role); }
+    const col = /^[a-z_][a-z0-9_]*$/.test(owner()) ? owner() : qid(owner());
+    using.value = x.using.replace(/\{owner\}/g, col);
+    check.value = x.check.replace(/\{owner\}/g, col);
+    if (!name.value) name.value = x.label;
+    refresh();
+  });
+  for (const el of [name, table, cmd, kind, using, check, enableRls, ...roleBoxes.map((l) => l.querySelector("input"))]) { el.addEventListener("input", refresh); el.addEventListener("change", refresh); }
+  table.addEventListener("change", loadCols);
+  await loadCols();
+
+  const ok = await dialog(pol ? `Edit policy` : "Create a policy", () => h("div", { class: "stack" },
+    pol ? null : formRow("Template", tpl, "Fills in the fields below. Check the expression before you save."),
+    formRow("Name", name), formRow("Table", table, pol ? "A policy's table, command and type cannot be changed. Create a new policy instead." : null),
+    formRow("Command", cmd), formRow("Type", kind), rlsRow,
+    formRow("Roles", h("div", { class: "checks", id: "pol-roles" }, roleBoxes), "service_role bypasses row-level security, so it is not listed."),
+    usingRow, checkRow,
+    h("div", { class: "form-section" }, h("h3", null, "SQL that will run"), prev.el)), {
+    sheet: true, confirmLabel: pol ? "Save policy" : "Create policy",
+    onSubmit: async () => {
+      if (!name.value.trim()) throw new Error("Give the policy a name.");
+      const w = wants();
+      if (!roles().length) throw new Error("Choose at least one role.");
+      if (w.using) NO_SEMI("The using expression", using.value);
+      if (w.check) NO_SEMI("The with check expression", check.value);
+      if (cmd.value === "INSERT" && !check.value.trim()) throw new Error("An insert policy needs a with check expression.");
+      if (cmd.value !== "INSERT" && !using.value.trim() && !(w.check && check.value.trim())) throw new Error("Write a using expression (for example true, or auth.uid() = user_id).");
+      if (pol && cmd.value !== "INSERT" && !using.value.trim()) throw new Error("A using expression is required.");
+      await sqlRun(sqlText());
+      return true;
+    },
+  });
+  if (ok) { toast(pol ? "Policy saved" : "Policy created", "ok"); reload(); }
+}
+
+/** Ask "what can this identity see in this table?" without leaving the policies page. */
+async function accessTester(ctx, preset) {
+  const tables = await tablesIn("public");
+  if (!tables.length) { toast("There are no tables in the public schema yet.", "bad"); return; }
+  const table = h("select", { id: "tst-table" }, tables.map((t) => h("option", { value: t.name }, t.name)));
+  if (preset) table.value = preset;
+  const who = h("select", { id: "tst-who" }, [["anon", "An anonymous visitor"], ["user", "A signed-in user…"]].map(([v, l]) => h("option", { value: v }, l)));
+  const q = h("input", { id: "tst-user-search", placeholder: "Search users by email", autocomplete: "off", hidden: true });
+  const found = h("div", { class: "checks", id: "tst-user-results" });
+  let userId = null;
+  const out = h("div", { id: "tst-result" });
+  const run = async () => {
+    clear(out);
+    if (who.value === "user" && !userId) { out.append(h("div", { class: "notice bad" }, "Pick a user first.")); return; }
+    out.append(h("p", { class: "muted" }, "Checking…"));
+    try {
+      const r = await api("POST", `/v1/projects/${S.project.ref}/policy-test`, { table: table.value, as: who.value === "anon" ? { type: "anon" } : { type: "user", userId } });
+      clear(out);
+      if (!r.allowed) { out.append(h("div", { class: "notice bad", id: "tst-denied" }, `${r.identity} cannot read ${r.table}: ${r.reason}.`)); return; }
+      out.append(
+        h("div", { class: "notice", id: "tst-summary", "data-visible": String(r.visible), "data-total": String(r.total) }, `${r.identity} can see ${r.visible} of ${r.total} row${r.total === 1 ? "" : "s"} in ${r.table}.`,
+          !r.rls ? h("div", { class: "warn" }, "Row-level security is off on this table, so every row is visible.") : r.policies === 0 ? h("div", { class: "warn" }, "Row-level security is on but there are no policies, so no rows are visible.") : null),
+        r.sample.length ? h("pre", { class: "sql-preview", id: "tst-sample" }, r.sample.map((x) => JSON.stringify(x)).join("\n")) : null);
+    } catch (ex) { clear(out); out.append(h("div", { class: "notice bad" }, ex.message)); }
+  };
+  who.addEventListener("change", () => { q.hidden = who.value !== "user"; clear(found); userId = null; });
+  q.addEventListener("input", async () => {
+    clear(found);
+    if (q.value.trim().length < 1) return;
+    try {
+      const users = await api("GET", `/v1/projects/${S.project.ref}/ai/users?q=${encodeURIComponent(q.value.trim())}`);
+      for (const u of users) found.append(h("button", { type: "button", class: "small", "data-user": u.email, onclick: () => { userId = u.id; q.value = u.email; clear(found); } }, u.email));
+    } catch { /* the list is optional */ }
+  });
+  await dialog("Test access", () => h("div", { class: "stack" },
+    h("p", { class: "muted" }, "Runs a read-only query as the chosen identity, with its real role, so you can see exactly which rows your policies allow. Nothing is changed."),
+    formRow("Table", table), formRow("Identity", h("div", { class: "stack" }, who, q, found)),
+    h("div", { class: "row" }, h("button", { type: "button", class: "primary", id: "tst-run", onclick: run }, "Run test")), out), { confirmLabel: "Close" });
+}
+
+// ---------- triggers ----------
+async function triggerSheet(tr, reload, ctx) {
+  const schema = tr ? tr.schema : ctx.state.schema;
+  const tables = await tablesIn(schema);
+  const fns = await catalog(`select n.nspname as schema, p.proname as name from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prorettype = 'trigger'::regtype and p.prokind = 'f'
+    and n.nspname !~ '^pg_' and n.nspname not in ('information_schema', 'realtime', 'auth', 'storage', 'extensions') and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e') order by 1, 2`);
+  if (!tables.length) { toast(`There are no tables in schema ${schema} yet.`, "bad"); return; }
+  const prev = sqlPreview();
+  const bits = tr ? Number(tr.tgtype) : 0;
+  const name = h("input", { id: "trg-name", placeholder: "e.g. set_updated_at", autocomplete: "off", value: tr ? tr.name : "" });
+  const table = h("select", { id: "trg-table" }, tables.map((t) => h("option", { value: t.name }, t.name)));
+  if (tr) table.value = tr.table;
+  const timing = h("select", { id: "trg-timing" }, ["BEFORE", "AFTER"].map((x) => h("option", { value: x }, x)));
+  timing.value = tr ? ((bits & 2) ? "BEFORE" : "AFTER") : "AFTER";
+  const evs = [["INSERT", 4], ["UPDATE", 16], ["DELETE", 8]].map(([e, bit]) => h("label", { class: "check" }, h("input", { type: "checkbox", "data-event": e, checked: tr ? !!(bits & bit) : e === "INSERT" }), e.charAt(0) + e.slice(1).toLowerCase()));
+  const orient = h("select", { id: "trg-orient" }, [["ROW", "For each row"], ["STATEMENT", "For each statement"]].map(([v, l]) => h("option", { value: v }, l)));
+  orient.value = tr ? ((bits & 1) ? "ROW" : "STATEMENT") : "ROW";
+  const fn = h("select", { id: "trg-fn" }, fns.length ? fns.map((f) => h("option", { value: `${f.schema}.${f.name}` }, `${f.schema}.${f.name}()`)) : [h("option", { value: "" }, "No trigger functions yet")]);
+  if (tr) fn.value = `${tr.fn_schema}.${tr.fn_name}`;
+  const when = h("input", { id: "trg-when", class: "code", placeholder: "e.g. OLD.status IS DISTINCT FROM NEW.status", autocomplete: "off", value: tr?.when_expr || "" });
+  const events = () => evs.map((l) => l.querySelector("input")).filter((i) => i.checked).map((i) => i.dataset.event);
+  const sqlText = () => {
+    const [fs, fnn] = (fn.value || "schema.function").split(".");
+    const w = when.value.trim() && orient.value === "ROW" ? `\n  when (${when.value.trim()})` : "";
+    const create = `create trigger ${qid(name.value || "trigger_name")} ${timing.value.toLowerCase()} ${events().map((e) => e.toLowerCase()).join(" or ") || "insert"}\n  on ${qid(schema)}.${qid(table.value)}\n  for each ${orient.value.toLowerCase()}${w}\n  execute function ${qid(fs)}.${qid(fnn)}();`;
+    return tr ? `drop trigger ${qid(tr.name)} on ${qid(schema)}.${qid(tr.table)};\n${create}` : create;
+  };
+  const refresh = () => prev.set(sqlText());
+  for (const el of [name, table, timing, orient, fn, when, ...evs.map((l) => l.querySelector("input"))]) { el.addEventListener("input", refresh); el.addEventListener("change", refresh); }
+  refresh();
+  const ok = await dialog(tr ? "Edit trigger" : "Create a trigger", () => h("div", { class: "stack" },
+    formRow("Name", name), formRow("Table", table), formRow("Timing", timing, "BEFORE can change the row before it is written; AFTER runs once it has been."),
+    formRow("Events", h("div", { class: "checks", id: "trg-events" }, evs)), formRow("Orientation", orient),
+    formRow("Function", fn, fns.length ? "A function that returns trigger." : "Create a function that returns trigger first (Database → Functions)."),
+    formRow("Condition (optional)", when, "Only fire when this is true. Only for row triggers."),
+    tr ? h("p", { class: "muted" }, "Saving drops the trigger and creates it again, in one transaction.") : null,
+    h("div", { class: "form-section" }, h("h3", null, "SQL that will run"), prev.el)), {
+    sheet: true, confirmLabel: tr ? "Save trigger" : "Create trigger",
+    onSubmit: async () => {
+      if (!/^[A-Za-z_][A-Za-z0-9_$]*$/.test(name.value.trim())) throw new Error("Give the trigger a name: letters, digits and underscores, not starting with a digit.");
+      if (!events().length) throw new Error("Choose at least one event.");
+      if (!fn.value) throw new Error("Choose a trigger function.");
+      NO_SEMI("The condition", when.value);
+      await sqlRun(sqlText());
+      return true;
+    },
+  });
+  if (ok) { toast(tr ? "Trigger saved" : "Trigger created", "ok"); reload(); }
+}
+
+// ---------- indexes ----------
+async function indexSheet(reload, ctx) {
+  const schema = ctx.state.schema;
+  const tables = await tablesIn(schema);
+  if (!tables.length) { toast(`There are no tables in schema ${schema} yet.`, "bad"); return; }
+  const prev = sqlPreview();
+  const table = h("select", { id: "idx-table" }, tables.map((t) => h("option", { value: t.name }, t.name)));
+  const pick = h("select", { id: "idx-add", "aria-label": "Add a column" });
+  const chips = h("div", { class: "chips", id: "idx-cols" });
+  const method = h("select", { id: "idx-method" }, ["btree", "hash", "gin", "gist", "brin"].map((m) => h("option", { value: m }, m)));
+  const unique = h("input", { type: "checkbox", id: "idx-unique" });
+  const name = h("input", { id: "idx-name", placeholder: "Leave empty to let Postgres choose", autocomplete: "off" });
+  const where = h("input", { id: "idx-where", class: "code", placeholder: "e.g. deleted_at IS NULL", autocomplete: "off" });
+  let cols = [], chosen = [];
+  const sqlText = () => `create ${unique.checked ? "unique " : ""}index${name.value.trim() ? ` ${qid(name.value.trim())}` : ""} on ${qid(schema)}.${qid(table.value)}\n  using ${method.value} (${chosen.map(qid).join(", ") || "column"})${where.value.trim() ? `\n  where (${where.value.trim()})` : ""};`;
+  const drawChips = () => {
+    clear(chips);
+    chosen.forEach((c, i) => chips.append(h("span", { class: "chip-col", "data-col": c },
+      h("span", { class: "mono" }, `${i + 1}. ${c}`),
+      h("button", { type: "button", "aria-label": `Move ${c} earlier`, disabled: i === 0, onclick: () => { [chosen[i - 1], chosen[i]] = [chosen[i], chosen[i - 1]]; drawChips(); } }, "◀"),
+      h("button", { type: "button", "aria-label": `Move ${c} later`, disabled: i === chosen.length - 1, onclick: () => { [chosen[i + 1], chosen[i]] = [chosen[i], chosen[i + 1]]; drawChips(); } }, "▶"),
+      h("button", { type: "button", "aria-label": `Remove ${c}`, onclick: () => { chosen = chosen.filter((x) => x !== c); drawChips(); } }, "✕"))));
+    if (!chosen.length) chips.append(h("span", { class: "muted" }, "No columns yet. The order matters for lookups on several columns."));
+    clear(pick);
+    pick.append(h("option", { value: "" }, "Add a column…"), ...cols.filter((c) => !chosen.includes(c.name)).map((c) => h("option", { value: c.name }, `${c.name} (${c.type})`)));
+    prev.set(sqlText());
+  };
+  const loadCols = async () => { cols = await columnsOf(schema, table.value); chosen = []; drawChips(); };
+  pick.addEventListener("change", () => { if (pick.value) { chosen.push(pick.value); drawChips(); } });
+  for (const el of [method, unique, name, where]) { el.addEventListener("input", () => prev.set(sqlText())); el.addEventListener("change", () => prev.set(sqlText())); }
+  table.addEventListener("change", loadCols);
+  await loadCols();
+  const ok = await dialog("Create an index", () => h("div", { class: "stack" },
+    formRow("Table", table), formRow("Columns", h("div", { class: "stack" }, chips, pick)),
+    formRow("Method", method, "btree suits almost everything. gin is for arrays, jsonb and text search; gist for ranges and geometry."),
+    formRow("Unique", h("label", { class: "check" }, unique, "Reject duplicate values")), formRow("Name", name),
+    formRow("Only rows where (optional)", where, "A partial index covers only the rows that match."),
+    h("div", { class: "form-section" }, h("h3", null, "SQL that will run"), prev.el)), {
+    sheet: true, confirmLabel: "Create index",
+    onSubmit: async () => {
+      if (!chosen.length) throw new Error("Choose at least one column.");
+      if (name.value.trim() && !/^[A-Za-z_][A-Za-z0-9_$]*$/.test(name.value.trim())) throw new Error("The name may only use letters, digits and underscores.");
+      NO_SEMI("The condition", where.value);
+      await sqlRun(sqlText());
+      return true;
+    },
+  });
+  if (ok) { toast("Index created", "ok"); reload(); }
+}
+
+// ---------- enumerated types ----------
+async function enumSheet(reload, ctx) {
+  const schema = ctx.state.schema;
+  const prev = sqlPreview();
+  const name = h("input", { id: "enum-name", placeholder: "e.g. order_status", autocomplete: "off" });
+  const vals = h("textarea", { id: "enum-values", rows: 6, class: "code", placeholder: "pending\nshipped\ndelivered", spellcheck: "false" });
+  const list = () => vals.value.split("\n").map((x) => x.trim()).filter(Boolean);
+  const sqlText = () => `create type ${qid(schema)}.${qid(name.value || "type_name")} as enum (${list().map(qlit).join(", ")});`;
+  for (const el of [name, vals]) el.addEventListener("input", () => prev.set(sqlText()));
+  prev.set(sqlText());
+  const ok = await dialog("Create an enumerated type", () => h("div", { class: "stack" },
+    formRow("Name", name), formRow("Values", vals, "One value per line, in the order they should sort. You can add more later but not remove them."),
+    h("div", { class: "form-section" }, h("h3", null, "SQL that will run"), prev.el)), {
+    sheet: true, confirmLabel: "Create type",
+    onSubmit: async () => {
+      if (!/^[A-Za-z_][A-Za-z0-9_$]*$/.test(name.value.trim())) throw new Error("Give the type a name: letters, digits and underscores, not starting with a digit.");
+      const v = list();
+      if (!v.length) throw new Error("Add at least one value.");
+      if (new Set(v).size !== v.length) throw new Error("Values must be different from each other.");
+      await sqlRun(sqlText());
+      return true;
+    },
+  });
+  if (ok) { toast("Type created", "ok"); reload(); }
+}
+
+async function enumValueDialog(en, reload, ctx) {
+  const schema = ctx.state.schema;
+  const existing = typeof en.values_json === "string" ? JSON.parse(en.values_json) : en.values_json || [];
+  const value = h("input", { id: "enum-new-value", autocomplete: "off", placeholder: "new value" });
+  const where = h("select", { id: "enum-where" }, [["end", "At the end"], ...existing.flatMap((v) => [[`before:${v}`, `Before ${v}`], [`after:${v}`, `After ${v}`]])].map(([v, l]) => h("option", { value: v }, l)));
+  const ok = await dialog(`Add a value to ${en.name}`, () => h("div", { class: "stack" }, h("p", { class: "muted" }, `Current values: ${existing.join(", ")}`), formRow("Value", value), formRow("Position", where)), {
+    confirmLabel: "Add value",
+    onSubmit: async () => {
+      const v = value.value.trim();
+      if (!v) throw new Error("Type the new value.");
+      if (existing.includes(v)) throw new Error(`${v} is already a value of this type.`);
+      const [pos, ref] = where.value === "end" ? [null, null] : where.value.split(/:(.*)/s);
+      await sqlRun(`alter type ${qid(schema)}.${qid(en.name)} add value ${qlit(v)}${pos ? ` ${pos} ${qlit(ref)}` : ""}`);
+      return true;
+    },
+  });
+  if (ok) { toast("Value added", "ok"); reload(); }
+}
+
 const DB_PAGES = {
   tables: {
     title: "Tables", hint: "Tables, views and other relations in the schema. Use the Table editor to browse and edit rows.", searchPlaceholder: "Search for a table", empty: "No tables in this schema.",
@@ -1069,19 +1365,39 @@ const DB_PAGES = {
     ],
   },
   triggers: {
-    title: "Triggers", hint: "Functions that run automatically when rows change.", searchPlaceholder: "Search for a trigger", empty: "No triggers in this schema.",
-    query: (s) => `select t.tgname as name, c.relname as "table", p.proname as function, pg_get_triggerdef(t.oid) as definition, t.tgenabled <> 'D' as enabled
-      from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_namespace n on n.oid = c.relnamespace join pg_proc p on p.oid = t.tgfoid
-      where not t.tgisinternal and n.nspname = ${pgLit(s)} order by c.relname, t.tgname`,
-    cols: [{ key: "name", label: "Name" }, { key: "table", label: "Table" }, { key: "function", label: "Function" },
+    title: "Triggers", hint: "Functions that run automatically when rows change. Triggers the platform installs for Realtime and Pipelines are not listed.", searchPlaceholder: "Search for a trigger", empty: "No triggers in this schema.",
+    toolbarAction: (reload, ctx) => h("button", { class: "primary", id: "new-trigger", onclick: () => triggerSheet(null, reload, ctx) }, icon("plus", 15), " New trigger"),
+    query: (s) => `select t.tgname as name, c.relname as "table", p.proname as function, fn.nspname as fn_schema, p.proname as fn_name, n.nspname as schema, t.tgtype::int as tgtype,
+        pg_get_expr(t.tgqual, t.tgrelid) as when_expr, pg_get_triggerdef(t.oid) as definition, t.tgenabled <> 'D' as enabled
+      from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_namespace n on n.oid = c.relnamespace join pg_proc p on p.oid = t.tgfoid join pg_namespace fn on fn.oid = p.pronamespace
+      where not t.tgisinternal and t.tgname <> 'baas_realtime' and n.nspname = ${pgLit(s)} order by c.relname, t.tgname`,
+    cols: [{ label: "Name", cell: (r, reload, ctx) => h("button", { class: "linkish", "data-action": "open-trigger", onclick: () => triggerSheet(r, reload, ctx) }, r.name) },
+      { key: "table", label: "Table" }, { key: "function", label: "Function" },
       { label: "Events", cell: (r) => (/(?:BEFORE|AFTER|INSTEAD OF) ([A-Z ]+?) ON /.exec(r.definition)?.[1] || "").replace(/ OR /g, ", ") }, { label: "Enabled", cell: (r) => (r.enabled ? "yes" : "no") }],
-    actions: (r) => [h("button", { class: "small", onclick: () => definitionDialog(`Trigger ${r.name}`, r.definition) }, "Definition")],
+    actions: (r, reload, ctx) => [rowMenu([
+      ["Edit trigger", () => triggerSheet(r, reload, ctx), { action: "edit-trigger" }],
+      [r.enabled ? "Disable" : "Enable", async () => { try { await sqlRun(`alter table ${qid(r.schema)}.${qid(r.table)} ${r.enabled ? "disable" : "enable"} trigger ${qid(r.name)}`); toast(r.enabled ? "Trigger disabled" : "Trigger enabled", "ok"); reload(); } catch (ex) { toast(ex.message, "bad"); } }, { action: "toggle-trigger" }],
+      ["View definition", () => definitionDialog(`Trigger ${r.name}`, r.definition), { action: "definition" }],
+      ["Delete trigger", async () => {
+        if (!(await confirmBox("Delete trigger", `Delete “${r.name}” on ${r.table}?`, { typed: r.name, confirmLabel: "Delete trigger" }))) return;
+        try { await sqlRun(`drop trigger ${qid(r.name)} on ${qid(r.schema)}.${qid(r.table)}`); toast("Trigger deleted", "ok"); reload(); } catch (ex) { toast(ex.message, "bad"); }
+      }, { danger: true, action: "drop-trigger" }],
+    ])],
   },
   enums: {
-    title: "Enumerated Types", hint: "Custom types with a fixed list of values.", searchPlaceholder: "Search for a type", empty: "No enumerated types in this schema.",
-    query: (s) => `select t.typname as name, (select string_agg(e.enumlabel, ', ' order by e.enumsortorder) from pg_enum e where e.enumtypid = t.oid) as "values"
+    title: "Enumerated Types", hint: "Custom types with a fixed list of values. You can add values later but not remove them.", searchPlaceholder: "Search for a type", empty: "No enumerated types in this schema.",
+    toolbarAction: (reload, ctx) => h("button", { class: "primary", id: "new-enum", onclick: () => enumSheet(reload, ctx) }, icon("plus", 15), " New type"),
+    query: (s) => `select t.typname as name, (select string_agg(e.enumlabel, ', ' order by e.enumsortorder) from pg_enum e where e.enumtypid = t.oid) as "values",
+        (select json_agg(e.enumlabel order by e.enumsortorder) from pg_enum e where e.enumtypid = t.oid) as values_json
       from pg_type t join pg_namespace n on n.oid = t.typnamespace where t.typtype = 'e' and n.nspname = ${pgLit(s)} order by t.typname`,
     cols: [{ key: "name", label: "Name" }, { key: "values", label: "Values", max: 120 }],
+    actions: (r, reload, ctx) => [rowMenu([
+      ["Add a value", () => enumValueDialog(r, reload, ctx), { action: "add-enum-value" }],
+      ["Delete type", async () => {
+        if (!(await confirmBox("Delete type", `Delete the type ${r.name}? This fails if a column still uses it.`, { typed: r.name, confirmLabel: "Delete type" }))) return;
+        try { await sqlRun(`drop type ${qid(ctx.state.schema)}.${qid(r.name)}`); toast("Type deleted", "ok"); reload(); } catch (ex) { toast(ex.message, "bad"); }
+      }, { danger: true, action: "drop-enum" }],
+    ])],
   },
   extensions: {
     schemas: false, title: "Extensions", hint: "PostgreSQL extensions installed in this database. Installing more is done by whoever runs the server.", searchPlaceholder: "Search for an extension", empty: "No extensions.",
@@ -1089,25 +1405,39 @@ const DB_PAGES = {
     cols: [{ key: "name", label: "Name" }, { label: "Status", cell: (r) => (r.installed_version ? h("span", { class: "ok" }, `enabled ${r.installed_version}`) : h("span", { class: "muted" }, "available")) }, { key: "comment", label: "Description", max: 90 }],
   },
   indexes: {
-    title: "Indexes", hint: "Indexes speed up lookups. Create one in the SQL editor.", searchPlaceholder: "Search for an index", empty: "No indexes in this schema.",
-    query: (s) => `select i.indexname as name, i.tablename as "table", i.indexdef as definition, pg_size_pretty(pg_relation_size((quote_ident(i.schemaname) || '.' || quote_ident(i.indexname))::regclass)) as size
-      from pg_indexes i where i.schemaname = ${pgLit(s)} order by i.tablename, i.indexname`,
-    cols: [{ key: "name", label: "Name" }, { key: "table", label: "Table" }, { key: "definition", label: "Definition", mono: true, max: 90 }, { key: "size", label: "Size" }],
-    actions: (r) => [h("button", { class: "small", onclick: () => definitionDialog(`Index ${r.name}`, r.definition) }, "Definition")],
+    title: "Indexes", hint: "Indexes speed up lookups. Indexes that enforce a primary key or unique constraint are managed with the table.", searchPlaceholder: "Search for an index", empty: "No indexes in this schema.",
+    toolbarAction: (reload, ctx) => h("button", { class: "primary", id: "new-index", onclick: () => indexSheet(reload, ctx) }, icon("plus", 15), " New index"),
+    query: (s) => `select ic.relname as name, tc.relname as "table", pg_get_indexdef(i.indexrelid) as definition, pg_size_pretty(pg_relation_size(i.indexrelid)) as size, am.amname as method,
+        exists(select 1 from pg_constraint k where k.conindid = i.indexrelid) as backs_constraint, n.nspname as schema
+      from pg_index i join pg_class ic on ic.oid = i.indexrelid join pg_class tc on tc.oid = i.indrelid join pg_namespace n on n.oid = tc.relnamespace join pg_am am on am.oid = ic.relam
+      where n.nspname = ${pgLit(s)} order by tc.relname, ic.relname`,
+    cols: [{ key: "name", label: "Name" }, { key: "table", label: "Table" }, { key: "method", label: "Method" }, { key: "definition", label: "Definition", mono: true, max: 90 }, { key: "size", label: "Size" }],
+    actions: (r, reload) => [rowMenu([
+      ["View definition", () => definitionDialog(`Index ${r.name}`, r.definition), { action: "definition" }],
+      ["Delete index", async () => {
+        if (!(await confirmBox("Delete index", `Delete the index ${r.name}? Queries that relied on it may get slower.`, { typed: r.name, confirmLabel: "Delete index" }))) return;
+        try { await sqlRun(`drop index ${qid(r.schema)}.${qid(r.name)}`); toast("Index deleted", "ok"); reload(); } catch (ex) { toast(ex.message, "bad"); }
+      }, { danger: true, action: "drop-index", disabled: r.backs_constraint, why: r.backs_constraint ? "This index enforces a constraint; change the constraint instead" : "" }],
+    ])],
   },
   policies: {
     title: "Policies", hint: "Row-level security policies decide which rows each role can read or change. Tables with security on and no policy hide every row.", searchPlaceholder: "Search for a policy", empty: "No policies in this schema.",
-    headAction: () => h("button", { class: "primary", id: "new-policy", onclick: () => openInSql("create policy \"policy name\" on public.your_table\n  for select to authenticated\n  using ( auth.uid() = user_id );") }, "New policy"),
-    query: (s) => `select p.policyname as name, p.tablename as "table", p.cmd as command, array_to_string(p.roles, ', ') as roles, p.permissive, p.qual as "using", p.with_check as "check"
+    toolbarAction: (reload, ctx) => h("span", { class: "row" },
+      h("button", { id: "test-access", onclick: () => accessTester(ctx) }, "Test access"),
+      h("button", { class: "primary", id: "new-policy", onclick: () => policySheet(null, reload, ctx) }, icon("plus", 15), " New policy")),
+    query: (s) => `select p.policyname as name, p.tablename as "table", p.cmd as command, array_to_string(p.roles, ', ') as roles, p.permissive, p.qual as "using", p.with_check as "check", p.schemaname as schema
       from pg_policies p where p.schemaname = ${pgLit(s)} order by p.tablename, p.policyname`,
-    cols: [{ key: "name", label: "Name" }, { key: "table", label: "Table" }, { key: "command", label: "Command" }, { key: "roles", label: "Roles" }, { key: "using", label: "Using", mono: true, max: 60 }, { key: "check", label: "With check", mono: true, max: 60 }],
-    actions: (r, reload) => [
-      h("button", { class: "small", onclick: () => definitionDialog(`Policy ${r.name}`, `create policy ${JSON.stringify(r.name)} on ${JSON.stringify(document.getElementById("catalog-schema").value)}.${JSON.stringify(r.table)}\n  as ${r.permissive.toLowerCase()} for ${r.command.toLowerCase()} to ${r.roles}${r.using ? `\n  using (${r.using})` : ""}${r.check ? `\n  with check (${r.check})` : ""};`) }, "Definition"),
-      h("button", { class: "small danger", "data-action": "drop-policy", onclick: async () => {
-        if (!(await confirmBox("Delete policy", `Delete “${r.name}” on ${r.table}? Access changes immediately.`, { confirmLabel: "Delete" }))) return;
-        try { await sqlRun(`drop policy ${JSON.stringify(r.name)} on ${JSON.stringify(document.getElementById("catalog-schema").value)}.${JSON.stringify(r.table)}`); toast("Policy deleted", "ok"); reload(); } catch (ex) { toast(ex.message, "bad"); }
-      } }, "Delete"),
-    ],
+    cols: [{ label: "Name", cell: (r, reload, ctx) => h("button", { class: "linkish", "data-action": "open-policy", onclick: () => policySheet(r, reload, ctx) }, r.name) },
+      { key: "table", label: "Table" }, { key: "command", label: "Command" }, { key: "roles", label: "Roles" }, { key: "using", label: "Using", mono: true, max: 60 }, { key: "check", label: "With check", mono: true, max: 60 }],
+    actions: (r, reload, ctx) => [rowMenu([
+      ["Edit policy", () => policySheet(r, reload, ctx), { action: "edit-policy" }],
+      ["Test access to this table", () => accessTester(ctx, r.table), { action: "test-policy" }],
+      ["View definition", () => definitionDialog(`Policy ${r.name}`, `create policy ${qid(r.name)} on ${qid(r.schema)}.${qid(r.table)}\n  as ${r.permissive.toLowerCase()} for ${r.command.toLowerCase()} to ${r.roles}${r.using ? `\n  using (${r.using})` : ""}${r.check ? `\n  with check (${r.check})` : ""};`), { action: "definition" }],
+      ["Delete policy", async () => {
+        if (!(await confirmBox("Delete policy", `Delete “${r.name}” on ${r.table}? Access changes immediately.`, { confirmLabel: "Delete policy" }))) return;
+        try { await sqlRun(`drop policy ${qid(r.name)} on ${qid(r.schema)}.${qid(r.table)}`); toast("Policy deleted", "ok"); reload(); } catch (ex) { toast(ex.message, "bad"); }
+      }, { danger: true, action: "drop-policy" }],
+    ])],
   },
   roles: {
     schemas: false, title: "Roles", hint: "The database roles your API uses. Their privileges are granted per table; row-level security narrows them further.", searchPlaceholder: "Search for a role", empty: "No roles.",

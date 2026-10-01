@@ -153,6 +153,11 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
       await control.audit(p.tokenId, p.orgId, "project.sql", ref, { statement: String(q).slice(0, 200) });
       return { results };
     });
+    app.post<{ Params: { ref: string } }>("/v1/projects/:ref/policy-test", async (req) => {
+      const { ref } = await owned(req, "admin");
+      const b = body(req);
+      return ops.admin!.testAccess(ref, b.table, b.as);
+    });
     app.get<{ Params: { ref: string } }>("/v1/projects/:ref/tables", async (req) => ops.admin!.tables((await owned(req)).ref));
   }
 

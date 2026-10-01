@@ -344,3 +344,13 @@ a.integ-card:hover { border-color: var(--line-strong); text-decoration: none; }
 .integ-card .mono { overflow: hidden; text-overflow: ellipsis; }
 
 .ext-card.na { opacity: .6; }
+
+/* ---- database editors ---- */
+.sql-preview { max-height: 220px; overflow: auto; white-space: pre-wrap; background: var(--bg-subtle); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 30px; align-items: center; }
+.chip-col { display: inline-flex; align-items: center; gap: 2px; border: 1px solid var(--line-strong); border-radius: 8px; padding: 2px 4px 2px 8px; background: var(--panel-2); }
+.chip-col button { border: 0; background: transparent; padding: 2px 5px; color: var(--muted); }
+.chip-col button:hover:not(:disabled) { color: var(--text); }
+.menu button:disabled { opacity: .45; cursor: not-allowed; }
+#tst-sample { margin-top: 8px; }
+[hidden] { display: none !important; }
