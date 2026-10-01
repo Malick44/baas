@@ -1,0 +1,27 @@
+# Adds automatic HTTPS in front of the platform:  docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+# Set in .env:  DOMAIN=example.com  DASHBOARD_HOST=baas.example.com  ACME_EMAIL=you@example.com
+# DNS: an A record for DASHBOARD_HOST and a wildcard A record for *.DOMAIN, both pointing at this machine.
+services:
+  baas:
+    ports: !override []          # only the proxy is reachable from outside
+    environment:
+      BAAS_GATEWAY_DOMAIN: ${DOMAIN:?set DOMAIN}
+      BAAS_DASHBOARD_HOST: ${DASHBOARD_HOST:?set DASHBOARD_HOST}
+      BAAS_PUBLIC_SCHEME: https
+      BAAS_PUBLIC_PORT: "443"
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [baas]
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN}
+      DASHBOARD_HOST: ${DASHBOARD_HOST:?set DASHBOARD_HOST}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  caddy_data:
+  caddy_config:

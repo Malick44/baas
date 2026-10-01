@@ -85,10 +85,25 @@ step "edge function"
 api -fS -XPUT "http://127.0.0.1:$API_PORT/v1/projects/$REF/functions/hi" -d '{"source":"export default async () => Response.json({ hi: 1 });"}' >/dev/null
 expect "function runs" 1 "$(gw POST /functions/v1/hi -H "apikey: $ANON" -H "authorization: Bearer $SERVICE" | jq .hi)"
 
-step "dashboard metrics, backup and restart"
+step "metrics, backup and restart"
 expect "requests were counted" true "$(api -fS "http://127.0.0.1:$API_PORT/v1/projects/$REF/metrics" | jq '.totals.requests > 0')"
-BACKUP=$(api -fS -XPOST "http://127.0.0.1:$API_PORT/v1/projects/$REF/backups" -d '{"note":"smoke"}' | jq -r .status)
-expect "backup completes" complete "$BACKUP"
+BACKUP_JSON=$(api -fS -XPOST "http://127.0.0.1:$API_PORT/v1/projects/$REF/backups" -d '{"note":"smoke"}')
+expect "backup completes" complete "$(jq -r .status <<<"$BACKUP_JSON")"
+BACKUP_ID=$(jq -r .id <<<"$BACKUP_JSON")
+
+step "restore a backup"
+sql "insert into public.todos (owner, title) values (null, 'written after the backup')" >/dev/null
+expect "the later row exists" 1 "$(sql "select count(*) from public.todos where title = 'written after the backup'" | jq -r '.results[0].rows[0][0]')"
+api -fS -XPOST "http://127.0.0.1:$API_PORT/v1/projects/$REF/backups/$BACKUP_ID/restore" -d "{}" >/dev/null
+expect "restore removes what came after the backup" 0 "$(sql "select count(*) from public.todos where title = 'written after the backup'" | jq -r '.results[0].rows[0][0]')"
+expect "restore keeps what was in the backup" 1 "$(sql "select count(*) from public.todos where title = 'from the smoke test'" | jq -r '.results[0].rows[0][0]')"
+expect "the project still serves requests after a restore" 200 "$(gw GET /rest/v1/todos -H "apikey: $ANON" -H "authorization: Bearer $USER_TOKEN" -o /dev/null -w '%{http_code}')"
+
+step "certificate check used by the TLS proxy"
+tls() { curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$API_PORT/v1/tls-check?domain=$1"; }
+expect "a project's host is allowed" 200 "$(tls "$REF.localhost")"
+expect "an unknown project's host is refused" 404 "$(tls "aaaaaaaaaaaaaaaaaaaa.localhost")"
+expect "a foreign domain is refused" 404 "$(tls "$REF.example.org")"
 compose restart baas >/dev/null
 compose up -d --wait --wait-timeout 120 >/dev/null
 expect "data survives a restart" "from the smoke test" "$(gw GET /rest/v1/todos -H "apikey: $ANON" -H "authorization: Bearer $USER_TOKEN" | jq -r '.[0].title')"

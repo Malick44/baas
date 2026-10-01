@@ -129,7 +129,8 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 
 ## Production
 
-- Put a reverse proxy in front with a **wildcard DNS record and certificate** for `*.your-domain` (Caddy, Traefik, nginx), forwarding to the gateway port. Set `BAAS_GATEWAY_DOMAIN`, `BAAS_PUBLIC_SCHEME=https`, `BAAS_PUBLIC_PORT=443`. The proxy must send exactly one `Host` header.
+- **HTTPS with one extra file.** Point two DNS records at the machine (`baas.example.com` and a wildcard `*.example.com`), put `DOMAIN`, `DASHBOARD_HOST` and `ACME_EMAIL` in `.env`, and run `docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d`. A Caddy container then gets certificates automatically. It asks the platform (`/v1/tls-check`) before requesting each one, so certificates are only issued for the dashboard host and for projects that exist, with no wildcard certificate or DNS API token needed. The app's own ports are closed; only 80 and 443 are open. CI checks that the Caddyfile and the Compose overlay are valid, but not a real certificate issue, which needs real DNS. Using another proxy instead: forward `*.your-domain` to the gateway port, set `BAAS_GATEWAY_DOMAIN`, `BAAS_PUBLIC_SCHEME=https`, `BAAS_PUBLIC_PORT=443`, and make sure it sends exactly one `Host` header.
+- **Releases.** Pushing a tag like `v1.0.0` builds the image and publishes it to `ghcr.io/<owner>/baas` as `1.0.0`, `1.0` and `latest` (`.github/workflows/release.yml`). To use it, replace `build: .` in `docker-compose.yml` with `image: ghcr.io/<owner>/baas:1.0.0`.
 - Serve the management API/dashboard on a separate hostname over TLS and firewall it if you can. Never expose Postgres.
 - Back up the **master key**, the Postgres volume, and the storage volume separately: backups made by the platform contain the database only.
 - Run functions on a host that cannot reach your internal network (see limitations).
@@ -151,7 +152,7 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 
 ## Development and tests
 
-CI (`.github/workflows/ci.yml`) runs the typecheck, unit tests and browser tests against a Postgres service, and a second job runs `scripts/smoke.sh`: it builds the images, starts the real Compose stack, creates an organisation and a project, and exercises REST with row-level security, auth, storage, a function, metrics, a backup and a restart. Run it yourself with `scripts/smoke.sh` (needs docker, curl and jq).
+CI (`.github/workflows/ci.yml`) runs the typecheck, unit tests and browser tests against a Postgres service, and a second job runs `scripts/smoke.sh`: it builds the images, starts the real Compose stack, creates an organisation and a project, and exercises REST with row-level security, auth, storage, a function, metrics, a backup that it then restores, the certificate check and a restart. Run it yourself with `scripts/smoke.sh` (needs docker, curl and jq).
 
 ```bash
 npm ci

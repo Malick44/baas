@@ -37,6 +37,8 @@ export type PlatformConfig = {
   publicPort: number | null;
   purgeRetentionMs: number;
   dashboardDir?: string;
+  /** Hostname the dashboard is served on behind a TLS proxy (for certificate checks). */
+  dashboardHost?: string;
   realtimeCheckMs?: number;
   /** Outgoing email for confirmation, password reset and magic links. Leave out to switch those flows off. Give `mailer` to supply your own (tests do). */
   mail?: { smtpUrl?: string; from?: string; mailer?: Mailer };
@@ -96,7 +98,7 @@ export async function createPlatform(cfg: PlatformConfig) {
   const api: FastifyInstance = buildApi(control, cfg.bootstrapToken, {
     admin, usage, backups, functions, ai, pipelines, extensions, auth,
     gateway: { domain: cfg.gatewayDomain, scheme: cfg.publicScheme, port: cfg.publicPort },
-    dashboardDir: cfg.dashboardDir ?? defaultDashboardDir,
+    dashboardDir: cfg.dashboardDir ?? defaultDashboardDir, dashboardHost: cfg.dashboardHost,
   });
 
   let timer: NodeJS.Timeout | undefined;

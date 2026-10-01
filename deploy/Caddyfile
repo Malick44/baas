@@ -1,0 +1,22 @@
+# Automatic HTTPS for the dashboard and for every project's <ref>.<domain>, with no wildcard certificate or DNS API token.
+# Caddy asks the platform "should I get a certificate for this name?" before it contacts Let's Encrypt, so only real projects qualify.
+# Needs: DNS records for DOMAIN and *.DOMAIN pointing at this machine, and ports 80 and 443 open.
+{
+	email {$ACME_EMAIL}
+	on_demand_tls {
+		ask http://baas:8080/v1/tls-check
+	}
+}
+
+# The dashboard and management API.
+{$DASHBOARD_HOST} {
+	reverse_proxy baas:8080
+}
+
+# Projects: https://<ref>.<domain> -> the data plane. WebSockets (Realtime) pass through unchanged.
+*.{$DOMAIN} {
+	tls {
+		on_demand
+	}
+	reverse_proxy baas:8081
+}

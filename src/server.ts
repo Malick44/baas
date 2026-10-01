@@ -25,6 +25,7 @@ const platform = await createPlatform({
     : undefined,
   // Email for confirmation, password reset and magic links is offered only when the operator provides an SMTP server.
   mail: process.env.SMTP_URL ? { smtpUrl: process.env.SMTP_URL, from: process.env.MAIL_FROM } : undefined,
+  dashboardHost: process.env.BAAS_DASHBOARD_HOST || undefined,
   purgeRetentionMs: Number(process.env.BAAS_PURGE_RETENTION_DAYS ?? 7) * 86_400_000,
 });
 if (platform.migrations.length) console.log(`applied migrations: ${platform.migrations.join(", ")}`);

@@ -29,6 +29,23 @@ describe("platform ops", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     await t?.close();
   });
 
+  describe("certificate check for a TLS proxy", () => {
+    const check = (domain: string) => t.api("GET", `/v1/tls-check?domain=${encodeURIComponent(domain)}`);
+    it("says yes only to names that are served: an existing project's host, and the dashboard host", async () => {
+      assert.equal((await check(`${p.ref}.localhost`)).status, 200);
+      assert.equal((await check(`${p.ref.toUpperCase()}.LOCALHOST`)).status, 200, "host names are case-insensitive");
+      for (const bad of [`${"a".repeat(20)}.localhost`, `${p.ref}.evil.com`, `${p.ref}.localhost.evil.com`, `x${p.ref}.localhost`, "localhost", "", `${p.ref.slice(1)}.localhost`, `${p.ref}.localhostx`])
+        assert.equal((await check(bad)).status, 404, bad);
+      assert.equal((await t.api("GET", "/v1/tls-check")).status, 404);
+    });
+    it("stops answering yes once a project is deleted", async () => {
+      const gone = await t.project(owner, "to-delete");
+      assert.equal((await check(`${gone.ref}.localhost`)).status, 200);
+      assert.equal((await t.api("DELETE", `/v1/projects/${gone.ref}`, { token: owner })).status, 200);
+      assert.equal((await check(`${gone.ref}.localhost`)).status, 404);
+    });
+  });
+
   describe("sql and tables", () => {
     it("runs SQL as service_role, including multi-statement scripts", async () => {
       const r = await t.sql(owner, p.ref, "CREATE TABLE public.items (id serial PRIMARY KEY, name text NOT NULL, qty int DEFAULT 0); INSERT INTO public.items (name) VALUES ('a'), ('b'); SELECT id, name FROM public.items ORDER BY id");

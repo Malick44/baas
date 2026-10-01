@@ -26,6 +26,8 @@ export type ApiOps = {
   auth?: AuthService;
   /** Where the data plane listens, so clients can build <ref>.<domain> URLs. */
   gateway?: { domain: string; scheme: string; port: number | null };
+  /** Hostname the dashboard is served on behind a proxy; certificates may be issued for it too. */
+  dashboardHost?: string;
   /** Directory holding the dashboard's static files. */
   dashboardDir?: string;
 };
@@ -133,6 +135,21 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
   app.get("/v1/audit-log", async (req) => control.auditLog(await principal(req)));
 
   app.get("/healthz", async () => ({ ok: true }));
+
+  /**
+   * Lets a TLS proxy (Caddy's on-demand certificates) ask "is this a hostname I should get a certificate for?" before it asks Let's Encrypt.
+   * Answers 200 only for the dashboard host and for <ref>.<domain> of a project that exists, so strangers cannot make the proxy
+   * request certificates for arbitrary names. It reveals only whether a name is served, which the name itself already shows.
+   */
+  app.get("/v1/tls-check", async (req, reply) => {
+    const host = String((req.query as Record<string, string>).domain ?? "").toLowerCase();
+    const g = ops.gateway;
+    if (host && ops.dashboardHost && host === ops.dashboardHost.toLowerCase()) return reply.code(200).send({ ok: true });
+    const m = g ? new RegExp(`^([a-z0-9]{20})\\.${g.domain.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`).exec(host) : null;
+    const project = m ? await control.resolve(m[1]!) : null;
+    if (project && project.status !== "deleted" && project.status !== "purged") return reply.code(200).send({ ok: true });
+    return reply.code(404).send({ ok: false });
+  });
 
   const refParam = (req: FastifyRequest) => (req.params as { ref: string }).ref;
   /** Authenticate and confirm the project belongs to the caller's organisation and is usable. */
