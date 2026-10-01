@@ -5,12 +5,13 @@ import { ProjectAdmin } from "./admin-sql.js";
 import { AiAssistant } from "./ai/assistant.js";
 import { AnthropicLlm, type LlmClient } from "./ai/llm.js";
 import { buildApi } from "./api.js";
-import { AuthService } from "./authsvc.js";
+import { AuthService, type AuthOptions } from "./authsvc.js";
 import { BackupService } from "./backup.js";
 import { ControlPlane } from "./control.js";
 import { ExtensionService } from "./extensions.js";
 import { FunctionService } from "./functions.js";
 import { buildGateway } from "./gateway.js";
+import { mailerFrom, type Mailer } from "./mailer.js";
 import { migrate } from "./migrate.js";
 import { PipelineService, type PipelineOptions } from "./pipelines.js";
 import { planOf } from "./plans.js";
@@ -37,6 +38,9 @@ export type PlatformConfig = {
   purgeRetentionMs: number;
   dashboardDir?: string;
   realtimeCheckMs?: number;
+  /** Outgoing email for confirmation, password reset and magic links. Leave out to switch those flows off. Give `mailer` to supply your own (tests do). */
+  mail?: { smtpUrl?: string; from?: string; mailer?: Mailer };
+  auth?: Pick<AuthOptions, "providerOverrides" | "emailCooldownMs" | "maxEmailsPerHour" | "fetch">;
   /** Webhook pipelines. `tickMs` is how often pending changes are delivered (default 5 s). */
   pipelines?: PipelineOptions & { tickMs?: number };
   /** Server-side cap on any single data-plane query (default 20 s). Users cannot raise it with SET statement_timeout. */
@@ -74,8 +78,11 @@ export async function createPlatform(cfg: PlatformConfig) {
     },
   });
   const usage = new UsageService(control, cfg.pgAdminUrl, storage);
-  const functions = new FunctionService(control, {
-    publicUrl: (ref) => `${cfg.publicScheme}://${ref}.${cfg.gatewayDomain}${cfg.publicPort ? `:${cfg.publicPort}` : ""}`,
+  const publicUrl = (ref: string) => `${cfg.publicScheme}://${ref}.${cfg.gatewayDomain}${cfg.publicPort ? `:${cfg.publicPort}` : ""}`;
+  const functions = new FunctionService(control, { publicUrl });
+  const auth = new AuthService(pm, {
+    adminUrl: cfg.pgAdminUrl, vault, mailer: mailerFrom(cfg.mail), publicUrl, secureCookies: cfg.publicScheme === "https",
+    log: (m) => console.error(`[auth] ${m}`), ...cfg.auth,
   });
   const realtime = new RealtimeHub(pm, cfg.pgAdminUrl, { checkMs: cfg.realtimeCheckMs });
   const backups = new BackupService(control, { dir: cfg.backupDir, pgBinDir: cfg.pgBinDir });
@@ -85,9 +92,9 @@ export async function createPlatform(cfg: PlatformConfig) {
   const llm = cfg.ai?.llm ?? (cfg.ai?.model ? new AnthropicLlm({ model: cfg.ai.model, effort: cfg.ai.effort, serverFallbacks: cfg.ai.serverFallbacks }) : undefined);
   const ai = new AiAssistant(control, pm, llm, { queryTimeoutMs: cfg.ai?.queryTimeoutMs, totalTimeoutMs: cfg.ai?.totalTimeoutMs });
 
-  const gateway: FastifyInstance = buildGateway(pm, { auth: new AuthService(pm), storage, functions, realtime }, { domain: cfg.gatewayDomain, hooks: usage.hooks() });
+  const gateway: FastifyInstance = buildGateway(pm, { auth, storage, functions, realtime }, { domain: cfg.gatewayDomain, hooks: usage.hooks() });
   const api: FastifyInstance = buildApi(control, cfg.bootstrapToken, {
-    admin, usage, backups, functions, ai, pipelines, extensions,
+    admin, usage, backups, functions, ai, pipelines, extensions, auth,
     gateway: { domain: cfg.gatewayDomain, scheme: cfg.publicScheme, port: cfg.publicPort },
     dashboardDir: cfg.dashboardDir ?? defaultDashboardDir,
   });
@@ -123,7 +130,7 @@ export async function createPlatform(cfg: PlatformConfig) {
   }
 
   return {
-    cfg, pool, control, pm, dir, storage, usage, functions, realtime, backups, admin, ai, pipelines, extensions, gateway, api, migrations, housekeep,
+    cfg, pool, control, pm, dir, storage, usage, functions, realtime, backups, admin, ai, pipelines, extensions, auth, gateway, api, migrations, housekeep,
 
     start(intervalMs = 10 * 60_000) {
       usage.start();

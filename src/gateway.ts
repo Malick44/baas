@@ -169,10 +169,9 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
         }),
     });
 
-  authRoute("GET", "/settings", async (ctx) => ({
-    external: { email: true }, disable_signup: ctx.project.settings.disable_signup === true, mailer_autoconfirm: true,
-  }));
-  authRoute("POST", "/signup", (ctx, req) => A.signup(ctx.ref, ctx.project, jsonBody(req)));
+  authRoute("GET", "/settings", async (ctx) => A.publicSettings(ctx.project));
+  const redirectParam = (req: FastifyRequest) => (req.query as Record<string, string>).redirect_to;
+  authRoute("POST", "/signup", (ctx, req) => A.signup(ctx.ref, ctx.project, jsonBody(req), redirectParam(req)));
   authRoute("POST", "/token", (ctx, req) => {
     const grant = (req.query as Record<string, string>).grant_type;
     if (grant === "password") return A.passwordLogin(ctx.ref, ctx.project, jsonBody(req));
@@ -180,14 +179,74 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
     throw new AuthError(400, "unsupported_grant_type", "grant_type must be password or refresh_token");
   });
   authRoute("GET", "/user", (ctx) => A.me(ctx.ref, ctx.who.claims));
-  authRoute("PUT", "/user", (ctx, req) => A.updateMe(ctx.ref, ctx.who.claims, jsonBody(req)));
+  authRoute("PUT", "/user", (ctx, req) => A.updateMe(ctx.ref, ctx.project, ctx.who.claims, jsonBody(req)));
   authRoute("POST", "/logout", async (ctx) => {
     await A.logout(ctx.ref, ctx.who.claims);
   }, { status: 204 });
-  for (const p of ["/recover", "/otp", "/magiclink", "/verify", "/resend"])
-    authRoute("POST", p, async () => {
-      throw new AuthError(501, "not_implemented", "Email delivery is not configured for this platform");
-    });
+  authRoute("POST", "/recover", (ctx, req) => A.recover(ctx.ref, ctx.project, jsonBody(req), redirectParam(req)));
+  authRoute("POST", "/magiclink", (ctx, req) => A.magicLink(ctx.ref, ctx.project, jsonBody(req), redirectParam(req)));
+  authRoute("POST", "/otp", (ctx, req) => A.magicLink(ctx.ref, ctx.project, jsonBody(req), redirectParam(req)));
+  authRoute("POST", "/resend", (ctx, req) => A.resend(ctx.ref, ctx.project, jsonBody(req), redirectParam(req)));
+
+  // Pages the browser lands on from an email or from a provider. They carry no API key, so they resolve the project from the host alone.
+  const fragment = (s: { access_token: string; refresh_token: string; expires_at: number; expires_in: number }, type: string) =>
+    new URLSearchParams({ access_token: s.access_token, expires_at: String(s.expires_at), expires_in: String(s.expires_in), refresh_token: s.refresh_token, token_type: "bearer", type }).toString();
+  const sendHtml = (reply: FastifyReply, status: number, title: string, message: string) =>
+    reply.code(status).header("content-type", "text/html; charset=utf-8").header("x-content-type-options", "nosniff").header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'")
+      .send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><body style="font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:15vh auto;padding:0 1rem"><h1>${title}</h1><p>${message}</p></body>`);
+  const goBack = (to: string, params: Record<string, string>, asFragment: string | null) => {
+    const u = new URL(to);
+    if (asFragment !== null) u.hash = asFragment;
+    else for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+    return u.toString();
+  };
+  const failBack = (err: AuthError & { redirectTo?: string | null }, reply: FastifyReply) => {
+    if (err.redirectTo) {
+      const params = { error: err.errorCode, error_code: err.errorCode, error_description: err.message };
+      const u = new URL(err.redirectTo);
+      for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+      u.hash = new URLSearchParams(params).toString();
+      return reply.code(302).header("location", u.toString()).send("");
+    }
+    return sendHtml(reply, err.status >= 400 ? err.status : 400, "Sign-in failed", err.message.replace(/[<>&"]/g, ""));
+  };
+  app.get("/auth/v1/verify", (req, reply) =>
+    withCtx(req, reply, async (ctx) => {
+      const q = req.query as Record<string, string>;
+      try {
+        const r = await A.verify(ctx.ref, ctx.project, { token: q.token, type: q.type });
+        if (r.redirectTo) return reply.code(302).header("location", goBack(r.redirectTo, {}, fragment(r.session, r.type))).send("");
+        return sendHtml(reply, 200, r.type === "signup" ? "Email confirmed" : "Signed in", r.type === "recovery" ? "You can now choose a new password in the app." : "You can close this tab and return to the app.");
+      } catch (e) {
+        if (e instanceof AuthError) return sendHtml(reply, e.status, "This link did not work", "The link is invalid, has expired or was already used. Ask for a new one.");
+        throw e;
+      }
+    }, { anonymous: true }));
+  app.post("/auth/v1/verify", (req, reply) =>
+    withCtx(req, reply, async (ctx) => {
+      const b = jsonBody(req);
+      const r = await A.verify(ctx.ref, ctx.project, { token: b.token ?? b.token_hash, type: b.type });
+      return reply.send(r.session);
+    }, { anonymous: true }));
+  app.get("/auth/v1/authorize", (req, reply) =>
+    withCtx(req, reply, async (ctx) => {
+      const q = req.query as Record<string, string>;
+      const { url, nonce } = A.authorize(ctx.ref, ctx.project, q.provider, q.redirect_to);
+      return reply.header("set-cookie", `baas_oauth=${nonce}; HttpOnly; SameSite=Lax; Path=/auth/v1; Max-Age=600${A.secureCookies ? "; Secure" : ""}`).code(302).header("location", url).send("");
+    }, { anonymous: true }));
+  app.get("/auth/v1/callback", (req, reply) =>
+    withCtx(req, reply, async (ctx) => {
+      const cookie = /(?:^|;\s*)baas_oauth=([\w-]+)/.exec(String(req.headers.cookie ?? ""))?.[1];
+      try {
+        const r = await A.callback(ctx.ref, ctx.project, req.query as Record<string, string>, cookie);
+        reply.header("set-cookie", `baas_oauth=; HttpOnly; SameSite=Lax; Path=/auth/v1; Max-Age=0${A.secureCookies ? "; Secure" : ""}`);
+        if (!r.redirectTo) return sendHtml(reply, 200, "Signed in", "You can close this tab and return to the app.");
+        return reply.code(302).header("location", goBack(r.redirectTo, {}, fragment(r.session, "oauth"))).send("");
+      } catch (e) {
+        if (e instanceof AuthError) return failBack(e as AuthError & { redirectTo?: string | null }, reply);
+        throw e;
+      }
+    }, { anonymous: true }));
   authRoute("GET", "/admin/users", (ctx, req) => {
     const q = req.query as Record<string, string>;
     return A.adminList(ctx.ref, Math.max(1, Number(q.page) || 1), Math.min(200, Math.max(1, Number(q.per_page) || 50)));

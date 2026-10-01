@@ -23,6 +23,8 @@ const platform = await createPlatform({
   ai: process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN
     ? { model: process.env.BAAS_AI_MODEL ?? "claude-opus-5-5", effort: (process.env.BAAS_AI_EFFORT as "low" | "medium" | "high" | "xhigh" | "max" | undefined) ?? "medium", serverFallbacks: process.env.BAAS_AI_FALLBACKS !== "off" }
     : undefined,
+  // Email for confirmation, password reset and magic links is offered only when the operator provides an SMTP server.
+  mail: process.env.SMTP_URL ? { smtpUrl: process.env.SMTP_URL, from: process.env.MAIL_FROM } : undefined,
   purgeRetentionMs: Number(process.env.BAAS_PURGE_RETENTION_DAYS ?? 7) * 86_400_000,
 });
 if (platform.migrations.length) console.log(`applied migrations: ${platform.migrations.join(", ")}`);

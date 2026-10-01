@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import pg from "pg";
+import { isProvider } from "./oauth.js";
 import { PLANS } from "./plans.js";
 import { checkSyntax } from "./sandbox.js";
 import { dbNameOf, dropProject, newRef, provisionProject, setProjectAccess, type Project } from "./provision.js";
@@ -30,7 +31,19 @@ export type ProjectRow = {
 
 export type ProjectSecrets = { jwtSecret: string; serviceKey: string; anonKey: string; dbPassword: string };
 
+const TEMPLATE_KINDS = ["confirmation", "recovery", "magic_link"];
+const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+
 const SETTINGS_KEYS = {
+  email_confirm: (v: unknown) => typeof v === "boolean",
+  mailer_from_name: (v: unknown) => typeof v === "string" && v.length <= 60 && !/[\r\n<>"]/.test(v),
+  password_min_length: (v: unknown) => Number.isInteger(v) && (v as number) >= 6 && (v as number) <= 64,
+  email_templates: (v: unknown) =>
+    isObj(v) && Object.entries(v).every(([k, x]) => TEMPLATE_KINDS.includes(k) && isObj(x) && Object.entries(x).every(([f, t]) =>
+      (f === "subject" && typeof t === "string" && t.length <= 200 && !/[\r\n]/.test(t)) || (f === "body" && typeof t === "string" && t.length <= 5000))),
+  auth_providers: (v: unknown) =>
+    isObj(v) && Object.entries(v).every(([k, x]) => isProvider(k) && isObj(x) && Object.entries(x).every(([f, t]) =>
+      (f === "enabled" && typeof t === "boolean") || (f === "client_id" && typeof t === "string" && t.length <= 300) || (f === "secret" && typeof t === "string" && t.length <= 2000))),
   site_url: (v: unknown) => typeof v === "string" && /^https?:\/\//.test(v),
   redirect_urls: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string"),
   cors_origins: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string"),
@@ -242,9 +255,21 @@ export class ControlPlane {
     return keys;
   }
 
+  /** Settings as the dashboard sees them: provider secrets are never returned, only whether one is set. */
+  private publicSettings(settings: Record<string, unknown>): Record<string, unknown> {
+    const out = { ...settings };
+    const providers = out.auth_providers;
+    if (isObj(providers))
+      out.auth_providers = Object.fromEntries(Object.entries(providers).map(([k, v]) => {
+        const { secret_enc, ...rest } = (v ?? {}) as Record<string, unknown>;
+        return [k, { ...rest, secret_set: typeof secret_enc === "string" && secret_enc.length > 0 }];
+      }));
+    return out;
+  }
+
   async getSettings(p: Principal, ref: string): Promise<Record<string, unknown>> {
     await this.getProject(p, ref);
-    return (await this.pool.query(`SELECT settings FROM project_settings WHERE ref = $1`, [ref])).rows[0]?.settings ?? {};
+    return this.publicSettings((await this.pool.query(`SELECT settings FROM project_settings WHERE ref = $1`, [ref])).rows[0]?.settings ?? {});
   }
 
   async updateSettings(p: Principal, ref: string, patch: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -255,9 +280,31 @@ export class ControlPlane {
       if (!ok) throw new HttpError(400, `unknown setting: ${k}`);
       if (!ok(v)) throw new HttpError(400, `invalid value for ${k}`);
     }
-    const r = await this.pool.query(`UPDATE project_settings SET settings = settings || $2::jsonb WHERE ref = $1 RETURNING settings`, [ref, JSON.stringify(patch)]);
+    const cur = ((await this.pool.query(`SELECT settings FROM project_settings WHERE ref = $1`, [ref])).rows[0]?.settings ?? {}) as Record<string, unknown>;
+    const next: Record<string, unknown> = { ...patch };
+    if (isObj(patch.email_templates)) {
+      const merged: Record<string, unknown> = { ...(isObj(cur.email_templates) ? cur.email_templates : {}) };
+      for (const [k, v] of Object.entries(patch.email_templates)) merged[k] = { ...(isObj(merged[k]) ? (merged[k] as object) : {}), ...(v as object) };
+      next.email_templates = merged;
+    }
+    if (isObj(patch.auth_providers)) {
+      const merged: Record<string, Record<string, unknown>> = { ...(isObj(cur.auth_providers) ? (cur.auth_providers as Record<string, Record<string, unknown>>) : {}) };
+      for (const [name, v] of Object.entries(patch.auth_providers as Record<string, Record<string, unknown>>)) {
+        const { secret, ...rest } = v;
+        const entry: Record<string, unknown> = { ...(merged[name] ?? {}), ...rest };
+        if (typeof secret === "string") {
+          if (secret) entry.secret_enc = this.vault.seal(secret, `${ref}:oauth:${name}`);
+          else delete entry.secret_enc;
+        }
+        // A provider cannot be switched on without both halves of its credentials.
+        if (entry.enabled === true && (!entry.client_id || !entry.secret_enc)) throw new HttpError(400, `${name} needs a client id and a client secret before it can be enabled`);
+        merged[name] = entry;
+      }
+      next.auth_providers = merged;
+    }
+    const r = await this.pool.query(`UPDATE project_settings SET settings = settings || $2::jsonb WHERE ref = $1 RETURNING settings`, [ref, JSON.stringify(next)]);
     await this.audit(p.tokenId, p.orgId, "project.settings", ref, { keys: Object.keys(patch) });
-    return r.rows[0].settings;
+    return this.publicSettings(r.rows[0].settings);
   }
 
   // ---- functions ----

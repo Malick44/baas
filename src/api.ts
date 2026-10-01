@@ -5,9 +5,12 @@ import type { ProjectAdmin } from "./admin-sql.js";
 import type { AiAssistant } from "./ai/assistant.js";
 import type { BackupService } from "./backup.js";
 import { ControlPlane, HttpError, type Principal, type ProjectRow, type Role } from "./control.js";
+import type { AuthService } from "./authsvc.js";
 import type { ExtensionService } from "./extensions.js";
 import type { FunctionService } from "./functions.js";
 import type { PipelineService } from "./pipelines.js";
+import { DEFAULT_TEMPLATES } from "./mailer.js";
+import { PROVIDERS } from "./oauth.js";
 import { PLANS, planOf } from "./plans.js";
 import type { UsageService } from "./usage.js";
 
@@ -20,6 +23,7 @@ export type ApiOps = {
   ai?: AiAssistant;
   pipelines?: PipelineService;
   extensions?: ExtensionService;
+  auth?: AuthService;
   /** Where the data plane listens, so clients can build <ref>.<domain> URLs. */
   gateway?: { domain: string; scheme: string; port: number | null };
   /** Directory holding the dashboard's static files. */
@@ -103,7 +107,28 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
   app.get<{ Params: { ref: string } }>("/v1/projects/:ref/api-keys", async (req) => control.apiKeys(await principal(req), req.params.ref));
 
   app.get<{ Params: { ref: string } }>("/v1/projects/:ref/settings", async (req) => control.getSettings(await principal(req), req.params.ref));
-  app.patch<{ Params: { ref: string } }>("/v1/projects/:ref/settings", async (req) => control.updateSettings(await principal(req), req.params.ref, body(req)));
+  app.patch<{ Params: { ref: string } }>("/v1/projects/:ref/settings", async (req) => {
+    const b = body(req);
+    if (b.email_confirm === true && ops.auth && !ops.auth.emailConfigured)
+      throw new HttpError(400, "Email delivery is not configured on this server, so confirmation emails cannot be sent. Ask the operator to set SMTP_URL.");
+    return control.updateSettings(await principal(req), req.params.ref, b);
+  });
+
+  /** Everything the dashboard's Authentication settings need in one call. */
+  app.get<{ Params: { ref: string } }>("/v1/projects/:ref/auth-config", async (req) => {
+    const p = await principal(req);
+    const settings = await control.getSettings(p, req.params.ref);
+    const g = ops.gateway;
+    const base = g ? `${g.scheme}://${req.params.ref}.${g.domain}${g.port ? `:${g.port}` : ""}` : null;
+    const given = (settings.auth_providers ?? {}) as Record<string, { enabled?: boolean; client_id?: string; secret_set?: boolean }>;
+    return {
+      email_delivery: ops.auth ? ops.auth.emailConfigured : false,
+      callback_url: base ? `${base}/auth/v1/callback` : null,
+      providers: Object.entries(PROVIDERS).map(([id, v]) => ({ id, label: v.label, enabled: given[id]?.enabled === true, client_id: given[id]?.client_id ?? "", secret_set: given[id]?.secret_set === true })),
+      templates: DEFAULT_TEMPLATES,
+      settings,
+    };
+  });
 
   app.get("/v1/audit-log", async (req) => control.auditLog(await principal(req)));
 

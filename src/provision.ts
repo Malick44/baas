@@ -6,6 +6,33 @@ const REF = /^[a-z0-9]{20}$/;
 export const CONNECTION_LIMIT = 25;
 
 /** Base schema every project starts with: roles' grants, auth, storage and realtime tables. Idempotent. */
+/** One-time email tokens and linked sign-in providers. Also applied lazily to projects created before these existed. */
+export const AUTH_EXTRAS_SQL = `
+CREATE TABLE IF NOT EXISTS auth.one_time_tokens (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users ON DELETE CASCADE,
+  token_type text NOT NULL CHECK (token_type IN ('confirmation', 'recovery', 'magiclink')),
+  token_hash text NOT NULL UNIQUE,
+  redirect_to text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL,
+  used_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS one_time_tokens_user ON auth.one_time_tokens (user_id, token_type);
+CREATE TABLE IF NOT EXISTS auth.identities (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users ON DELETE CASCADE,
+  provider text NOT NULL,
+  provider_id text NOT NULL,
+  identity_data jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  last_sign_in_at timestamptz,
+  UNIQUE (provider, provider_id)
+);
+CREATE INDEX IF NOT EXISTS identities_user ON auth.identities (user_id);
+GRANT ALL ON auth.one_time_tokens, auth.identities TO service_role;
+`;
+
 export const PROJECT_SCHEMA_SQL = `
 CREATE SCHEMA IF NOT EXISTS auth; CREATE SCHEMA IF NOT EXISTS storage;
 CREATE SCHEMA IF NOT EXISTS realtime; CREATE SCHEMA IF NOT EXISTS extensions;
@@ -98,7 +125,7 @@ BEGIN
   PERFORM pg_notify('realtime_changes', cid::text);
   RETURN NULL;
 END $$;
-`;
+${AUTH_EXTRAS_SQL}`;
 
 export type Project = {
   ref: string;
