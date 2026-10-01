@@ -502,7 +502,7 @@ describe("email flows and sign-in with providers", { skip: !ADMIN && "set BAAS_T
       profiles.set("c7", github("107", "app7@example.com"));
       const f = await start("github", "myapp://callback");
       const done = await finish("c7", f);
-      assert.match(done.headers.location as string, /^myapp:\/\/callback#access_token=/);
+      assert.match(String(done.headers.location), /^myapp:\/\/callback#access_token=/, `${done.status} ${done.text}`);
     });
   });
 

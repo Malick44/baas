@@ -103,7 +103,8 @@ describe("edge functions", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     assert.equal(boom.status, 500);
     assert.ok(!boom.text.includes("kaboom")); // internals are not leaked to callers
     await deploy(a, "hog", `export default () => { const a = []; for (;;) a.push(new Array(1e6).fill("x")); };`);
-    assert.equal((await invoke(a, "hog")).status, 500);
+    // Either way the runaway is stopped and contained: an out-of-memory crash is a 500, and on a slow machine the time limit can win first (504).
+    assert.ok([500, 504].includes((await invoke(a, "hog")).status));
     await deploy(a, "notresp", `export default () => "a string";`);
     assert.equal((await invoke(a, "notresp")).status, 500);
   });

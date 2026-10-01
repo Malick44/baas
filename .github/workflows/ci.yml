@@ -13,12 +13,13 @@ jobs:
     services:
       postgres:
         image: postgres:16-bookworm
-        env: { POSTGRES_PASSWORD: postgres }
+        # Trust auth: some tests rewrite the connection URL to log in as a project role, which assumes a URL without a password.
+        env: { POSTGRES_HOST_AUTH_METHOD: trust }
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 20
         ports: ["5432:5432"]
     env:
-      BAAS_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+      BAAS_TEST_PG_URL: postgres://postgres@localhost:5432/postgres
       BAAS_TEST_PG_BIN: /usr/lib/postgresql/16/bin
     steps:
       - uses: actions/checkout@v4
@@ -26,9 +27,9 @@ jobs:
         with: { node-version: 22, cache: npm }
       - name: Give Postgres headroom (every test creates its own databases and roles)
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -c "ALTER SYSTEM SET max_connections = 500" -c "ALTER SYSTEM SET fsync = off"
+          psql -h localhost -U postgres -c "ALTER SYSTEM SET max_connections = 500" -c "ALTER SYSTEM SET fsync = off"
           docker restart "$(docker ps -q --filter ancestor=postgres:16-bookworm)"
-          until PGPASSWORD=postgres pg_isready -h localhost -U postgres; do sleep 1; done
+          until pg_isready -h localhost -U postgres; do sleep 1; done
       - name: pg_dump / pg_restore for the backup tests (same major version as the server)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-16
       - run: npm ci
