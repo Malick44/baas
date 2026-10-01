@@ -80,6 +80,7 @@ describe("email flows and sign-in with providers", { skip: !ADMIN && "set BAAS_T
     strict = await makePlatform(ADMIN!);
     owner = await t.org();
     p = await t.project(owner, "auth");
+    await t.api("PATCH", `/v1/projects/${p.ref}`, { token: owner, body: { plan: "pro" } }); // this suite is about auth, not the free plan's request rate limit
   });
   after(async () => {
     provider?.close();
