@@ -1225,7 +1225,8 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await save(() => page.fill("#set-minpw", "3"));
     await save(() => page.fill("#set-minpw", "3"));
     await page.waitForSelector(".toast.bad[data-msg='invalid value for password_min_length']");
-    assert.match((await page.textContent(".toast.bad[data-msg='invalid value for password_min_length']"))!, /×2/, "the same message counts up");
+    // The second response can arrive a moment after the first on a fast machine, so wait for the count instead of reading it once.
+    await page.waitForFunction(() => /×2/.test(document.querySelector(".toast.bad[data-msg='invalid value for password_min_length']")?.textContent ?? ""), null, { timeout: 5000 });
     assert.equal(await page.locator(".toast.bad[data-msg='invalid value for password_min_length']").count(), 1);
     await page.fill("#set-minpw", "6");
     await save(() => page.fill("#set-expiry", "10"));
