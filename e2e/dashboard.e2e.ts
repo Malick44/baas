@@ -1017,6 +1017,37 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
       assert.notEqual((await page.locator("dialog .kv code").first().textContent())!, shown);
       await page.click("dialog button[type=submit]");
 
+      // Only matching rows: add a condition through the editor.
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=edit]");
+      await page.waitForSelector("#pl-filters .filter-block[data-table=notes]");
+      assert.match((await page.textContent("#pl-filters"))!, /Every row is sent/);
+      await page.click("#pl-filters [data-action=add-cond]");
+      await page.selectOption("#pl-filters .cond-col", "body");
+      await page.selectOption("#pl-filters .cond-op", "eq");
+      await page.click("dialog button[type=submit]");
+      await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+      assert.match((await page.textContent("dialog .notice.bad"))!, /Give a value for the condition on notes\.body/);
+      await page.fill("#pl-filters .cond-val", "match me");
+      await shot("06h-pipeline-filter");
+      await page.click("dialog button[type=submit]");
+      await toast("Pipeline saved");
+      await page.waitForFunction((r) => /notes \(filtered\)/.test(document.querySelector(r)?.textContent ?? ""), row);
+      got.length = 0;
+      await t.sql(owner, ref, "insert into public.notes (body) values ('other'), ('match me'), ('match me too')");
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=run]");
+      for (let i = 0; i < 50 && !got.length; i++) await new Promise((r) => setTimeout(r, 100));
+      assert.deepEqual(got.flatMap((g) => JSON.parse(g.raw).events).map((e: any) => e.record.body), ["match me"], "only the matching row is sent");
+      await page.locator(`${row} button[aria-label='Row actions']`).click();
+      await page.click(".menu [data-action=edit]");
+      await page.waitForSelector("#pl-filters .cond-val");
+      assert.equal(await page.inputValue("#pl-filters .cond-val"), "match me", "the condition is shown again when editing");
+      await page.click("#pl-filters [aria-label='Remove condition']");
+      await page.click("dialog button[type=submit]");
+      await toast("Pipeline saved");
+      await page.waitForFunction((r) => !/filtered/.test(document.querySelector(r)?.textContent ?? ""), row);
+
       // Delete needs the name typed.
       await page.locator(`${row} button[aria-label='Row actions']`).click();
       await page.click(".menu [data-action=delete]");
@@ -1186,6 +1217,34 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await toast("Email settings saved");
     t.platform.dir.forget(ref);
     assert.equal((await t.api("GET", `/v1/projects/${ref}/settings`, { token: owner })).json.email_templates.recovery.subject, "");
+  });
+
+  step("keeps toasts tidy: repeats count up, at most three show, and a click dismisses", async () => {
+    await tab("auth", "sessions");
+    const save = async (fill: () => Promise<void>) => { await fill(); await page.click("#save-settings"); };
+    await save(() => page.fill("#set-minpw", "3"));
+    await save(() => page.fill("#set-minpw", "3"));
+    await page.waitForSelector(".toast.bad[data-msg='invalid value for password_min_length']");
+    assert.match((await page.textContent(".toast.bad[data-msg='invalid value for password_min_length']"))!, /×2/, "the same message counts up");
+    assert.equal(await page.locator(".toast.bad[data-msg='invalid value for password_min_length']").count(), 1);
+    await page.fill("#set-minpw", "6");
+    await save(() => page.fill("#set-expiry", "10"));
+    await toast("invalid value for jwt_expiry");
+    await page.fill("#set-expiry", "900");
+    await tab("auth", "urls");
+    await page.fill("#auth-site-url", "ftp://nope");
+    await page.click("#save-urls");
+    await toast("invalid value for site_url");
+    await tab("auth", "email");
+    await page.fill("#auth-from-name", "a<b");
+    await page.click("#save-email");
+    await toast("invalid value for mailer_from_name");
+    assert.equal(await page.locator(".toast").count(), 3, "never more than three");
+    assert.equal(await page.locator(".toast[data-msg='invalid value for password_min_length']").count(), 0, "the oldest made room");
+    await shot("17-toasts");
+    await page.locator(".toast").first().click();
+    assert.equal(await page.locator(".toast").count(), 2, "a click dismisses one");
+    await page.fill("#auth-from-name", "");
   });
 
   step("lists request logs and activity", async () => {

@@ -355,3 +355,11 @@ a.integ-card:hover { border-color: var(--line-strong); text-decoration: none; }
 #tst-sample { margin-top: 8px; }
 [hidden] { display: none !important; }
 .notice code { overflow-wrap: anywhere; word-break: break-all; }
+
+.toast { cursor: pointer; }
+.toast .n { color: var(--muted); }
+.filter-block { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: grid; gap: 8px; background: var(--bg-subtle); }
+.filter-block p { margin: 0; }
+.cond-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.2fr) 30px; gap: 8px; align-items: center; }
+@media (max-width: 640px) { .cond-row { grid-template-columns: minmax(0, 1fr) 30px; } }
+.form-row input[type=checkbox], .form-row input[type=radio] { width: auto; }

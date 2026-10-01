@@ -162,6 +162,77 @@ describe("pipelines and extensions", { skip: !ADMIN && "set BAAS_TEST_PG_URL" },
     await t.api("DELETE", `${base()}/${c.json.id}`, { token: owner });
   });
 
+  it("sends only the rows that match a filter, always sends deletes, and validates filters against the real columns", async () => {
+    await t.sql(owner, p.ref, "create table public.sales (id serial primary key, status text, total numeric, region text, note text)");
+    assert.equal((await create({ tables: ["sales"], filters: { orders: [{ column: "item", op: "eq", value: "x" }] } })).status, 400, "a filter for an unwatched table");
+    assert.match((await create({ tables: ["sales"], filters: { sales: [{ column: "nope", op: "eq", value: 1 }] } })).json.error, /no column named nope/);
+    assert.match((await create({ tables: ["sales"], filters: { sales: [{ column: "total", op: "gt", value: "abc" }] } })).json.error, /not valid/);
+    for (const bad of [{ sales: [{ column: "status", op: "like", value: "x" }] }, { sales: [{ column: "status", op: "eq" }] }, { sales: [{ column: "status", op: "in", value: [] }] },
+      { sales: [{ column: "status; drop", op: "eq", value: 1 }] }, { sales: "status=paid" }, [], { sales: Array(11).fill({ column: "status", op: "null" }) }, { sales: [{ column: "status", op: "eq", value: { a: 1 } }] }])
+      assert.equal((await create({ tables: ["sales"], filters: bad })).status, 400, JSON.stringify(bad));
+
+    const c = await create({ tables: ["sales"], filters: { sales: [{ column: "status", op: "eq", value: "paid" }, { column: "total", op: "gte", value: 100 }, { column: "region", op: "in", value: ["eu", "us"] }, { column: "note", op: "null" }] } });
+    assert.equal(c.status, 201, c.text);
+    assert.equal(c.json.filters.sales.length, 4);
+    hits = [];
+    await t.sql(owner, p.ref, `insert into public.sales (status, total, region, note) values
+      ('paid', 150, 'eu', null), ('paid', 50, 'eu', null), ('open', 500, 'eu', null), ('paid', 200, 'asia', null), ('paid', 300, 'us', 'has a note'), ('paid', 100, 'us', null)`);
+    await run(c.json.id);
+    const sent = hits.flatMap((h) => h.body.events);
+    assert.deepEqual(sent.map((e: any) => [e.record.status, Number(e.record.total), e.record.region]), [["paid", 150, "eu"], ["paid", 100, "us"]], "only rows meeting every condition");
+
+    // An update is judged on the row as it is now: it starts matching, or stops.
+    hits = [];
+    await t.sql(owner, p.ref, "update public.sales set total = 120 where total = 50; update public.sales set status = 'refunded' where total = 150");
+    await run(c.json.id);
+    assert.deepEqual(hits.flatMap((h) => h.body.events).map((e: any) => `${e.type}:${Number(e.record.total)}`), ["UPDATE:120"], "the row that stopped matching is not sent");
+
+    // Deletes carry no row, so they cannot be checked and are always sent.
+    hits = [];
+    await t.sql(owner, p.ref, "delete from public.sales where status = 'open'");
+    await run(c.json.id);
+    assert.deepEqual(hits.flatMap((h) => h.body.events).map((e: any) => e.type), ["DELETE"]);
+
+    // Filters work without row data too, and can be changed or cleared.
+    const off = await t.api("PATCH", `${base()}/${c.json.id}`, { token: owner, body: { include_rows: false } });
+    assert.equal(off.json.filters.sales.length, 4, "unrelated edits keep the filters");
+    hits = [];
+    await t.sql(owner, p.ref, "insert into public.sales (status, total, region) values ('paid', 999, 'eu'), ('open', 999, 'eu')");
+    await run(c.json.id);
+    const noRows = hits.flatMap((h) => h.body.events);
+    assert.equal(noRows.length, 1);
+    assert.equal(noRows[0].record, null);
+    assert.equal((await t.api("PATCH", `${base()}/${c.json.id}`, { token: owner, body: { filters: { sales: [{ column: "nope", op: "null" }] } } })).status, 400);
+    const cleared = await t.api("PATCH", `${base()}/${c.json.id}`, { token: owner, body: { filters: {}, include_rows: true } });
+    assert.deepEqual(cleared.json.filters, {});
+    hits = [];
+    await t.sql(owner, p.ref, "insert into public.sales (status, total, region) values ('open', 1, 'asia')");
+    await run(c.json.id);
+    assert.equal(hits.flatMap((h) => h.body.events).length, 1, "no filter sends everything again");
+
+    // Narrowing the table list drops filters for tables that are no longer watched.
+    const two = await create({ tables: ["sales", "orders"], filters: { sales: [{ column: "status", op: "null" }] } });
+    const narrowed = await t.api("PATCH", `${base()}/${two.json.id}`, { token: owner, body: { tables: ["orders"] } });
+    assert.deepEqual(narrowed.json.filters, {});
+    for (const id of [c.json.id, two.json.id]) await t.api("DELETE", `${base()}/${id}`, { token: owner });
+    await t.sql(owner, p.ref, "drop table public.sales");
+  });
+
+  it("a filter that stops working makes the pipeline fail instead of dropping rows", async () => {
+    await t.sql(owner, p.ref, "create table public.gadgets (id serial primary key, weight int)");
+    const c = await create({ tables: ["gadgets"], filters: { gadgets: [{ column: "weight", op: "gt", value: 5 }] } });
+    assert.equal(c.status, 201, c.text);
+    await t.sql(owner, p.ref, "insert into public.gadgets (weight) values (10)");
+    await t.sql(owner, p.ref, "alter table public.gadgets alter column weight type boolean using (weight > 0)");
+    hits = [];
+    const r = await run(c.json.id);
+    assert.equal(r.json.status, "failing");
+    assert.match(r.json.last_error, /boolean|cast/);
+    assert.equal(hits.length, 0);
+    await t.api("DELETE", `${base()}/${c.json.id}`, { token: owner });
+    await t.sql(owner, p.ref, "drop table public.gadgets");
+  });
+
   it("sends a test event without touching the cursor, and rotates the secret", async () => {
     const c = await create();
     hits = [];

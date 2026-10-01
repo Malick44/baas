@@ -217,6 +217,64 @@ describe("cli", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     assert.equal((await run("extensions", "bogus")).code, 1);
   });
 
+  it("filters pipelines with --where and shows deliveries live with --follow", async () => {
+    const got: any[] = [];
+    const hook = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (d) => chunks.push(d));
+      req.on("end", () => { got.push(JSON.parse(Buffer.concat(chunks).toString())); res.end("ok"); });
+    });
+    await new Promise<void>((r) => hook.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${(hook.address() as AddressInfo).port}/h`;
+    try {
+      await run("sql", "CREATE TABLE public.items (id serial PRIMARY KEY, status text, qty int, region text)");
+      for (const bad of ["items.status", "status:eq:paid", "items.status:like:x", "items.status:eq", "items.status:null:x", "items.status:in:"])
+        assert.match((await run("pipelines", "create", "bad", "--tables", "items", "--url", url, "--where", bad)).err, /--where|cannot read/, bad);
+      assert.match((await run("pipelines", "create", "bad", "--tables", "items", "--url", url, "--where", "items.nope:eq:1")).err, /no column named nope/);
+      assert.match((await run("pipelines", "create", "bad", "--tables", "items", "--url", url, "--where", "other.status:eq:1")).err, /does not watch/);
+
+      const c = await run("pipelines", "create", "paid-items", "--tables", "items", "--url", url, "--where", "items.status:eq:paid", "--where", "items.qty:gte:5", "--where", "items.region:in:eu|us");
+      assert.equal(c.code, 0, c.err);
+      assert.match((await run("pipelines", "show", "paid-items")).out, /only rows:\s+items: status = paid and qty >= 5 and region in \(eu, us\)/);
+
+      await run("sql", "INSERT INTO public.items (status, qty, region) VALUES ('paid', 9, 'eu'), ('open', 9, 'eu'), ('paid', 1, 'eu'), ('paid', 7, 'asia'), ('paid', 5, 'us')");
+      assert.match((await run("pipelines", "run", "paid-items")).out, /2 delivered/);
+      assert.deepEqual(got.flatMap((b) => b.events).map((e) => [e.record.qty, e.record.region]), [[9, "eu"], [5, "us"]]);
+
+      // Follow: print what is already there, then each new delivery once, until told to stop.
+      const stop = new AbortController();
+      const out: string[] = [];
+      let tick = 0;
+      const follow = runCli(["pipelines", "deliveries", "paid-items", "--follow", "--interval", "1"], {
+        out: (s) => out.push(s), err: (s) => out.push(`ERR ${s}`), cwd, env: { BAAS_CONFIG_DIR: cfg }, signal: stop.signal,
+        sleep: async () => {
+          tick++;
+          if (tick === 1) {
+            await run("sql", "INSERT INTO public.items (status, qty, region) VALUES ('paid', 50, 'us')");
+            await run("pipelines", "run", "paid-items");
+          } else if (tick === 2) await run("pipelines", "test", "paid-items");
+          else stop.abort();
+        },
+      });
+      assert.equal(await follow, 0);
+      assert.match(out[0]!, /Following deliveries for paid-items \(Ctrl-C to stop\)/);
+      const lines = out.slice(1);
+      assert.equal(lines.length, 3, lines.join("\n"));
+      assert.match(lines[0]!, /delivery\s+ok 200\s+2 events/, "the earlier delivery");
+      assert.match(lines[1]!, /delivery\s+ok 200\s+1 event\s/, "the new one, once");
+      assert.match(lines[2]!, /test\s+ok 200\s+0 events/);
+      assert.equal((await run("pipelines", "deliveries", "paid-items", "--follow", "--interval", "0")).code, 1);
+
+      assert.match((await run("pipelines", "edit", "paid-items", "--where", "items.status:null")).out, /Updated/);
+      assert.match((await run("pipelines", "show", "paid-items")).out, /only rows:\s+items: status is null\n/);
+      assert.match((await run("pipelines", "edit", "paid-items", "--no-where")).out, /Updated/);
+      assert.equal((await run("pipelines", "show", "paid-items")).out.includes("only rows"), false);
+      assert.equal((await run("pipelines", "delete", "paid-items")).code, 0);
+    } finally {
+      hook.close();
+    }
+  });
+
   it("asks the AI assistant and shows proposals without running them", async () => {
     assert.match((await run("ai", "status")).out, /off/);
     assert.match((await run("ask", "how", "many", "people?")).err, /not enabled/);

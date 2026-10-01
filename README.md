@@ -189,12 +189,13 @@ In the client: `auth.signUp` (a session, or only the user when confirmation is r
 **Pipelines** send a project's row changes to a webhook (dashboard → Database → Pipelines, or `POST /v1/projects/:ref/pipelines`). Admins only.
 
 - Choose tables and events (insert, update, delete) and a URL. A pipeline starts from *now*; it does not replay existing rows.
+- Optionally send only rows that match conditions (`status` equals `paid`, `total` at least 100, `region` is one of eu, us, `note` is empty). A change is checked against the row as it is at delivery time; a row that is gone or no longer matches is skipped. Deletes carry no row, so they are always sent (switch them off under events). Conditions are structured, not SQL.
 - Delivery is at least once and in order, one batch at a time. Failures are retried with a growing delay (up to 15 minutes) and a pipeline pauses itself after 30 in a row. Undelivered changes are kept for at most 24 hours.
 - Each request carries `X-Baas-Signature: t=<unix seconds>,v1=<hex>`, an HMAC-SHA256 of `"<t>.<body>"` with the signing secret shown once at creation (rotate it any time).
 - Rows are read with the platform's own access at delivery time: row-level security does not apply, and the row is the current one, not a snapshot. Turn off "include the row" to send only primary keys.
 - Destinations on private, loopback or link-local addresses are refused, and the connection is pinned to the address that was checked. Operators can allow them for development with `pipelines.allowPrivateTargets`.
 
-From the command line: `baas pipelines list | show | create <name> --tables a,b --url <url> [--events insert,update,delete] [--no-rows] | edit | pause | resume | run | test | deliveries | rotate-secret | delete`. `<pipeline>` is a name or an id (or its first 8 characters). The signing secret is printed once, by `create` and `rotate-secret`.
+From the command line: `baas pipelines list | show | create <name> --tables a,b --url <url> [--events insert,update,delete] [--no-rows] [--where orders.status:eq:paid]... | edit | pause | resume | run | test | deliveries [--follow] | rotate-secret | delete`. `--where table.column:op:value` can be repeated (ops: eq neq gt gte lt lte in null notnull; `in` takes `a|b|c`); `deliveries --follow` prints new deliveries as they happen until Ctrl-C. `<pipeline>` is a name or an id (or its first 8 characters). The signing secret is printed once, by `create` and `rotate-secret`.
 
 From the command line: `baas extensions list [--installed|--available] [--search <text>]` and `baas extensions install|remove <name...>`.
 

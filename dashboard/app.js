@@ -95,10 +95,23 @@ const pgLit = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const schemaOk = (s) => /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(s);
 
 
+const TOAST_MAX = 3;
+/** A short message in the corner. The same message shown again counts up instead of stacking; at most three show at once; click to dismiss. */
 function toast(msg, kind = "") {
-  const t = h("div", { class: `toast ${kind}`, role: "status" }, msg);
-  document.getElementById("toasts").append(t);
-  setTimeout(() => t.remove(), kind === "bad" ? 7000 : 3500);
+  const box = document.getElementById("toasts");
+  const life = kind === "bad" ? 7000 : 3500;
+  const same = [...box.children].find((x) => x.dataset.msg === msg && x.dataset.kind === kind);
+  if (same) {
+    same._n = (same._n || 1) + 1;
+    same.querySelector(".n").textContent = ` ×${same._n}`;
+    clearTimeout(same._t);
+    same._t = setTimeout(() => same.remove(), life);
+    return;
+  }
+  const t = h("div", { class: `toast ${kind}`, role: "status", title: "Click to dismiss", "data-msg": msg, "data-kind": kind, onclick: () => { clearTimeout(t._t); t.remove(); } }, h("span", null, msg), h("span", { class: "n" }));
+  t._t = setTimeout(() => t.remove(), life);
+  box.append(t);
+  while (box.children.length > TOAST_MAX) { const old = box.firstElementChild; clearTimeout(old._t); old.remove(); }
 }
 
 function dialog(title, build, { confirmLabel = "OK", danger = false, onSubmit, sheet = false } = {}) {
@@ -1884,11 +1897,36 @@ async function pipelinesPage(body, p) {
     const tableBoxes = tabs.map((t) => h("label", { class: "check" }, h("input", { type: "checkbox", "data-table": t, checked: pl ? pl.tables.includes(t) : false }), h("span", { class: "mono" }, t)));
     const eventBoxes = ["INSERT", "UPDATE", "DELETE"].map((e) => h("label", { class: "check" }, h("input", { type: "checkbox", "data-event": e, checked: pl ? pl.events.includes(e) : true }), e.charAt(0) + e.slice(1).toLowerCase() + "s"));
     const rowsBox = h("input", { type: "checkbox", id: "pl-rows", checked: pl ? pl.include_rows : true });
+    const OPS = [["eq", "equals"], ["neq", "does not equal"], ["gt", "is greater than"], ["gte", "is at least"], ["lt", "is less than"], ["lte", "is at most"], ["in", "is one of"], ["null", "is empty"], ["notnull", "is not empty"]];
+    const filters = JSON.parse(JSON.stringify(pl?.filters || {}));
+    const colCache = {};
+    const fbox = h("div", { class: "stack", id: "pl-filters" });
+    const selectedTables = () => tableBoxes.map((l) => l.querySelector("input")).filter((i) => i.checked).map((i) => i.dataset.table);
+    const drawFilters = async () => {
+      const chosen = selectedTables();
+      for (const t of chosen) colCache[t] ??= await columnsOf("public", t);
+      clear(fbox);
+      if (!chosen.length) { fbox.append(h("p", { class: "muted" }, "Choose a table first.")); return; }
+      for (const t of chosen) {
+        const conds = (filters[t] ??= []);
+        fbox.append(h("div", { class: "filter-block", "data-table": t },
+          h("div", { class: "row between" }, h("strong", { class: "mono" }, t), h("button", { type: "button", class: "small", "data-action": "add-cond", onclick: () => { conds.push({ column: colCache[t][0]?.name, op: "eq", value: "" }); drawFilters(); } }, "Add condition")),
+          !conds.length ? h("p", { class: "muted" }, "Every row is sent.") : null,
+          conds.map((c, i) => h("div", { class: "cond-row" },
+            h("select", { class: "cond-col", "aria-label": "Column", onchange: (e) => { c.column = e.target.value; } }, colCache[t].map((x) => h("option", { value: x.name, selected: x.name === c.column }, x.name))),
+            h("select", { class: "cond-op", "aria-label": "Condition", onchange: (e) => { c.op = e.target.value; drawFilters(); } }, OPS.map(([v, l]) => h("option", { value: v, selected: v === c.op }, l))),
+            c.op === "null" || c.op === "notnull" ? h("span") : h("input", { class: "cond-val", "aria-label": "Value", placeholder: c.op === "in" ? "a, b, c" : "value", autocomplete: "off", value: Array.isArray(c.value) ? c.value.join(", ") : (c.value ?? ""), oninput: (e) => { c.value = e.target.value; } }),
+            h("button", { type: "button", class: "iconbtn", "aria-label": "Remove condition", onclick: () => { conds.splice(i, 1); drawFilters(); } }, icon("x", 14))))));
+      }
+    };
+    for (const l of tableBoxes) l.querySelector("input").addEventListener("change", drawFilters);
+    await drawFilters();
     const field = (label, el, hint) => h("div", { class: "form-row" }, h("label", null, label), h("div", null, el, hint ? h("p", { class: "muted hint" }, hint) : null));
     return dialog(pl ? `Edit ${pl.name}` : "New pipeline", () => h("div", { class: "stack" },
       field("Name", name),
       field("Tables", tabs.length ? h("div", { class: "checks", id: "pl-tables" }, tableBoxes) : h("p", { class: "muted" }, "No tables yet. Create one first."), "Changes to these tables are sent. Only new changes: nothing already in the table is replayed."),
       field("Events", h("div", { class: "checks", id: "pl-events" }, eventBoxes)),
+      field("Only rows where", fbox, "Optional. A change is sent only if the row matches every condition as it is when delivered. Deletes carry no row, so they are always sent: turn them off under Events if you do not want that."),
       field("Destination URL", url, "Must be reachable from this server. Addresses on private networks are refused unless the operator allows them."),
       field("Row data", h("label", { class: "check" }, rowsBox, "Include the row in each event"), "Rows are read with full access, ignoring row-level security, and are the row as it is at delivery time. Turn this off to send only the primary key."),
     ), {
@@ -1899,7 +1937,21 @@ async function pipelinesPage(body, p) {
         if (!name.value.trim()) throw new Error("Give the pipeline a name.");
         if (!tablesSel.length) throw new Error("Choose at least one table.");
         if (!eventsSel.length) throw new Error("Choose at least one event.");
-        const payload = { name: name.value.trim(), tables: tablesSel, events: eventsSel, url: url.value.trim(), include_rows: rowsBox.checked };
+        const outFilters = {};
+        for (const t of tablesSel) {
+          const list = (filters[t] || []).map((c) => {
+            if (c.op === "null" || c.op === "notnull") return { column: c.column, op: c.op };
+            if (c.op === "in") {
+              const v = String(Array.isArray(c.value) ? c.value.join(",") : c.value ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+              if (!v.length) throw new Error(`Give ${t}.${c.column} at least one value.`);
+              return { column: c.column, op: "in", value: v };
+            }
+            if (c.value === undefined || c.value === null || String(c.value).trim() === "") throw new Error(`Give a value for the condition on ${t}.${c.column}.`);
+            return { column: c.column, op: c.op, value: String(c.value).trim() };
+          });
+          if (list.length) outFilters[t] = list;
+        }
+        const payload = { name: name.value.trim(), tables: tablesSel, events: eventsSel, url: url.value.trim(), include_rows: rowsBox.checked, filters: outFilters };
         return pl ? { saved: await api("PATCH", `${base}/${pl.id}`, payload) } : { created: await api("POST", base, payload) };
       },
     });
@@ -1945,7 +1997,7 @@ async function pipelinesPage(body, p) {
     slot.append(h("div", { class: "tablewrap" }, h("table", { class: "data", id: "pipeline-table" },
       h("thead", null, h("tr", null, ["Name", "Tables", "Destination", "Status", "Delivered", "Last delivery", ""].map((x) => h("th", null, x)))),
       h("tbody", null, rows.map((pl) => h("tr", { "data-row": pl.name },
-        h("td", null, pl.name), h("td", { class: "mono-cell", title: pl.tables.join(", ") }, pl.tables.join(", ")), h("td", { class: "mono-cell", title: hostOf(pl.url) }, hostOf(pl.url)),
+        h("td", null, pl.name), h("td", { class: "mono-cell", title: pl.tables.join(", ") }, pl.tables.map((t) => (pl.filters?.[t]?.length ? `${t} (filtered)` : t)).join(", ")), h("td", { class: "mono-cell", title: hostOf(pl.url) }, hostOf(pl.url)),
         h("td", null, h("span", { class: `chip ${pl.status}`, "data-status": pl.status, title: pl.disabled_reason || pl.last_error || "" }, PIPELINE_STATUS[pl.status])),
         h("td", { "data-delivered": String(pl.delivered) }, pl.delivered.toLocaleString()), h("td", { title: pl.last_error || "" }, pl.last_success_at ? ago(pl.last_success_at) : (pl.last_attempt_at ? `failed ${ago(pl.last_attempt_at)}` : "never")),
         h("td", { class: "actions-cell" }, h("div", { class: "row" }, menuFor(pl)))))))));

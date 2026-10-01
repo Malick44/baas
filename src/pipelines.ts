@@ -35,10 +35,40 @@ export type PipelineOptions = {
 export type PipelineRow = {
   id: string; ref: string; name: string; tables: string[]; events: string[]; url: string; secret_enc: string; include_rows: boolean; enabled: boolean;
   disabled_reason: string | null; consecutive_failures: number; next_attempt_at: Date | null; last_attempt_at: Date | null; last_success_at: Date | null;
-  last_status: number | null; last_error: string | null; delivered: string; failed: string; created_at: Date;
+  last_status: number | null; last_error: string | null; delivered: string; failed: string; created_at: Date; filters: Filters;
 };
 
 const EVENTS = ["INSERT", "UPDATE", "DELETE"] as const;
+const OPS = ["eq", "neq", "gt", "gte", "lt", "lte", "in", "null", "notnull"] as const;
+type Op = (typeof OPS)[number];
+export type Condition = { column: string; op: Op; value?: unknown };
+export type Filters = Record<string, Condition[]>;
+const MAX_CONDITIONS = 10;
+const MAX_IN = 100;
+const SQL_OP: Record<string, string> = { eq: "=", neq: "<>", gt: ">", gte: ">=", lt: "<", lte: "<=" };
+
+/**
+ * A table's conditions as SQL over `t`, with every value passed as a parameter. Values are typed by Postgres from the
+ * column itself (through jsonb_populate_record), so nothing the caller wrote is ever spliced into the statement.
+ */
+export function conditionSql(table: string, conds: Condition[], firstParam: number): { sql: string; params: string[] } {
+  const tbl = `"public".${ident(table)}`;
+  const parts: string[] = [];
+  const params: string[] = [];
+  for (const c of conds) {
+    const col = ident(c.column, "column name");
+    if (c.op === "null") parts.push(`t.${col} IS NULL`);
+    else if (c.op === "notnull") parts.push(`t.${col} IS NOT NULL`);
+    else if (c.op === "in") {
+      params.push(JSON.stringify((c.value as unknown[]).map((v) => ({ [c.column]: v }))));
+      parts.push(`t.${col} IN (SELECT r.${col} FROM jsonb_populate_recordset(NULL::${tbl}, $${firstParam + params.length - 1}::jsonb) r)`);
+    } else {
+      params.push(JSON.stringify({ [c.column]: c.value }));
+      parts.push(`t.${col} ${SQL_OP[c.op]} (jsonb_populate_record(NULL::${tbl}, $${firstParam + params.length - 1}::jsonb)).${col}`);
+    }
+  }
+  return { sql: parts.join(" AND ") || "true", params };
+}
 const MAX_TABLES = 50;
 const PAYLOAD_LIMIT = 4 * 1024 * 1024;
 const MAX_BIGINT = "9223372036854775807";
@@ -104,7 +134,7 @@ function post(t: Target, body: string, headers: Record<string, string>, timeoutM
 export const sign = (secret: string, t: number, body: string) => `t=${t},v1=${createHmac("sha256", secret).update(`${t}.${body}`).digest("hex")}`;
 
 const view = (r: PipelineRow) => ({
-  id: r.id, name: r.name, tables: r.tables, events: r.events, url: r.url, include_rows: r.include_rows, enabled: r.enabled, disabled_reason: r.disabled_reason,
+  id: r.id, name: r.name, tables: r.tables, events: r.events, filters: r.filters ?? {}, url: r.url, include_rows: r.include_rows, enabled: r.enabled, disabled_reason: r.disabled_reason,
   status: !r.enabled ? "paused" : r.consecutive_failures > 0 ? "failing" : "healthy",
   consecutive_failures: r.consecutive_failures, next_attempt_at: r.next_attempt_at, last_attempt_at: r.last_attempt_at, last_success_at: r.last_success_at,
   last_status: r.last_status, last_error: r.last_error, delivered: Number(r.delivered), failed: Number(r.failed), created_at: r.created_at,
@@ -145,7 +175,30 @@ export class PipelineService {
   }
 
   private parse(b: Record<string, unknown>, partial: boolean) {
-    const out: { name?: string; tables?: string[]; events?: string[]; url?: string; include_rows?: boolean; enabled?: boolean } = {};
+    const out: { name?: string; tables?: string[]; events?: string[]; url?: string; include_rows?: boolean; enabled?: boolean; filters?: Filters } = {};
+    if (b.filters !== undefined) {
+      const f = b.filters;
+      if (f === null || typeof f !== "object" || Array.isArray(f)) throw new HttpError(400, "filters must be an object of table name to a list of conditions");
+      out.filters = {};
+      for (const [table, list] of Object.entries(f)) {
+        ident(table, "table name");
+        if (!Array.isArray(list) || list.length > MAX_CONDITIONS) throw new HttpError(400, `filters for ${table} must be a list of up to ${MAX_CONDITIONS} conditions`);
+        out.filters[table] = list.map((c, i) => {
+          const x = c as Record<string, unknown>;
+          if (x === null || typeof x !== "object" || typeof x.column !== "string") throw new HttpError(400, `filter ${i + 1} on ${table} needs a column`);
+          ident(x.column, "column name");
+          if (!OPS.includes(x.op as Op)) throw new HttpError(400, `filter ${i + 1} on ${table}: op must be one of ${OPS.join(", ")}`);
+          const scalar = (v: unknown) => v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean";
+          if (x.op === "null" || x.op === "notnull") return { column: x.column, op: x.op as Op };
+          if (x.op === "in") {
+            if (!Array.isArray(x.value) || !x.value.length || x.value.length > MAX_IN || !x.value.every(scalar)) throw new HttpError(400, `filter ${i + 1} on ${table}: in needs a list of 1-${MAX_IN} values`);
+            return { column: x.column, op: "in" as Op, value: x.value };
+          }
+          if (!scalar(x.value) || x.value === null) throw new HttpError(400, `filter ${i + 1} on ${table}: ${x.op} needs a value`);
+          return { column: x.column, op: x.op as Op, value: x.value };
+        });
+      }
+    }
     if (!partial || b.name !== undefined) {
       if (typeof b.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,59}$/.test(b.name.trim())) throw new HttpError(400, "name must be 1-60 letters, digits, spaces, dots, dashes or underscores");
       out.name = b.name.trim();
@@ -173,6 +226,24 @@ export class PipelineService {
       out.enabled = b.enabled;
     }
     return out;
+  }
+
+  /** Check each filter against the real columns and types, by running it once with no rows wanted. */
+  private async checkFilters(ref: string, tables: string[], filters: Filters) {
+    for (const t of Object.keys(filters)) if (!tables.includes(t)) throw new HttpError(400, `a filter is set for ${t}, which this pipeline does not watch`);
+    if (!Object.keys(filters).length) return;
+    await this.withAdmin(ref, async (c) => {
+      for (const [table, conds] of Object.entries(filters)) {
+        const cols = new Set((await c.query(`SELECT a.attname FROM pg_attribute a WHERE a.attrelid = format('%I.%I', 'public', $1::text)::regclass AND a.attnum > 0 AND NOT a.attisdropped`, [table])).rows.map((r) => r.attname as string));
+        for (const x of conds) if (!cols.has(x.column)) throw new HttpError(400, `${table} has no column named ${x.column}`);
+        const { sql, params } = conditionSql(table, conds, 1);
+        try {
+          await c.query(`SELECT 1 FROM "public".${ident(table)} t WHERE ${sql} LIMIT 0`, params);
+        } catch (err) {
+          throw new HttpError(400, `filter on ${table} is not valid: ${(err as Error).message}`);
+        }
+      }
+    });
   }
 
   private async prepareProject(ref: string, tables: string[], id?: string, cursorFromNow = false) {
@@ -203,11 +274,15 @@ export class PipelineService {
     if (count >= this.opts.maxPerProject) throw new HttpError(409, `a project can have at most ${this.opts.maxPerProject} pipelines`);
     const id = randomUUID();
     await this.prepareProject(ref, v.tables!, id, true);
+    await this.checkFilters(ref, v.tables!, v.filters ?? {}).catch(async (e) => {
+      await this.withAdmin(ref, (c) => c.query(`DELETE FROM realtime.pipeline_cursors WHERE pipeline_id = $1`, [id])).catch(() => {});
+      throw e;
+    });
     const secret = `whsec_${randomBytes(24).toString("base64url")}`;
     try {
       const r = await this.pool.query<PipelineRow>(
-        `INSERT INTO pipelines (id, ref, name, tables, events, url, secret_enc, include_rows, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-        [id, ref, v.name, v.tables, v.events, v.url, this.vault.seal(secret, `pipeline:${id}`), v.include_rows ?? true, p.tokenId],
+        `INSERT INTO pipelines (id, ref, name, tables, events, url, secret_enc, include_rows, created_by, filters) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb) RETURNING *`,
+        [id, ref, v.name, v.tables, v.events, v.url, this.vault.seal(secret, `pipeline:${id}`), v.include_rows ?? true, p.tokenId, JSON.stringify(v.filters ?? {})],
       );
       await this.control.audit(p.tokenId, p.orgId, "pipeline.create", ref, { name: v.name, tables: v.tables });
       return { ...view(r.rows[0]!), secret };
@@ -224,14 +299,21 @@ export class PipelineService {
     const v = this.parse(b, true);
     if (v.url !== undefined) await resolveTarget(v.url, this.opts.allowPrivateTargets);
     if (v.tables) await this.prepareProject(ref, v.tables);
+    if (v.filters !== undefined || v.tables) {
+      // Filters for a table that is no longer watched are dropped rather than left behind.
+      const tables = v.tables ?? cur.tables;
+      const filters = v.filters ?? Object.fromEntries(Object.entries(cur.filters ?? {}).filter(([t]) => tables.includes(t)));
+      await this.checkFilters(ref, tables, filters);
+      v.filters = filters;
+    }
     const enabling = v.enabled === true && !cur.enabled;
     const r = await this.pool.query<PipelineRow>(
-      `UPDATE pipelines SET name = coalesce($3, name), tables = coalesce($4, tables), events = coalesce($5, events), url = coalesce($6, url), include_rows = coalesce($7, include_rows),
+      `UPDATE pipelines SET name = coalesce($3, name), tables = coalesce($4, tables), events = coalesce($5, events), url = coalesce($6, url), include_rows = coalesce($7, include_rows), filters = coalesce($10::jsonb, filters),
          enabled = coalesce($8, enabled),
          disabled_reason = CASE WHEN $8 IS NOT NULL THEN NULL ELSE disabled_reason END,
          consecutive_failures = CASE WHEN $9 THEN 0 ELSE consecutive_failures END, next_attempt_at = CASE WHEN $9 THEN NULL ELSE next_attempt_at END
        WHERE id::text = $1 AND ref = $2 RETURNING *`,
-      [id, ref, v.name ?? null, v.tables ?? null, v.events ?? null, v.url ?? null, v.include_rows ?? null, v.enabled ?? null, enabling],
+      [id, ref, v.name ?? null, v.tables ?? null, v.events ?? null, v.url ?? null, v.include_rows ?? null, v.enabled ?? null, enabling, v.filters === undefined ? null : JSON.stringify(v.filters)],
     ).catch((err) => {
       if ((err as { code?: string }).code === "23505") throw new HttpError(409, "a pipeline with that name already exists");
       throw err;
@@ -377,18 +459,29 @@ export class PipelineService {
       const events = [];
       for (const ch of chosen) {
         let record: unknown = null;
-        if (row.include_rows && ch.op !== "DELETE" && ch.pk && Object.keys(ch.pk).length) {
-          const keys = Object.keys(ch.pk);
+        const conds = row.filters?.[ch.table_name];
+        const hasKey = ch.pk && Object.keys(ch.pk).length > 0;
+        if (ch.op !== "DELETE" && hasKey && (row.include_rows || conds?.length)) {
+          const keys = Object.keys(ch.pk!);
           const tbl = `"public".${ident(ch.table_name)}`;
+          const f = conds?.length ? conditionSql(ch.table_name, conds, 2) : { sql: "true", params: [] as string[] };
           const r = await c.query(
-            `SELECT to_jsonb(t) AS rec FROM ${tbl} t WHERE ROW(${keys.map((k) => `t.${ident(k)}`).join(", ")}) = (SELECT ${keys.map((k) => `r.${ident(k)}`).join(", ")} FROM jsonb_populate_record(NULL::${tbl}, $1::jsonb) r) LIMIT 1`,
-            [JSON.stringify(ch.pk)],
-          ).catch(() => null);
-          record = r?.rows[0]?.rec ?? null;
+            `SELECT to_jsonb(t) AS rec FROM ${tbl} t WHERE ROW(${keys.map((k) => `t.${ident(k)}`).join(", ")}) = (SELECT ${keys.map((k) => `r.${ident(k)}`).join(", ")} FROM jsonb_populate_record(NULL::${tbl}, $1::jsonb) r) AND ${f.sql} LIMIT 1`,
+            [JSON.stringify(ch.pk), ...f.params],
+          ).catch((e) => {
+            if (conds?.length) throw e; // a filter that stopped working must show up as a failing pipeline, not as silently dropped rows
+            return null;
+          });
+          // A filtered table only sends rows that match right now. A row that is gone or no longer matches is skipped.
+          if (conds?.length && !r?.rows[0]) continue;
+          record = row.include_rows ? (r?.rows[0]?.rec ?? null) : null;
+        } else if (ch.op !== "DELETE" && conds?.length) {
+          continue; // cannot be checked without a key
         }
         events.push({ id: ch.id, at: ch.at, schema: "public", table: ch.table_name, type: ch.op, pk: ch.pk, record });
       }
-      return { events, lastSeen, first: chosen[0]?.id ?? null, last: chosen[chosen.length - 1]?.id ?? null };
+      const first = events[0]?.id ?? null, last = events[events.length - 1]?.id ?? null;
+      return { events, lastSeen, first, last };
     });
   }
 

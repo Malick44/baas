@@ -3,7 +3,12 @@ import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
-export type CliIO = { out: (s: string) => void; err: (s: string) => void; cwd: string; env: Record<string, string | undefined>; fetch?: typeof fetch };
+export type CliIO = {
+  out: (s: string) => void; err: (s: string) => void; cwd: string; env: Record<string, string | undefined>; fetch?: typeof fetch;
+  /** For commands that wait (--follow). Tests replace both; the real CLI wires `signal` to Ctrl-C. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  signal?: AbortSignal;
+};
 
 type Config = { url: string; token: string };
 
@@ -22,9 +27,12 @@ const USAGE = `baas <command>
   functions list | deploy <name> <file> [--no-verify-jwt] | delete <name> | logs <name>
   backups list | create [--note <text>] | restore <id>
   pipelines list | show <pipeline>        send row changes to a webhook (admin role); <pipeline> is a name or id
-  pipelines create <name> --tables <a,b> --url <url> [--events insert,update,delete] [--no-rows]
-  pipelines edit <pipeline> [--name <n>] [--tables <a,b>] [--url <url>] [--events <list>] [--rows|--no-rows]
-  pipelines pause|resume|run|test|deliveries|rotate-secret|delete <pipeline>
+  pipelines create <name> --tables <a,b> --url <url> [--events insert,update,delete] [--no-rows] [--where <table.column:op:value>]...
+  pipelines edit <pipeline> [--name <n>] [--tables <a,b>] [--url <url>] [--events <list>] [--rows|--no-rows] [--where …]... | [--no-where]
+  pipelines deliveries <pipeline> [--follow [--interval <seconds>]]   --follow keeps printing new deliveries until Ctrl-C
+  pipelines pause|resume|run|test|rotate-secret|delete <pipeline>
+                                          --where sends only rows that match, e.g. orders.status:eq:paid, orders.total:gte:100,
+                                          orders.region:in:eu|us, orders.note:null (ops: eq neq gt gte lt lte in null notnull)
   extensions list [--installed|--available] [--search <text>]   Postgres extensions (admin role)
   extensions install|remove <name...>     only extensions Postgres marks as safe for database owners can be installed
   ai status | enable | disable             the plain-language SQL assistant (needs a server-side Anthropic key)
@@ -39,18 +47,20 @@ Project: --ref <ref>, or BAAS_PROJECT, or the link made by "baas link".`;
 function parseArgs(argv: string[]) {
   const pos: string[] = [];
   const flags: Record<string, string | true> = {};
+  const multi: Record<string, string[]> = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a.startsWith("--")) {
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith("--") && !["no-verify-jwt", "no-rows", "rows", "installed", "available"].includes(key)) {
-        flags[key] = next;
+      if (next !== undefined && !next.startsWith("--") && !["no-verify-jwt", "no-rows", "rows", "installed", "available", "no-where", "follow"].includes(key)) {
+        if (key === "where") (multi.where ??= []).push(next);
+        else flags[key] = next;
         i++;
       } else flags[key] = true;
     } else pos.push(a);
   }
-  return { pos, flags };
+  return { pos, flags, multi };
 }
 
 const table = (rows: string[][]) => {
@@ -62,7 +72,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
   const f = io.fetch ?? fetch;
   const configDir = io.env.BAAS_CONFIG_DIR ?? join(io.env.HOME ?? homedir(), ".config", "baas");
   const configFile = join(configDir, "config.json");
-  const { pos, flags } = parseArgs(argv);
+  const { pos, flags, multi } = parseArgs(argv);
   const [cmd, sub, ...rest] = pos;
 
   async function config(): Promise<Config> {
@@ -259,8 +269,26 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         };
         const when = (d: unknown) => (d ? new Date(String(d)).toISOString().replace("T", " ").slice(0, 19) : "never");
         const secretNote = (secret: string) => `Signing secret (shown once, keep it safe):\n  ${secret}\nDeliveries carry X-Baas-Signature: t=<unix time>,v1=<hex HMAC-SHA256 of "<t>.<body>">.`;
+        const whereFilters = () => {
+          const out: Record<string, Array<Record<string, unknown>>> = {};
+          for (const w of multi.where ?? []) {
+            const m = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*):(eq|neq|gt|gte|lt|lte|in|null|notnull)(?::(.*))?$/s.exec(w);
+            if (!m) throw new CliError(`cannot read --where "${w}": use table.column:op:value, for example orders.status:eq:paid`);
+            const [, table, column, op, value] = m as unknown as [string, string, string, string, string | undefined];
+            if (op === "null" || op === "notnull") {
+              if (value !== undefined) throw new CliError(`--where "${w}": ${op} takes no value`);
+              (out[table] ??= []).push({ column, op });
+            } else {
+              if (value === undefined || value === "") throw new CliError(`--where "${w}": ${op} needs a value`);
+              (out[table] ??= []).push({ column, op, value: op === "in" ? value.split("|") : value });
+            }
+          }
+          return out;
+        };
         const fields = () => {
           const body: Record<string, unknown> = {};
+          if (multi.where?.length) body.filters = whereFilters();
+          else if (flags["no-where"] === true) body.filters = {};
           if (typeof flags.name === "string") body.name = flags.name;
           if (flags.tables !== undefined) body.tables = list(flags.tables, "--tables");
           if (flags.events !== undefined) body.events = list(flags.events, "--events", true);
@@ -277,7 +305,8 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         } else if (sub === "show") {
           const x = await one(rest[0]);
           io.out([`name:        ${x.name}`, `id:          ${x.id}`, `status:      ${x.status}${x.disabled_reason ? ` (${x.disabled_reason})` : ""}`, `tables:      ${x.tables.join(", ")}`, `events:      ${x.events.join(", ")}`,
-            `rows:        ${x.include_rows ? "included" : "primary key only"}`, `destination: ${x.url}`, `delivered:   ${x.delivered}, failed ${x.failed}`, `last ok:     ${when(x.last_success_at)}`,
+            `rows:        ${x.include_rows ? "included" : "primary key only"}`,
+            ...Object.entries(x.filters ?? {}).map(([t, cs]) => `only rows:   ${t}: ${(cs as any[]).map((c) => `${c.column} ${{ eq: "=", neq: "!=", gt: ">", gte: ">=", lt: "<", lte: "<=", in: "in", null: "is null", notnull: "is not null" }[c.op as string]}${c.op === "null" || c.op === "notnull" ? "" : ` ${Array.isArray(c.value) ? `(${c.value.join(", ")})` : c.value}`}`).join(" and ")}`), `destination: ${x.url}`, `delivered:   ${x.delivered}, failed ${x.failed}`, `last ok:     ${when(x.last_success_at)}`,
             ...(x.last_error ? [`last error:  ${x.last_error}`] : [])].join("\n"));
         } else if (sub === "create") {
           if (!rest[0] || flags.tables === undefined || typeof flags.url !== "string") throw new CliError("usage: baas pipelines create <name> --tables <a,b> --url <url> [--events insert,update,delete] [--no-rows]");
@@ -286,7 +315,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         } else if (sub === "edit") {
           const x = await one(rest[0]);
           const body = fields();
-          if (!Object.keys(body).length) throw new CliError("nothing to change: pass --name, --tables, --url, --events, --rows or --no-rows");
+          if (!Object.keys(body).length) throw new CliError("nothing to change: pass --name, --tables, --url, --events, --rows, --no-rows, --where or --no-where");
           const r = await api("PATCH", `${base}/${x.id}`, body);
           io.out(`Updated ${r.name}.`);
         } else if (sub === "pause" || sub === "resume") {
@@ -304,7 +333,25 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           io.out(`Test event delivered: ${r.status} in ${r.ms} ms.`);
         } else if (sub === "deliveries") {
           const x = await one(rest[0]);
-          const rows = (await api("GET", `${base}/${x.id}/deliveries`)) as any[];
+          const line = (d: any) => `${when(d.at)}  ${d.kind.padEnd(8)}  ${(d.ok ? `ok ${d.status}` : (d.error ?? "failed").slice(0, 80)).padEnd(14)}  ${String(d.events).padStart(3)} event${d.events === 1 ? " " : "s"}  ${d.ms ?? ""} ms`;
+          const fetchRows = async () => (await api("GET", `${base}/${x.id}/deliveries`)) as any[];
+          if (flags.follow === true) {
+            const secs = flags.interval === undefined ? 2 : Number(flags.interval);
+            if (!Number.isFinite(secs) || secs < 1 || secs > 3600) throw new CliError("--interval must be between 1 and 3600 seconds");
+            const wait = io.sleep ?? ((ms, sig) => new Promise<void>((done) => { const t = setTimeout(done, ms); sig?.addEventListener("abort", () => { clearTimeout(t); done(); }, { once: true }); }));
+            io.out(`Following deliveries for ${x.name} (Ctrl-C to stop)…`);
+            const first = (await fetchRows()).slice(0, 10).reverse();
+            let seen = first.length ? BigInt(first[first.length - 1].id) : -1n;
+            for (const d of first) io.out(line(d));
+            while (!io.signal?.aborted) {
+              await wait(secs * 1000, io.signal);
+              if (io.signal?.aborted) break;
+              const fresh = (await fetchRows()).filter((d) => BigInt(d.id) > seen).reverse();
+              for (const d of fresh) { io.out(line(d)); seen = BigInt(d.id); }
+            }
+            return 0;
+          }
+          const rows = await fetchRows();
           io.out(rows.length ? table([["WHEN", "KIND", "RESULT", "EVENTS", "MS"], ...rows.map((d) => [when(d.at), d.kind, d.ok ? `ok ${d.status}` : (d.error ?? "failed").slice(0, 80), String(d.events), String(d.ms ?? "")])]) : "No deliveries yet.");
         } else if (sub === "rotate-secret") {
           const x = await one(rest[0]);
