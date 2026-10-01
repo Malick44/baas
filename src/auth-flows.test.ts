@@ -330,6 +330,7 @@ describe("email flows and sign-in with providers", { skip: !ADMIN && "set BAAS_T
     const start = async (name = "github", redirect = "https://app.example.com/cb") => {
       const r = await gw("GET", `/auth/v1/authorize?provider=${name}&redirect_to=${encodeURIComponent(redirect)}`);
       const cookie = /baas_oauth=([\w-]+)/.exec(String(r.headers["set-cookie"] ?? ""))?.[1];
+      if (r.status !== 302 && !redirect.startsWith("https://evil")) console.error(`authorize ${name} ${redirect} -> ${r.status} ${r.text}`);
       return { r, cookie, url: r.headers.location ? new URL(r.headers.location as string) : null };
     };
     const finish = async (code: string, flow: Awaited<ReturnType<typeof start>>, o: { cookie?: string | null; state?: string } = {}) =>
