@@ -1606,6 +1606,8 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     const fresh = await browser.newContext();
     const np = await fresh.newPage();
     np.on("pageerror", (e) => problems.push(`secure pageerror: ${e.message}`));
+    // Slow runners expose ordering bugs; E2E_CPU_THROTTLE=6 reproduces them locally.
+    if (process.env.E2E_CPU_THROTTLE) await (await fresh.newCDPSession(np)).send("Emulation.setCPUThrottlingRate", { rate: Number(process.env.E2E_CPU_THROTTLE) });
     await np.goto(`${base}/#/invite/${inv.json.token}`);
     await np.fill("#invite-password", "secure-password-1");
     await np.fill("#invite-confirm", "secure-password-1");
@@ -1634,9 +1636,16 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await np.waitForSelector("#mfa-state");
     await np.click("dialog button:has-text('Cancel')");
 
-    // Signing in now asks for a code.
+    // Signing in now asks for a code. Signing out renders the sign-in page once: a second render could wipe what someone has already typed.
     await np.click("#avatar");
+    await np.evaluate(() => {
+      (window as any).__loginRenders = 0;
+      new MutationObserver((rs) => { for (const r of rs) for (const n of r.addedNodes) if (n instanceof HTMLElement && n.querySelector?.("#member-form")) (window as any).__loginRenders++; }).observe(document.body, { childList: true, subtree: true });
+    });
     await np.click("#signout");
+    await np.waitForSelector("#member-form");
+    await np.waitForTimeout(300);
+    assert.equal(await np.evaluate(() => (window as any).__loginRenders), 1, "the sign-in page was drawn more than once");
     await np.fill("#login-email", "secure@example.com");
     await np.fill("#login-password", "secure-password-1");
     await np.click("#signin-member");

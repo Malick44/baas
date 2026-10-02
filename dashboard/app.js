@@ -195,13 +195,18 @@ async function gw(path, { method = "GET", body, headers = {}, rawBody, key } = {
   return { data, res };
 }
 
+/** Move to a page and render it once: changing the hash already triggers a render, so only render by hand when the hash stays the same. */
+function go(hash) {
+  if (location.hash === hash || (hash === "" && !location.hash)) route();
+  else location.hash = hash;
+}
+
 function logout() {
   if (S.token && S.me?.member) fetch("/v1/auth/logout", { method: "POST", headers: { authorization: `Bearer ${S.token}` } }).catch(() => {});
   localStorage.removeItem("baas.token");
   sessionStorage.removeItem("baas.token");
   S.token = S.me = S.project = S.keys = null;
-  location.hash = "";
-  route();
+  go("");
 }
 
 // ---------- shell: top bar, icon rail, section sidebar ----------
@@ -406,7 +411,7 @@ function renderLogin() {
   const forgot = h("button", { type: "button", class: "linkish", id: "forgot-password", hidden: true, onclick: () => forgotDialog(email.value) }, "Forgot password?");
   fetch("/v1/config").then((r) => r.json()).then((c) => { forgot.hidden = !c.member_email_reset; }).catch(() => {});
   memberForm.insertBefore(forgot, memberErr);
-  const finish = (data) => { startSession(data.token, rememberMember.checked); location.hash = "#/projects"; route(); };
+  const finish = (data) => { startSession(data.token, rememberMember.checked); go("#/projects"); };
   memberForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
@@ -459,8 +464,7 @@ function renderLogin() {
     try {
       S.me = await api("GET", "/v1/me");
       (remember.checked ? localStorage : sessionStorage).setItem("baas.token", S.token);
-      location.hash = "#/projects";
-      route();
+      go("#/projects");
     } catch (ex) {
       S.token = null;
       err.hidden = false;
@@ -492,8 +496,7 @@ function renderInvite(token) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
       startSession(data.token, false);
-      location.hash = "#/projects";
-      route();
+      go("#/projects");
     } catch (ex) {
       err.hidden = false;
       err.textContent = ex.message;
@@ -536,8 +539,7 @@ function renderReset(token) {
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `${res.status} ${res.statusText}`);
       S.token = S.me = null;
       localStorage.removeItem("baas.token"); sessionStorage.removeItem("baas.token");
-      location.hash = "";
-      route();
+      go("");
       toast("Password changed. Sign in with the new one.", "ok");
     } catch (ex) { err.hidden = false; err.textContent = ex.message; }
   });
