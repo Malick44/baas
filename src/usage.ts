@@ -80,26 +80,60 @@ export class UsageService {
     return requests;
   }
 
+  /**
+   * With several nodes the limits are shared exactly through the control database: a project's tokens live in one bucket and a node
+   * takes a short lease from it (about a tenth of a second of traffic) and spends it locally, so a lopsided balancer is not throttled
+   * harder than an even one and the plan's limit holds in total. Daily quota is claimed in blocks that shrink as the cap nears.
+   * If the database cannot be reached the node falls back to its share of the limit, so requests still get answered.
+   */
+  private leases = new Map<string, { tokens: number; until: number }>();
+  private blocks = new Map<string, { left: number; day: number }>();
+
+  private async takeShared(ref: string, plan: ReturnType<typeof planOf>): Promise<void> {
+    const t = this.now();
+    const lease = this.leases.get(ref);
+    if (lease && lease.until > t && lease.tokens >= 1) lease.tokens--;
+    else {
+      const want = Math.max(1, Math.min(plan.burst, Math.ceil(plan.rps / 10)));
+      const n = (await this.control.pool.query<{ n: number }>(`SELECT baas_take_tokens($1, $2, $3, $4) AS n`, [`rps:${ref}`, plan.burst, plan.rps, want])).rows[0]!.n;
+      if (n < 1) { this.leases.delete(ref); throw new HttpError(429, "rate limit exceeded", { "retry-after": "1" }); }
+      this.leases.set(ref, { tokens: n - 1, until: t + 500 });
+      if (this.leases.size > 10_000) this.leases.delete(this.leases.keys().next().value!);
+    }
+    const day = Math.floor(t / 86_400_000);
+    const block = this.blocks.get(ref);
+    if (block && block.day === day && block.left > 0) { block.left--; return; }
+    const n = (await this.control.pool.query<{ n: number }>(`SELECT baas_claim_day($1, 1000, $2, $3) AS n`, [ref, plan.requestsPerDay, Math.max(1, this.nodes())])).rows[0]!.n;
+    if (n < 1) { this.blocks.delete(ref); throw new HttpError(429, "daily request quota exceeded", { "retry-after": "3600" }); }
+    this.blocks.set(ref, { left: n - 1, day });
+    if (this.blocks.size > 10_000) this.blocks.delete(this.blocks.keys().next().value!);
+  }
+
   async admit(ref: string, project: Resolved, req: FastifyRequest): Promise<void> {
     const plan = planOf(project.plan);
-    // Token bucket: `burst` requests at once, refilled at `rps` per second. With several nodes behind a load balancer each
-    // takes its share, so the total stays at the plan's limit when traffic is spread evenly (and is stricter when it is not).
-    const share = Math.max(1, this.nodes());
-    const burst = Math.max(1, plan.burst / share), rps = plan.rps / share;
-    const t = this.now();
-    const b = this.buckets.get(ref) ?? { tokens: burst, at: t };
-    b.tokens = Math.min(burst, b.tokens + ((t - b.at) / 1000) * rps);
-    b.at = t;
-    if (b.tokens < 1) {
-      this.buckets.set(ref, b);
-      throw new HttpError(429, "rate limit exceeded", { "retry-after": "1" });
+    let shared = this.nodes() > 1;
+    if (shared) {
+      try { await this.takeShared(ref, plan); } catch (e) { if (e instanceof HttpError) throw e; shared = false; }
     }
-    b.tokens -= 1;
-    this.buckets.set(ref, b);
-    if (this.buckets.size > 10_000) this.buckets.delete(this.buckets.keys().next().value!);
-
-    const used = (await this.persistedToday(ref)) + (this.counter(ref).requests);
-    if (used >= plan.requestsPerDay) throw new HttpError(429, "daily request quota exceeded", { "retry-after": "3600" });
+    if (!shared) {
+      // One node (or the database unreachable): a token bucket in memory, `burst` requests at once refilled at `rps` a second,
+      // taking this node's share of the limit.
+      const share = Math.max(1, this.nodes());
+      const burst = Math.max(1, plan.burst / share), rps = plan.rps / share;
+      const t = this.now();
+      const b = this.buckets.get(ref) ?? { tokens: burst, at: t };
+      b.tokens = Math.min(burst, b.tokens + ((t - b.at) / 1000) * rps);
+      b.at = t;
+      if (b.tokens < 1) {
+        this.buckets.set(ref, b);
+        throw new HttpError(429, "rate limit exceeded", { "retry-after": "1" });
+      }
+      b.tokens -= 1;
+      this.buckets.set(ref, b);
+      if (this.buckets.size > 10_000) this.buckets.delete(this.buckets.keys().next().value!);
+      const used = (await this.persistedToday(ref).catch(() => 0)) + (this.counter(ref).requests);
+      if (used >= plan.requestsPerDay) throw new HttpError(429, "daily request quota exceeded", { "retry-after": "3600" });
+    }
     if (this.overDb.has(ref) && ["POST", "PUT", "PATCH"].includes(req.method) && /^\/(rest|storage)\//.test(req.url))
       throw new HttpError(402, "database size quota exceeded: delete data or upgrade the plan");
     this.counter(ref).requests++;

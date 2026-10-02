@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -46,6 +46,30 @@ describe("an S3 server", { skip: !ENDPOINT && "set BAAS_TEST_S3_ENDPOINT to a ru
     s3 = new S3(cfg());
     await s3.createBucket();
     await s3.check();
+  });
+
+  it("uploads a large file in parts and reads it back identically, and cleans up when a part fails", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "baas-s3-big-"));
+    try {
+      const big = randomBytes(40 * 1024 * 1024 + 123);
+      const src = join(dir, "big.dump");
+      await writeFile(src, big);
+      const store = new S3Store(cfg());
+      await store.putFile("parts/big.dump", src);
+      const back = join(dir, "back.dump");
+      assert.equal(await store.getToFile("parts/big.dump", back), true);
+      assert.equal(createHash("sha256").update(await readFile(back)).digest("hex"), createHash("sha256").update(big).digest("hex"), "three parts, one identical object");
+      assert.equal(await store.getToFile("parts/none", join(dir, "none")), false);
+      await writeFile(src, Buffer.from("tiny"));
+      await store.putFile("parts/tiny", src);
+      assert.equal((await readFile(await (async () => { await store.getToFile("parts/tiny", back); return back; })())).toString(), "tiny", "a small file takes the single-request path");
+      // A part that is refused aborts the upload instead of leaving it half-finished in the bucket.
+      let parts = 0;
+      const flaky = new S3({ ...cfg(), fetch: ((u: string, i: RequestInit) => (/partNumber=2/.test(String(u)) && ++parts ? Promise.resolve(new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 })) : fetch(u, i))) as typeof fetch });
+      await writeFile(src, big);
+      await assert.rejects(flaky.putFile("parts/flaky.dump", src), S3Error);
+      assert.equal(await s3.exists("parts/flaky.dump"), false, "nothing was created");
+    } finally { await rm(dir, { recursive: true, force: true }); }
   });
 
   it("stores, reads back, checks, copies and deletes", async () => {
@@ -150,10 +174,10 @@ describe("moving from disk to S3", { skip: (!ENDPOINT || !ADMIN) && "needs BAAS_
       const op = { "x-bootstrap-token": "bootstrap-token-for-tests-1234567890" };
       const first = await switched.api.inject({ method: "POST", url: "/v1/admin/storage/migrate", headers: { ...op, "content-type": "application/json" }, payload: "{}" });
       assert.equal(first.statusCode, 200, first.body);
-      assert.deepEqual(JSON.parse(first.body), { projects: 1, objects: 3, copied: 3, alreadyThere: 0, missingAtSource: 0, failed: 0 });
+      assert.deepEqual(JSON.parse(first.body), { projects: 1, objects: 3, copied: 3, alreadyThere: 0, missingAtSource: 0, failed: 0, backups: { copied: 0, alreadyThere: 0, missing: 0, failed: 0 } });
       for (const n of ["one.txt", "two.txt", "three.txt"]) assert.equal((await read(n)).body, `body of ${n}`);
       const again = JSON.parse((await switched.api.inject({ method: "POST", url: "/v1/admin/storage/migrate", headers: { ...op, "content-type": "application/json" }, payload: "{}" })).body);
-      assert.deepEqual(again, { projects: 1, objects: 3, copied: 0, alreadyThere: 3, missingAtSource: 0, failed: 0 }, "running it again changes nothing");
+      assert.deepEqual(again, { projects: 1, objects: 3, copied: 0, alreadyThere: 3, missingAtSource: 0, failed: 0, backups: { copied: 0, alreadyThere: 0, missing: 0, failed: 0 } }, "running it again changes nothing");
       assert.equal((await switched.api.inject({ method: "POST", url: "/v1/admin/storage/migrate", headers: { "content-type": "application/json" }, payload: "{}" })).statusCode, 401);
       // New uploads go to the bucket, not to disk.
       const fresh = await switched.gateway.inject({ method: "POST", url: "/storage/v1/object/b/new.txt", headers: { host: `${p.ref}.localhost`, apikey: p.service, authorization: `Bearer ${p.service}`, "content-type": "text/plain" }, payload: "new" });

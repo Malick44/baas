@@ -319,7 +319,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           } else throw new CliError("usage: baas admin clusters list | add <id> --url <url> | update <id> … | remove <id>");
         } else if (sub === "storage" && rest[0] === "migrate") {
           const r = await operatorApi("POST", "/v1/admin/storage/migrate", {});
-          io.out(`Checked ${r.objects} object(s) in ${r.projects} project(s): copied ${r.copied}, already there ${r.alreadyThere}, missing at the source ${r.missingAtSource}, failed ${r.failed}.`);
+          io.out(`Checked ${r.objects} object(s) in ${r.projects} project(s): copied ${r.copied}, already there ${r.alreadyThere}, missing at the source ${r.missingAtSource}, failed ${r.failed}.${r.backups ? ` Backups: copied ${r.backups.copied}, already there ${r.backups.alreadyThere}, missing ${r.backups.missing}, failed ${r.backups.failed}.` : ""}`);
         } else if (sub === "nodes") {
           const rows = await operatorApi("GET", "/v1/admin/nodes");
           io.out(table([["NODE", "HOST", "ROLE", "SINCE"], ...rows.map((n: any) => [String(n.id).slice(0, 8), n.host, n.leader ? "leader" : "follower", String(n.started_at)])]));

@@ -12,10 +12,10 @@ import { ExtensionService } from "./extensions.js";
 import { FunctionService } from "./functions.js";
 import { buildGateway } from "./gateway.js";
 import { mailerFrom, type Mailer } from "./mailer.js";
-import { DiskStore, S3Store } from "./blobs.js";
+import { DiskStore, PgStore, PrefixStore, S3Store } from "./blobs.js";
 import { ClusterMover } from "./clusters.js";
 import type { S3Config } from "./s3.js";
-import { migrateStorage } from "./storage-migrate.js";
+import { migrateBackups, migrateStorage } from "./storage-migrate.js";
 import { Coordinator } from "./coordinator.js";
 import { PgLimits } from "./limits.js";
 import { PitrService, type PitrOptions } from "./pitr.js";
@@ -36,6 +36,8 @@ export type PlatformConfig = {
   masterKey: string;
   bootstrapToken: string;
   storageDir: string;
+  /** "postgres" keeps object bytes (and backups) in the control database instead of storageDir: no shared filesystem, no S3 account. Ignored when s3 is set. */
+  storageBackend?: "disk" | "postgres";
   /** Keep object bytes in an S3 bucket instead of storageDir. Nodes then need no shared filesystem. */
   s3?: S3Config & { /** Create the bucket at start-up if it does not exist (for a bundled S3 server). */ createBucket?: boolean };
   backupDir: string;
@@ -92,7 +94,8 @@ export async function createPlatform(cfg: PlatformConfig) {
   const dir = new Directory(control);
   const pm = new PoolManager(dir, cfg.pgAdminUrl, { maxPools: 100, perPool: 5, queryTimeoutMs: cfg.queryTimeoutMs });
 
-  const blobs = cfg.s3 ? new S3Store(cfg.s3) : new DiskStore(cfg.storageDir);
+  // Where object bytes go: S3 if configured, else Postgres if asked for, else the local disk. The first two are shared by every node.
+  const blobs = cfg.s3 ? new S3Store(cfg.s3) : cfg.storageBackend === "postgres" ? new PgStore(pool) : new DiskStore(cfg.storageDir);
   // A wrong bucket or key is found now, not at the first upload.
   if (blobs instanceof S3Store) {
     let last: unknown;
@@ -130,7 +133,9 @@ export async function createPlatform(cfg: PlatformConfig) {
     log: (m) => console.error(`[auth] ${m}`), ...cfg.auth,
   });
   const realtime = new RealtimeHub(pm, { checkMs: cfg.realtimeCheckMs });
-  const backups = new BackupService(control, { dir: cfg.backupDir, pgBinDir: cfg.pgBinDir });
+  // Backups follow the files: in a shared store any node can restore a backup any other node took (the backup directory is then scratch only).
+  const backupBlobs = blobs.kind === "disk" ? undefined : new PrefixStore(blobs, "backups/");
+  const backups = new BackupService(control, { dir: cfg.backupDir, pgBinDir: cfg.pgBinDir, blobs: backupBlobs });
   const mover = new ClusterMover(control.clusters, pool, vault, backups, cfg.backupDir, (action, ref, orgId, meta) => control.audit("operator", orgId, action, ref, meta), (ref) => dir.forget(ref));
   const pitr = cfg.pitr ? new PitrService(control, backups, { pgBinDir: cfg.pgBinDir, ...cfg.pitr }) : undefined;
   const admin = new ProjectAdmin(pm);
@@ -145,7 +150,7 @@ export async function createPlatform(cfg: PlatformConfig) {
   });
   const api: FastifyInstance = buildApi(control, cfg.bootstrapToken, {
     admin, usage, backups, pitr, mover, coordinator, limits, functions,
-    storageMigrate: cfg.s3 ? () => migrateStorage(control, new DiskStore(cfg.storageDir), blobs, (r, i) => storage.key(r, i)) : undefined, ai, pipelines, extensions, auth, vault, mailer,
+    storageMigrate: backupBlobs ? async () => ({ ...(await migrateStorage(control, new DiskStore(cfg.storageDir), blobs, (r, i) => storage.key(r, i))), backups: await migrateBackups(control, cfg.backupDir, backupBlobs) }) : undefined, ai, pipelines, extensions, auth, vault, mailer,
     dashboardUrl: cfg.dashboardUrl ?? (cfg.dashboardHost ? `https://${cfg.dashboardHost}` : cfg.dashboardOrigins?.[0]),
     gateway: { domain: cfg.gatewayDomain, scheme: cfg.publicScheme, port: cfg.publicPort },
     dashboardDir: cfg.dashboardDir ?? defaultDashboardDir, dashboardHost: cfg.dashboardHost,

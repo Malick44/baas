@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
@@ -289,7 +289,7 @@ describe("platform ops", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
       assert.equal(r.status, 201);
       assert.equal(r.json.status, "complete");
       assert.ok(Number(r.json.size_bytes) > 0);
-      const file = (await t.platform.pool.query(`SELECT path FROM backups WHERE id = $1`, [r.json.id])).rows[0].path;
+      const file = join(t.root, "backups", (await t.platform.pool.query(`SELECT path FROM backups WHERE id = $1`, [r.json.id])).rows[0].path);
       assert.equal(createHash("sha256").update(await readFile(file)).digest("hex"), r.json.sha256);
       const list = (await t.api("GET", `/v1/projects/${b.ref}/backups`, { token: dev })).json;
       assert.equal(list[0].note, "before change");
@@ -325,7 +325,7 @@ describe("platform ops", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
 
     it("refuses a tampered backup and leaves the project untouched", async () => {
       const made = await t.api("POST", `/v1/projects/${b.ref}/backups`, { token: owner, body: {} });
-      const file = (await t.platform.pool.query(`SELECT path FROM backups WHERE id = $1`, [made.json.id])).rows[0].path;
+      const file = join(t.root, "backups", (await t.platform.pool.query(`SELECT path FROM backups WHERE id = $1`, [made.json.id])).rows[0].path);
       const bytes = await readFile(file);
       bytes[bytes.length - 20] = bytes[bytes.length - 20]! ^ 0xff;
       await writeFile(file, bytes);
@@ -336,10 +336,10 @@ describe("platform ops", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     });
 
     it("rolls back cleanly when the restore itself fails", async () => {
-      const junk = join(t.root, "junk.dump");
-      await writeFile(junk, "this is not a pg_dump archive");
       const sha = createHash("sha256").update("this is not a pg_dump archive").digest("hex");
-      const id = (await t.platform.pool.query(`INSERT INTO backups (ref, kind, status, path, sha256) VALUES ($1, 'manual', 'complete', $2, $3) RETURNING id`, [b.ref, junk, sha])).rows[0].id;
+      const id = (await t.platform.pool.query(`INSERT INTO backups (ref, kind, status, path, sha256) VALUES ($1, 'manual', 'complete', 'x', $2) RETURNING id`, [b.ref, sha])).rows[0].id;
+      await mkdir(join(t.root, "backups", b.ref), { recursive: true });
+      await writeFile(join(t.root, "backups", b.ref, `${id}.dump`), "this is not a pg_dump archive");
       const before = (await t.gw(b.ref, "GET", "/rest/v1/docs?order=id", { key: b.anon })).json;
       const r = await t.api("POST", `/v1/projects/${b.ref}/backups/${id}/restore`, { token: owner });
       assert.equal(r.status, 500);

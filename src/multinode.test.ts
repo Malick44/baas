@@ -132,21 +132,51 @@ describe("several baas processes on one control database", { skip: !ADMIN && "se
     assert.ok(B.lastHousekeep, "and does the housekeeping");
   });
 
-  it("splits the rate limit between the nodes that are alive", async () => {
-    // A fixed clock makes the count exact: the free plan allows 40 requests at once, then 20 a second.
-    const p = await project("rate-split", "free");
-    const resolved = (await A.dir.get(p.ref))!;
+  it("holds the plan's rate limit across nodes exactly, however the balancer spreads requests", async () => {
+    // The free plan allows 40 requests at once, then 20 a second. The bucket lives in the database, so what one node
+    // spends the other cannot: the total is the plan's limit whether traffic is even or all on one node.
     const request = { method: "GET", url: "/rest/v1/" } as never;
-    const allowed = async (nodes: number) => {
-      const usage = new UsageService(A.control, ADMIN!, undefined, () => 1_000_000, () => nodes);
+    const burst = async (name: string, nodes: number, route: (i: number) => number, count = 70) => {
+      const p = await project(name, "free");
+      const resolved = (await A.dir.get(p.ref))!;
+      const svcs = Array.from({ length: Math.max(1, nodes) }, () => new UsageService(A.control, ADMIN!, undefined, Date.now, () => nodes));
       let ok = 0;
-      for (let i = 0; i < 70; i++) { try { await usage.admit(p.ref, resolved, request); ok++; } catch (e) { assert.equal((e as { status: number }).status, 429); } }
+      for (let i = 0; i < count; i++) { try { await svcs[route(i)]!.admit(p.ref, resolved, request); ok++; } catch (e) { assert.equal((e as { status: number }).status, 429); } }
+      await Promise.all(svcs.map((s) => s.stop()));
       return ok;
     };
-    assert.equal(await allowed(1), 40, "one node allows the plan's whole burst");
-    assert.equal(await allowed(2), 20, "two nodes allow half each");
-    assert.equal(await allowed(3), 13, "three allow a third each");
-    assert.equal(await allowed(0), 40, "never divides by nothing");
+    const near = (n: number) => assert.ok(n >= 40 && n <= 46, `expected the burst of 40 (plus a little refill), got ${n}`);
+    near(await burst("rate-one", 1, () => 0));
+    near(await burst("rate-even", 2, (i) => i % 2));
+    near(await burst("rate-lopsided", 2, () => 0)); // one node takes everything: not throttled to half
+    near(await burst("rate-three", 3, (i) => i % 3));
+    near(await burst("rate-skewed", 2, (i) => (i % 10 === 0 ? 1 : 0)));
+
+    // Daily quota: handed out in blocks that shrink as the cap nears, so the total is the cap, never over.
+    const q = await project("quota-shared", "free");
+    const claim = async (want: number, cap: number, nodes: number) => Number((await A.control.pool.query(`SELECT baas_claim_day($1, $2, $3, $4) AS n`, [q.ref, want, cap, nodes])).rows[0].n);
+    let total = 0, calls = 0;
+    for (;;) { const n = await claim(1000, 2500, 2); if (n === 0) break; total += n; calls++; assert.ok(calls < 3000); }
+    assert.equal(total, 2500, "exactly the cap");
+    assert.ok(calls < 100, `in far fewer round trips than requests (${calls})`);
+    assert.equal(await claim(1000, 2500, 2), 0, "and nothing more today");
+    assert.equal(await claim(1000, 2501, 2), 1, "a raised cap opens up exactly the difference");
+    await A.control.pool.query(`UPDATE rate_limits SET window_end = now() - interval '1 second' WHERE key = $1`, [`day:${q.ref}`]);
+    assert.ok((await claim(1000, 2500, 2)) > 0, "a new day starts again");
+    await A.control.pool.query(`DELETE FROM rate_limits WHERE key = $1`, [`day:${q.ref}`]);
+    await A.control.pool.query(`INSERT INTO usage_daily (ref, day, requests) VALUES ($1, (now() AT TIME ZONE 'utc')::date, 2400) ON CONFLICT (ref, day) DO UPDATE SET requests = 2400`, [q.ref]);
+    let rest = 0;
+    for (;;) { const n = await claim(1000, 2500, 2); if (n === 0) break; rest += n; }
+    assert.equal(rest, 100, "it starts from what metering already counted today");
+
+    // Not reachable: the node answers from its own share of the limit.
+    const p = await project("rate-fallback", "free");
+    const resolved = (await A.dir.get(p.ref))!;
+    const dead = new UsageService({ pool: { query: async () => { throw new Error("down"); } } } as never, ADMIN!, undefined, () => 1_000_000, () => 2);
+    let ok = 0;
+    for (let i = 0; i < 70; i++) { try { await dead.admit(p.ref, resolved, request); ok++; } catch (e) { assert.equal((e as { status: number }).status, 429); } }
+    assert.equal(ok, 20, "its half of the burst");
+    await dead.stop();
 
     // And the coordinator feeds it the live count: two nodes beating means two.
     await A.coordinator.start();

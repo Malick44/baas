@@ -66,6 +66,7 @@ export class PgLimits implements Limits {
 
   /** Forget windows that ended. Housekeeping. */
   async prune(): Promise<number> {
+    await this.pool.query(`DELETE FROM shared_buckets WHERE at < now() - interval '1 day'`);
     return (await this.pool.query(`DELETE FROM rate_limits WHERE window_end < now() - interval '1 minute'`)).rowCount ?? 0;
   }
 }

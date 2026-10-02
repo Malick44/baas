@@ -24,6 +24,7 @@ const platform = await createPlatform({
     prefix: process.env.S3_PREFIX || undefined,
     createBucket: process.env.S3_CREATE_BUCKET === "true",
   } : undefined,
+  storageBackend: process.env.BAAS_STORAGE_BACKEND === "postgres" ? "postgres" : undefined,
   backupDir: resolve(process.env.BAAS_BACKUP_DIR ?? "./data/backups"),
   pgBinDir: process.env.BAAS_PG_BIN_DIR,
   pitr: process.env.BAAS_PITR_ARCHIVE_DIR ? {

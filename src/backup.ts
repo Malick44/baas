@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs";
 import { mkdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import pg from "pg";
+import { DiskStore, type BlobStore } from "./blobs.js";
 import { ControlPlane, HttpError, type Principal } from "./control.js";
 import { planOf } from "./plans.js";
 import { dbNameOf, setProjectAccess, urlFor } from "./provision.js";
@@ -12,6 +13,8 @@ export type BackupOptions = {
   dir: string;
   /** Directory containing pg_dump and pg_restore; defaults to PATH. */
   pgBinDir?: string;
+  /** Where finished dumps are kept. Defaults to files under `dir`; a shared store (S3, Postgres) lets any node restore a backup any node took. `dir` is then only scratch space. */
+  blobs?: BlobStore;
 };
 
 export type BackupRow = { id: string; ref: string; kind: string; status: string; size_bytes: string | null; sha256: string | null; note: string | null; error: string | null; created_at: Date };
@@ -23,8 +26,11 @@ export type BackupRow = { id: string; ref: string; kind: string; status: string;
  */
 export class BackupService {
   private busy = new Set<string>();
+  private blobs: BlobStore;
 
-  constructor(private control: ControlPlane, private opts: BackupOptions) {}
+  constructor(private control: ControlPlane, private opts: BackupOptions) {
+    this.blobs = opts.blobs ?? new DiskStore(opts.dir);
+  }
 
   private bin(name: string) {
     return this.opts.pgBinDir ? join(this.opts.pgBinDir, name) : name;
@@ -47,8 +53,13 @@ export class BackupService {
     return this.run(cmd, args, adminUrl);
   }
 
-  private file(ref: string, id: string) {
-    return join(this.opts.dir, ref, `${id}.dump`);
+  private key(ref: string, id: string) {
+    return `${ref}/${id}.dump`;
+  }
+
+  /** A scratch file for one dump or restore. */
+  private scratch(id: string) {
+    return join(this.opts.dir, "tmp", `${id}.dump`);
   }
 
   async create(p: Principal | null, ref: string, kind: "manual" | "scheduled", note?: string): Promise<BackupRow> {
@@ -59,20 +70,22 @@ export class BackupService {
     if (this.busy.has(ref)) throw new HttpError(409, "a backup or restore is already running for this project");
     this.busy.add(ref);
     const id = randomUUID();
-    const path = this.file(ref, id);
+    const path = this.scratch(id);
     const pool = this.control.pool;
-    await pool.query(`INSERT INTO backups (id, ref, kind, status, path, note) VALUES ($1, $2, $3, 'running', $4, $5)`, [id, ref, kind, path, note ?? null]);
+    await pool.query(`INSERT INTO backups (id, ref, kind, status, path, note) VALUES ($1, $2, $3, 'running', $4, $5)`, [id, ref, kind, this.key(ref, id), note ?? null]);
     try {
-      await mkdir(join(this.opts.dir, ref), { recursive: true, mode: 0o700 });
+      await mkdir(join(this.opts.dir, "tmp"), { recursive: true, mode: 0o700 });
       await this.run("pg_dump", ["-Fc", "-f", path, "-d", dbNameOf(ref)], await this.control.adminUrlFor(ref));
       const size = (await stat(path)).size;
       const hash = createHash("sha256");
       for await (const chunk of createReadStream(path)) hash.update(chunk);
+      await this.blobs.putFile(this.key(ref, id), path);
       const row = (await pool.query<BackupRow>(`UPDATE backups SET status = 'complete', size_bytes = $2, sha256 = $3 WHERE id = $1 RETURNING id, ref, kind, status, size_bytes, sha256, note, error, created_at`, [id, size, hash.digest("hex")])).rows[0]!;
       await this.prune(ref);
       return row;
     } catch (err) {
       await rm(path, { force: true });
+      await this.blobs.delete(this.key(ref, id)).catch(() => {});
       await pool.query(`UPDATE backups SET status = 'failed', error = $2, path = NULL WHERE id = $1`, [id, (err as Error).message.slice(0, 500)]);
       throw new HttpError(500, "backup failed");
     } finally {
@@ -94,7 +107,7 @@ export class BackupService {
   }
 
   private async remove(ref: string, id: string) {
-    await rm(this.file(ref, id), { force: true });
+    await this.blobs.delete(this.key(ref, id));
     await this.control.pool.query(`DELETE FROM backups WHERE id = $1 AND ref = $2`, [id, ref]);
   }
 
@@ -117,16 +130,20 @@ export class BackupService {
     const project = await this.control.getProject(p, ref);
     if (project.status !== "active") throw new HttpError(409, `cannot restore a project that is ${project.status}`);
     if (!/^[0-9a-f-]{36}$/.test(id)) throw new HttpError(404, "backup not found");
-    const b = (await this.control.pool.query<{ path: string; sha256: string }>(`SELECT path, sha256 FROM backups WHERE id = $1 AND ref = $2 AND status = 'complete'`, [id, ref])).rows[0];
+    const b = (await this.control.pool.query<{ sha256: string }>(`SELECT sha256 FROM backups WHERE id = $1 AND ref = $2 AND status = 'complete'`, [id, ref])).rows[0];
     if (!b) throw new HttpError(404, "backup not found");
-    const hash = createHash("sha256");
+    const file = this.scratch(`restore-${id}`);
     try {
-      for await (const chunk of createReadStream(b.path)) hash.update(chunk);
-    } catch {
-      throw new HttpError(500, "backup file is missing");
+      await mkdir(join(this.opts.dir, "tmp"), { recursive: true, mode: 0o700 });
+      const found = await this.blobs.getToFile(this.key(ref, id), file).catch(() => false);
+      if (!found) throw new HttpError(500, "backup file is missing");
+      const hash = createHash("sha256");
+      for await (const chunk of createReadStream(file)) hash.update(chunk);
+      if (hash.digest("hex") !== b.sha256) throw new HttpError(500, "backup file failed its integrity check");
+      await this.swapIn(ref, file, p, "backup.restore", { id });
+    } finally {
+      await rm(file, { force: true });
     }
-    if (hash.digest("hex") !== b.sha256) throw new HttpError(500, "backup file failed its integrity check");
-    await this.swapIn(ref, b.path, p, "backup.restore", { id });
   }
 
   /**
@@ -173,7 +190,7 @@ export class BackupService {
 
   /** Delete all backups of a purged project. */
   async purgeProject(ref: string) {
-    await rm(join(this.opts.dir, ref), { recursive: true, force: true });
+    await this.blobs.deletePrefix(ref);
     await this.control.pool.query(`DELETE FROM backups WHERE ref = $1`, [ref]);
   }
 

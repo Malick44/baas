@@ -3,6 +3,7 @@
  * Works with AWS S3 and S3-compatible servers (MinIO, Ceph, Cloudflare R2, Backblaze B2, SeaweedFS...).
  */
 import { createHash, createHmac } from "node:crypto";
+import { open, readFile, stat } from "node:fs/promises";
 import { Readable } from "node:stream";
 
 export type S3Config = {
@@ -122,6 +123,36 @@ export class S3 {
 
   async put(key: string, data: Buffer, contentType?: string): Promise<void> {
     await this.call("PUT", key, { body: data, headers: contentType ? { "content-type": contentType } : {} });
+  }
+
+  /** Upload a file of any size: one request when it is small, else a multipart upload in 16 MiB parts (aborted if anything fails). */
+  async putFile(key: string, path: string): Promise<void> {
+    const size = (await stat(path)).size;
+    const PART = 16 * 1024 * 1024;
+    if (size <= PART) return this.put(key, await readFile(path));
+    const init = await (await this.call("POST", key, { query: { uploads: "" } })).text();
+    const uploadId = unxml(/<UploadId>([^<]*)<\/UploadId>/.exec(init)?.[1] ?? "");
+    if (!uploadId) throw new S3Error(0, "BadResponse", "the S3 server did not start a multipart upload");
+    const etags: string[] = [];
+    const fh = await open(path, "r");
+    try {
+      for (let n = 1, pos = 0; pos < size; n++, pos += PART) {
+        const buf = Buffer.alloc(Math.min(PART, size - pos));
+        await fh.read(buf, 0, buf.length, pos);
+        const res = await this.call("PUT", key, { query: { partNumber: String(n), uploadId }, body: buf });
+        const etag = res.headers.get("etag");
+        if (!etag) throw new S3Error(0, "BadResponse", "the S3 server returned no ETag for a part");
+        etags.push(etag);
+      }
+      const xml = `<CompleteMultipartUpload>${etags.map((e, i) => `<Part><PartNumber>${i + 1}</PartNumber><ETag>${e.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</ETag></Part>`).join("")}</CompleteMultipartUpload>`;
+      const done = await (await this.call("POST", key, { query: { uploadId }, body: Buffer.from(xml) })).text();
+      if (/<Error>/.test(done)) throw new S3Error(0, /<Code>([^<]*)<\/Code>/.exec(done)?.[1] ?? "Error", "the S3 server could not complete the multipart upload");
+    } catch (e) {
+      await this.call("DELETE", key, { query: { uploadId }, ok: [404] }).catch(() => {});
+      throw e;
+    } finally {
+      await fh.close();
+    }
   }
 
   /** The object as a stream, or null when it does not exist. */

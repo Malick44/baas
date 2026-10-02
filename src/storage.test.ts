@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { signJwt } from "./keys.js";
-import { type BlobStore, DiskStore, S3Store } from "./blobs.js";
+import pg from "pg";
+import { type BlobStore, DiskStore, PgStore, S3Store } from "./blobs.js";
+import { migrate } from "./migrate.js";
 import { StorageService, parseMultipart, validObjectName } from "./storage.js";
 import { makeHarness, type Harness, type TestProject } from "./testkit.js";
 
@@ -38,6 +40,16 @@ const S3_ENDPOINT = process.env.BAAS_TEST_S3_ENDPOINT;
 if (process.env.CI && !S3_ENDPOINT) throw new Error("set BAAS_TEST_S3_ENDPOINT so the storage tests run against a real S3 server in CI");
 const backends: Array<{ name: string; make: (root: string) => Promise<BlobStore> }> = [
   { name: "disk", make: async (root) => new DiskStore(root) },
+  ...(ADMIN ? [{ name: "postgres", make: async () => {
+    // A control database of its own, with the blob tables the platform's migrations create.
+    const name = `baas_blobs_${Math.random().toString(36).slice(2, 10)}`;
+    const admin = new pg.Pool({ connectionString: ADMIN });
+    await admin.query(`CREATE DATABASE "${name}"`);
+    await admin.end();
+    const pool = new pg.Pool({ connectionString: ADMIN.replace(/\/[^/]*$/, `/${name}`) });
+    await migrate(pool);
+    return new PgStore(pool);
+  } }] : []),
   ...(S3_ENDPOINT ? [{ name: "s3", make: async () => {
     const store = new S3Store({ endpoint: S3_ENDPOINT, bucket: "baas-test", accessKeyId: process.env.BAAS_TEST_S3_KEY ?? "accessKey1", secretAccessKey: process.env.BAAS_TEST_S3_SECRET ?? "verySecretKey1", prefix: `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}/` });
     await store.s3.createBucket();

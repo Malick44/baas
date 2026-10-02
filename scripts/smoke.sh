@@ -39,7 +39,7 @@ EXTRA_FILE=()
 [ -n "${SMOKE_EXTRA_COMPOSE:-}" ] && EXTRA_FILE=(-f "$SMOKE_EXTRA_COMPOSE")   # for environments that need extra build settings (a proxy CA)
 [ "${SMOKE_PITR:-}" = 1 ] && PITR_FILE=(-f docker-compose.pitr.yml)
 if [ "${SMOKE_S3:-}" = 1 ] && [ "${SMOKE_NODES:-}" = 2 ]; then
-  # The second node gets its own, empty storage volume: if files were still kept locally the other node could not serve them.
+  # The nodes overlay gives baas2 its own volumes; it only needs the same S3 settings as baas.
   cat >> "$OVERRIDE" <<YML
   baas2:
     depends_on:
@@ -51,11 +51,6 @@ if [ "${SMOKE_S3:-}" = 1 ] && [ "${SMOKE_NODES:-}" = 2 ]; then
       S3_ACCESS_KEY_ID: \${S3_ACCESS_KEY_ID}
       S3_SECRET_ACCESS_KEY: \${S3_SECRET_ACCESS_KEY}
       S3_CREATE_BUCKET: "true"
-    volumes: !override
-      - backups:/data/backups
-      - nodelocal:/data/storage
-volumes:
-  nodelocal:
 YML
 fi
 compose() { docker compose --env-file "$ENVF" -f docker-compose.yml "${PITR_FILE[@]}" "${NODES_FILE[@]}" "${S3_FILE[@]}" -f "$OVERRIDE" "${EXTRA_FILE[@]}" "$@"; }
@@ -114,8 +109,9 @@ step "storage"
 gw POST /storage/v1/bucket -H "apikey: $SERVICE" -H "authorization: Bearer $SERVICE" -H 'content-type: application/json' -d '{"id":"files","name":"files","public":true}' -o /dev/null -f
 echo "hello storage" | gw POST /storage/v1/object/files/hello.txt -H "apikey: $SERVICE" -H "authorization: Bearer $SERVICE" -H 'content-type: text/plain' --data-binary @- -o /dev/null -f
 expect "public file downloads" "hello storage" "$(gw GET /storage/v1/object/public/files/hello.txt)"
-if [ "${SMOKE_S3:-}" = 1 ]; then
-  for i in 1 2 3 4; do expect "file $i is served from the bucket" "hello storage" "$(gw GET /storage/v1/object/public/files/hello.txt)"; done
+if [ "${SMOKE_S3:-}" = 1 ] || [ "${SMOKE_NODES:-}" = 2 ]; then
+  # Whichever node answers, the file is served although no node holds it on disk: it is in the S3 bucket or in Postgres.
+  for i in 1 2 3 4; do expect "file $i is served from the shared store" "hello storage" "$(gw GET /storage/v1/object/public/files/hello.txt)"; done
   for svc in baas $([ "${SMOKE_NODES:-}" = 2 ] && echo baas2); do
     expect "no object files on $svc's disk" 0 "$(compose exec -T "$svc" sh -c 'find /data/storage -type f | wc -l' | tr -d '[:space:]')"
   done
