@@ -14,7 +14,7 @@ Self-hosted, multi-project Supabase-style platform. All six phases of the origin
 |---|---|---|
 | Reuse PostgREST, GoTrue, Realtime, Storage-api, edge-runtime | Wrote TypeScript, multi-tenant implementations of the API subsets that matter | The open-source services are single-tenant; running one set per project costs ~1 GB idle each, and per-request tenant routing was the plan's main risk. One process resolving the project per request avoids both. The cost is that these are subsets (see README limitations), not full re-implementations |
 | Next.js dashboard | Dependency-free SPA served by the API (`dashboard/`) | No build step, strict CSP (no inline script/style), easy to test in a browser |
-| MinIO for storage | Files on a volume, keyed by object id | Simpler; an S3 backend can sit behind `StorageService` later. Object names never touch the filesystem |
+| MinIO for storage | Files on a volume, keyed by object id | Built after the plan: files go to a volume or to any S3-compatible store (`src/blobs.ts`, `src/s3.ts`, `docker-compose.s3.yml`), keyed by object id. Object names never touch the filesystem |
 | Deno edge functions | Node child process under the permission model, plus an in-process egress guard | No Deno dependency. Node 22 cannot turn the network off, so `fetch` is replaced by one that refuses private addresses and the socket-opening modules and `process.kill` are removed: defence in depth, not isolation |
 | WAL-based Realtime | Trigger → `realtime.changes` + `NOTIFY`, one `LISTEN` per project | Payload-size safe; lets each event be re-checked under the subscriber's role |
 | GoTrue email and OAuth deferred | Built after the plan: email confirmation, password reset and magic links over SMTP, and sign-in with Google, GitHub, GitLab, Discord and Microsoft (`src/mailer.ts`, `src/oauth.ts`, `src/authsvc.ts`) | Shared by every project: the operator supplies one SMTP server; each project owns its templates, redirect allow-list and provider credentials (sealed with the vault) |
@@ -22,7 +22,7 @@ Self-hosted, multi-project Supabase-style platform. All six phases of the origin
 | — | **Ask AI** (added after the plan): LLM tool loop with a database-enforced read-only reader role and human-approved proposals | Requested feature; see README for the safety model |
 | Supavisor pooling | One small `pg.Pool` per project, LRU-evicted | Enough for one node |
 | Multi-node | Built after the plan | Several clusters (`src/clusters.ts`) and several processes (`src/coordinator.ts`, `src/limits.ts`, `docker-compose.nodes.yml`) |
-| PITR | Built after the plan | Base backups plus archived WAL, replayed in a scratch server, one project extracted (`src/pitr.ts`, `docker-compose.pitr.yml`) |
+| PITR | Built after the plan | Base backups plus archived WAL, replayed in a scratch server, one project extracted, on any cluster that archives (`src/pitr.ts`, `docker-compose.pitr.yml`) |
 
 ## Architecture
 
@@ -69,6 +69,6 @@ A signed-in user could set their own `app_metadata`, which policies may trust (n
 ## Open work
 
 - **CI.** Nothing runs the 250 unit tests or the browser suite automatically, and `docker compose up` has not been exercised end to end by a test. A workflow plus a compose smoke test (start, create an org and project, make a request) is the next step.
-- **Auth gaps.** Single sign-on for dashboard members; passkeys as a primary (passwordless) sign-in rather than only a second factor; attestation statements are not verified.
+- **Auth gaps.** Single sign-on for dashboard members; attestation statements are not verified (passkeys are accepted for sign-in on proof of holding the key).
 - **Dashboard gaps.** Roles and Publications are read-only; the Schema Visualizer shows relationships but does not edit them; editors are plain textareas without syntax highlighting.
-- **Platform.** A function runner that is a real network boundary (the in-process egress guard is defence in depth); shared object storage (S3) so nodes need no shared filesystem; point-in-time recovery for projects on added clusters; moving a project without downtime. Member accounts: SSO.
+- **Platform.** A function runner that is a real network boundary (the in-process egress guard is defence in depth); moving a project without downtime. Member accounts: SSO.

@@ -184,10 +184,14 @@ describe("several Postgres clusters", { skip: (!ADMIN || !HAVE_SERVER_BINARIES) 
     assert.equal((await g("POST", "/auth/v1/token?grant_type=password", { body: { email: "trav@example.com", password: "password-123" } })).status, 200, "and so does the password");
     assert.equal((await g("POST", "/rest/v1/notes", { key: user.access_token, body: { body: "after" } })).status, 201);
     assert.equal((await on(c2.url.replace(/\/postgres$/, `/proj_${p.ref}`), `select count(*)::int as n from public.notes`))[0].n, 4, "new writes land on the new cluster");
+    // What the project's own role created is still its own: the dashboard's SQL editor (service_role) can keep working on it.
+    assert.equal((await on(c2.url.replace(/\/postgres$/, `/proj_${p.ref}`), `select tableowner from pg_tables where tablename = 'notes'`))[0].tableowner, "service_role", "ownership moved with the table");
+    const edit = await t.sql(owner, p.ref, "insert into public.notes (body) values ('from the editor'); alter table public.notes add column extra int");
+    assert.equal(edit.status, 200, edit.text);
 
     assert.equal((await move(p.ref, "main")).status, 200, "and back again");
     assert.equal(await where(p.ref), "main");
-    assert.equal((await g("GET", "/rest/v1/notes?select=body&order=id")).json.length, 4);
+    assert.equal((await g("GET", "/rest/v1/notes?select=body&order=id")).json.length, 5);
     assert.equal(await hasDb(c2.url, p.ref), false);
   });
 

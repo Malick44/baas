@@ -27,7 +27,7 @@ const USAGE = `baas <command>
   db status [--dir baas/migrations]
   functions list | deploy <name> <file> [--no-verify-jwt] | delete <name> | logs <name>
   backups list | create [--note <text>] | restore <id>
-  admin clusters list | add <id> --url <postgres-admin-url> [--name <n>] [--max-projects <n>] | update <id> [--drain|--activate] [--max-projects <n>|--unlimited] [--url <u>] | remove <id>
+  admin clusters list | add <id> --url <postgres-admin-url> [--name <n>] [--max-projects <n>] [--archive-dir <path>] | update <id> [--drain|--activate] [--max-projects <n>|--unlimited] [--url <u>] [--archive-dir <path>|--no-archive] | remove <id>
   admin storage migrate                   copy files from the old storage directory into the S3 bucket (safe to repeat)
   admin nodes                             the running baas nodes and which one leads
   admin move <ref> <cluster>              copy a project to another Postgres cluster (operator secret: BAAS_BOOTSTRAP_TOKEN)
@@ -295,10 +295,10 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           const [action, id] = rest;
           if (action === "list" || action === undefined) {
             const rows = await operatorApi("GET", "/v1/admin/clusters");
-            io.out(table([["ID", "NAME", "HOST", "STATUS", "PROJECTS", "LIMIT"], ...rows.map((c: any) => [c.id, c.name, c.host, c.status, String(c.projects), String(c.max_projects ?? "none")])]));
+            io.out(table([["ID", "NAME", "HOST", "STATUS", "PROJECTS", "LIMIT", "WAL ARCHIVE"], ...rows.map((c: any) => [c.id, c.name, c.host, c.status, String(c.projects), String(c.max_projects ?? "none"), c.id === "main" ? "(server setting)" : c.archive_dir ?? "-"])]));
           } else if (action === "add" && id) {
-            if (typeof flags.url !== "string") throw new CliError("usage: baas admin clusters add <id> --url <postgres://superuser@host:5432/postgres> [--name <n>] [--max-projects <n>]");
-            const c = await operatorApi("POST", "/v1/admin/clusters", { id, admin_url: flags.url, name: typeof flags.name === "string" ? flags.name : undefined, max_projects: typeof flags["max-projects"] === "string" ? Number(flags["max-projects"]) : undefined });
+            if (typeof flags.url !== "string") throw new CliError("usage: baas admin clusters add <id> --url <postgres://superuser@host:5432/postgres> [--name <n>] [--max-projects <n>] [--archive-dir <path>]");
+            const c = await operatorApi("POST", "/v1/admin/clusters", { id, admin_url: flags.url, name: typeof flags.name === "string" ? flags.name : undefined, max_projects: typeof flags["max-projects"] === "string" ? Number(flags["max-projects"]) : undefined, archive_dir: typeof flags["archive-dir"] === "string" ? flags["archive-dir"] : undefined });
             io.out(`Added cluster ${c.id} (${c.host}).`);
           } else if (action === "update" && id) {
             const patch: Record<string, unknown> = {};
@@ -308,7 +308,9 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
             if (flags.unlimited === true) patch.max_projects = null;
             if (typeof flags.url === "string") patch.admin_url = flags.url;
             if (typeof flags.name === "string") patch.name = flags.name;
-            if (!Object.keys(patch).length) throw new CliError("nothing to change: pass --drain, --activate, --max-projects <n>, --unlimited, --url or --name");
+            if (typeof flags["archive-dir"] === "string") patch.archive_dir = flags["archive-dir"];
+            if (flags["no-archive"] === true) patch.archive_dir = null;
+            if (!Object.keys(patch).length) throw new CliError("nothing to change: pass --drain, --activate, --max-projects <n>, --unlimited, --url, --name, --archive-dir <path> or --no-archive");
             const c = await operatorApi("PATCH", `/v1/admin/clusters/${id}`, patch);
             io.out(`Cluster ${c.id}: ${c.status}, ${c.projects} project(s), limit ${c.max_projects ?? "none"}.`);
           } else if (action === "remove" && id) {

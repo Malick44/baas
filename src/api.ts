@@ -144,6 +144,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
   app.delete<{ Params: { id: string } }>("/v1/admin/clusters/:id", async (req, reply) => {
     operator(req);
     await control.clusters.remove(req.params.id);
+    await ops.pitr?.forgetCluster(req.params.id);
     await control.audit("operator", null, "cluster.remove", req.params.id);
     return reply.code(204).send();
   });
@@ -413,7 +414,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     app.get<{ Params: { ref: string } }>("/v1/projects/:ref/pitr", async (req) => {
       const p = await principal(req);
       const project = await control.getProject(p, refParam(req));
-      return { ...(await pitr.status()), plan_allows: planOf(project.plan).pitr };
+      return { ...(await pitr.status(project.cluster_id)), plan_allows: planOf(project.plan).pitr };
     });
     app.post<{ Params: { ref: string } }>("/v1/projects/:ref/pitr/restore", async (req) => {
       const to = body(req).to;
@@ -424,8 +425,12 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
       const p = await principal(req);
       await control.getProject(p, refParam(req));
       ControlPlane.require(p, "owner");
-      return reply.code(201).send(await pitr.takeBaseBackup());
+      // A base backup is of a whole cluster: the one this project lives on.
+      return reply.code(201).send(await pitr.takeBaseBackup((await control.getProject(p, refParam(req))).cluster_id));
     });
+    // Operator: the same for a cluster directly, including the ones with no project of yours on them.
+    app.get<{ Params: { id: string } }>("/v1/admin/clusters/:id/pitr", async (req) => { operator(req); return pitr.status(req.params.id); });
+    app.post<{ Params: { id: string } }>("/v1/admin/clusters/:id/pitr/base-backup", async (req, reply) => { operator(req); return reply.code(201).send(await pitr.takeBaseBackup(req.params.id)); });
   } else {
     app.get<{ Params: { ref: string } }>("/v1/projects/:ref/pitr", async (req) => {
       await control.getProject(await principal(req), refParam(req));

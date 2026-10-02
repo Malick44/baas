@@ -1,11 +1,14 @@
 /**
  * Point-in-time recovery for a project's database.
  *
- * All projects share one Postgres cluster, and WAL archiving is cluster-wide, so history cannot be rewound for one
+ * Projects share a Postgres cluster, and WAL archiving is cluster-wide, so history cannot be rewound for one
  * project in place. Instead: keep periodic base backups of the cluster plus the archived WAL; to recover, start a throwaway
  * server from the newest base backup before the target, let it replay the WAL up to the target moment, dump that one
  * project's database from it, and swap the dump in with the same machinery as a backup restore. Nothing else on the
  * cluster is touched, and a logical backup of the current state is taken first so the restore can itself be undone.
+ *
+ * Every cluster has its own archive and base backups: the main cluster's archive is `archiveDir`, an added cluster's is the
+ * `archive_dir` registered with it. A project is recovered on the cluster it lives on now.
  *
  * Not covered: files in Storage, and anything outside the project's database.
  *
@@ -18,6 +21,7 @@ import { createServer } from "node:net";
 import { join } from "node:path";
 import pg from "pg";
 import type { BackupService } from "./backup.js";
+import { MAIN } from "./clusters.js";
 import { ControlPlane, HttpError, type Principal } from "./control.js";
 import { planOf } from "./plans.js";
 import { dbNameOf } from "./provision.js";
@@ -40,6 +44,9 @@ export type PitrOptions = {
   /** Run the scratch server as this user (PostgreSQL refuses to run as root). Defaults to the "postgres" user when baas runs as root. */
   runAs?: { uid: number; gid: number };
 };
+
+/** One cluster as recovery sees it. `archiveDir` is null for an added cluster whose operator has not said where its WAL goes. */
+type Target = { id: string; adminUrl: string; archiveDir: string | null; baseDir: string };
 
 export type BaseBackup = { id: string; status: string; started_at: Date; finished_at: Date | null; size_bytes: string | null; error: string | null };
 
@@ -72,7 +79,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const q = (v: string) => `'${v.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
 
 export class PitrService {
-  private busy = false;
+  /** Clusters with a base backup or recovery running: one at a time on each. */
+  private busy = new Set<string>();
+  private binMajor: number | null = null;
   private opts: Required<Omit<PitrOptions, "runAs" | "pgBinDir">> & Pick<PitrOptions, "runAs" | "pgBinDir">;
 
   constructor(private control: ControlPlane, private backups: BackupService, opts: PitrOptions) {
@@ -84,8 +93,23 @@ export class PitrService {
     return this.opts.pgBinDir ? join(this.opts.pgBinDir, n) : n;
   }
 
-  private connEnv() {
-    const u = new URL(this.control.adminUrl);
+  private async target(id: string): Promise<Target> {
+    const adminUrl = await this.control.clusters.adminUrl(id);
+    if (id === MAIN) return { id, adminUrl, archiveDir: this.opts.archiveDir, baseDir: this.opts.baseDir };
+    const r = (await this.control.pool.query<{ archive_dir: string | null }>(`SELECT archive_dir FROM clusters WHERE id = $1`, [id])).rows[0];
+    if (!r) throw new HttpError(404, "cluster not found");
+    return { id, adminUrl, archiveDir: r.archive_dir, baseDir: join(this.opts.baseDir, id) };
+  }
+
+  /** Recovery runs this host's server binaries against the cluster's backups, so they have to be the same major version. */
+  private async checkVersions(t: Target) {
+    this.binMajor ??= Number(/PostgreSQL\) (\d+)/.exec((await run(this.bin("postgres"), ["--version"])).out)?.[1]);
+    const server = await this.admin(t, async (c) => Math.floor(Number((await c.query<{ v: string }>(`SELECT current_setting('server_version_num') AS v`)).rows[0]!.v) / 10000));
+    if (this.binMajor !== server) throw new Error(`cluster ${t.id} runs PostgreSQL ${server}, but the server binaries baas uses for recovery are version ${this.binMajor} (set BAAS_PG_BIN_DIR to a matching install)`);
+  }
+
+  private connEnv(t: Target) {
+    const u = new URL(t.adminUrl);
     return { args: ["-h", u.hostname, "-p", u.port || "5432", "-U", decodeURIComponent(u.username)], env: { PGPASSWORD: decodeURIComponent(u.password) } };
   }
 
@@ -100,48 +124,52 @@ export class PitrService {
     throw new Error("baas is running as root and there is no postgres user to run the recovery server as; run baas as a normal user");
   }
 
-  private async admin<T>(fn: (c: pg.Client) => Promise<T>): Promise<T> {
-    const c = new pg.Client({ connectionString: this.control.adminUrl });
+  private async admin<T>(t: Target, fn: (c: pg.Client) => Promise<T>): Promise<T> {
+    const c = new pg.Client({ connectionString: t.adminUrl });
     c.on("error", () => {});
     await c.connect();
     try { return await fn(c); } finally { await c.end().catch(() => {}); }
   }
 
-  /** Is the server archiving, and what does the archive cover? */
-  async status() {
-    const s = await this.admin(async (c) => {
+  /** Is the cluster archiving, and what does the archive cover? */
+  async status(clusterId: string = MAIN) {
+    const t = await this.target(clusterId);
+    const s = await this.admin(t, async (c) => {
       const set = (await c.query<{ name: string; setting: string }>(`SELECT name, setting FROM pg_settings WHERE name IN ('archive_mode', 'archive_command', 'wal_level')`)).rows;
       const v = Object.fromEntries(set.map((r) => [r.name, r.setting]));
       const a = (await c.query(`SELECT last_archived_wal, last_archived_time, failed_count, last_failed_wal, last_failed_time FROM pg_stat_archiver`)).rows[0];
       return { archive_mode: v.archive_mode ?? "off", wal_level: v.wal_level ?? "", archive_command_set: !!v.archive_command && v.archive_command !== "(disabled)", archiver: a };
     });
-    const enabled = s.archive_mode !== "off" && s.archive_command_set && s.wal_level !== "minimal";
+    const archive_dir_configured = t.archiveDir !== null;
+    const enabled = archive_dir_configured && s.archive_mode !== "off" && s.archive_command_set && s.wal_level !== "minimal";
     const bases = (await this.control.pool.query<BaseBackup>(
-      `SELECT id, status, started_at, finished_at, size_bytes, error FROM pitr_base_backups ORDER BY started_at DESC LIMIT 20`)).rows;
-    const earliest = (await this.control.pool.query<{ t: Date | null }>(`SELECT min(finished_at) AS t FROM pitr_base_backups WHERE status = 'complete'`)).rows[0]!.t;
+      `SELECT id, status, started_at, finished_at, size_bytes, error FROM pitr_base_backups WHERE cluster_id = $1 ORDER BY started_at DESC LIMIT 20`, [t.id])).rows;
+    const earliest = (await this.control.pool.query<{ t: Date | null }>(`SELECT min(finished_at) AS t FROM pitr_base_backups WHERE status = 'complete' AND cluster_id = $1`, [t.id])).rows[0]!.t;
     return {
-      enabled, archive_mode: s.archive_mode, retention_days: this.opts.retentionDays,
+      cluster: t.id, archive_dir_configured, enabled, archive_mode: s.archive_mode, retention_days: this.opts.retentionDays,
       archiver: s.archiver ? { last_archived_wal: s.archiver.last_archived_wal, last_archived_time: s.archiver.last_archived_time, failed_count: Number(s.archiver.failed_count), last_failed_time: s.archiver.last_failed_time } : null,
       window: enabled && earliest ? { earliest, latest: new Date() } : null,
       base_backups: bases,
     };
   }
 
-  async takeBaseBackup(): Promise<BaseBackup> {
-    if (this.busy) throw new HttpError(409, "a base backup or recovery is already running");
-    this.busy = true;
-    const id = (await this.control.pool.query<{ id: string }>(`INSERT INTO pitr_base_backups (status) VALUES ('running') RETURNING id`)).rows[0]!.id;
-    const dir = join(this.opts.baseDir, id);
+  async takeBaseBackup(clusterId: string = MAIN): Promise<BaseBackup> {
+    const t = await this.target(clusterId);
+    if (this.busy.has(t.id)) throw new HttpError(409, "a base backup or recovery is already running on this cluster");
+    this.busy.add(t.id);
+    const id = (await this.control.pool.query<{ id: string }>(`INSERT INTO pitr_base_backups (status, cluster_id) VALUES ('running', $1) RETURNING id`, [t.id])).rows[0]!.id;
+    const dir = join(t.baseDir, id);
     try {
-      const st = await this.status();
-      if (!st.enabled) throw new Error("WAL archiving is not switched on for this Postgres server");
-      await mkdir(this.opts.baseDir, { recursive: true, mode: 0o700 });
-      const { args, env } = this.connEnv();
+      const st = await this.status(t.id);
+      if (!st.enabled) throw new Error(st.archive_dir_configured ? "WAL archiving is not switched on for this Postgres server" : `cluster ${t.id} has no WAL archive directory registered (baas admin clusters update ${t.id} --archive-dir <path>)`);
+      await this.checkVersions(t);
+      await mkdir(t.baseDir, { recursive: true, mode: 0o700 });
+      const { args, env } = this.connEnv(t);
       // -X none: the WAL a backup needs is fetched from the archive at recovery time, which Postgres makes sure is complete before it returns.
       await run(this.bin("pg_basebackup"), [...args, "-D", dir, "-F", "p", "-X", "none", "-c", "fast", "--no-sync"], env);
       const label = await readFile(join(dir, "backup_label"), "utf8");
       const startWal = /START WAL LOCATION: \S+ \(file ([0-9A-F]{24})\)/.exec(label)?.[1] ?? null;
-      const finished = (await this.admin((c) => c.query<{ t: Date }>(`SELECT now() AS t`))).rows[0]!.t;
+      const finished = (await this.admin(t, (c) => c.query<{ t: Date }>(`SELECT now() AS t`))).rows[0]!.t;
       const size = await dirSize(dir);
       const row = (await this.control.pool.query<BaseBackup>(
         `UPDATE pitr_base_backups SET status = 'complete', path = $2, finished_at = $3, start_wal = $4, size_bytes = $5 WHERE id = $1
@@ -152,14 +180,15 @@ export class PitrService {
       await this.control.pool.query(`UPDATE pitr_base_backups SET status = 'failed', error = $2, path = NULL WHERE id = $1`, [id, (err as Error).message.slice(0, 500)]);
       throw new HttpError(500, `base backup failed: ${(err as Error).message.slice(0, 200)}`);
     } finally {
-      this.busy = false;
+      this.busy.delete(t.id);
     }
   }
 
   /** Forget base backups past retention (always keeping the newest) and the WAL only they needed. */
-  async prune(): Promise<{ removedBackups: number }> {
+  async prune(clusterId: string = MAIN): Promise<{ removedBackups: number }> {
+    const t = await this.target(clusterId);
     const keep = (await this.control.pool.query<{ id: string; path: string | null; start_wal: string | null; finished_at: Date }>(
-      `SELECT id, path, start_wal, finished_at FROM pitr_base_backups WHERE status = 'complete' ORDER BY finished_at DESC`)).rows;
+      `SELECT id, path, start_wal, finished_at FROM pitr_base_backups WHERE status = 'complete' AND cluster_id = $1 ORDER BY finished_at DESC`, [t.id])).rows;
     const cutoff = Date.now() - this.opts.retentionDays * 86_400_000;
     // Recovery to a moment needs the newest backup before it, so the newest backup older than the window is kept too.
     const firstOld = keep.findIndex((b) => b.finished_at.getTime() < cutoff);
@@ -168,26 +197,41 @@ export class PitrService {
       if (b.path) await rm(b.path, { recursive: true, force: true });
       await this.control.pool.query(`DELETE FROM pitr_base_backups WHERE id = $1`, [b.id]);
     }
-    await this.control.pool.query(`DELETE FROM pitr_base_backups WHERE status = 'failed' AND started_at < now() - interval '7 days'`);
+    await this.control.pool.query(`DELETE FROM pitr_base_backups WHERE status = 'failed' AND cluster_id = $1 AND started_at < now() - interval '7 days'`, [t.id]);
     const oldest = keep.slice(0, keep.length - drop.length).at(-1);
-    if (oldest?.start_wal) await run(this.bin("pg_archivecleanup"), [this.opts.archiveDir, oldest.start_wal]).catch(() => {});
+    if (oldest?.start_wal && t.archiveDir) await run(this.bin("pg_archivecleanup"), [t.archiveDir, oldest.start_wal]).catch(() => {});
     return { removedBackups: drop.length };
   }
 
-  /** Housekeeping: a fresh base backup when due, then pruning. Quiet when archiving is not switched on. */
+  /** Housekeeping, for every cluster in turn: a fresh base backup when due, then pruning. Quiet where archiving is not switched on. */
   async runScheduled(): Promise<string> {
-    const st = await this.status();
-    if (!st.enabled) return "off";
-    const last = (await this.control.pool.query<{ t: Date | null }>(`SELECT max(started_at) AS t FROM pitr_base_backups WHERE status IN ('complete', 'running')`)).rows[0]!.t;
-    let taken = false;
-    if (!last || Date.now() - last.getTime() > this.opts.baseEveryHours * 3_600_000) { await this.takeBaseBackup(); taken = true; }
-    const { removedBackups } = await this.prune();
-    return `${taken ? "base backup taken" : "base backup current"}${removedBackups ? `, ${removedBackups} old removed` : ""}`;
+    const ids = (await this.control.pool.query<{ id: string }>(`SELECT id FROM clusters ORDER BY created_at, id`)).rows.map((r) => r.id);
+    const done: string[] = [], failed: string[] = [];
+    for (const id of ids) {
+      try {
+        const st = await this.status(id);
+        if (!st.enabled) continue;
+        const last = (await this.control.pool.query<{ t: Date | null }>(`SELECT max(started_at) AS t FROM pitr_base_backups WHERE status IN ('complete', 'running') AND cluster_id = $1`, [id])).rows[0]!.t;
+        let taken = false;
+        if (!last || Date.now() - last.getTime() > this.opts.baseEveryHours * 3_600_000) { await this.takeBaseBackup(id); taken = true; }
+        const { removedBackups } = await this.prune(id);
+        done.push(`${id === MAIN ? "" : `${id}: `}${taken ? "base backup taken" : "base backup current"}${removedBackups ? `, ${removedBackups} old removed` : ""}`);
+      } catch (e) {
+        failed.push(`${id}: ${(e as Error).message}`); // one cluster being down must not stop the others' backups
+      }
+    }
+    if (failed.length) throw new Error(`${failed.join("; ")}${done.length ? ` (${done.join("; ")})` : ""}`);
+    return done.length ? done.join("; ") : "off";
+  }
+
+  /** Delete what a removed cluster left behind. */
+  async forgetCluster(id: string): Promise<void> {
+    if (id !== MAIN) await rm(join(this.opts.baseDir, id), { recursive: true, force: true });
   }
 
   /** Make sure everything up to this moment is in the archive, so a target close to "now" can be replayed. */
-  private async flushArchive(): Promise<Date> {
-    return this.admin(async (c) => {
+  private async flushArchive(t: Target): Promise<Date> {
+    return this.admin(t, async (c) => {
       // A WAL record first, so the switch has something to close; then wait for exactly that segment to be archived.
       await c.query(`SELECT pg_logical_emit_message(false, 'baas', 'point-in-time recovery')`);
       const { t, seg } = (await c.query<{ t: Date; seg: string }>(`SELECT now() AS t, pg_walfile_name(pg_switch_wal()) AS seg`)).rows[0]!;
@@ -208,30 +252,36 @@ export class PitrService {
     ControlPlane.require(p, "owner");
     const project = await this.control.getProject(p, ref);
     if (project.status !== "active") throw new HttpError(409, `cannot restore a project that is ${project.status}`);
-    if (project.cluster_id !== "main") throw new HttpError(409, `point-in-time recovery covers the main cluster only, and this project is on cluster ${project.cluster_id}`);
     if (!planOf(project.plan).pitr) throw new HttpError(403, `point-in-time recovery is not part of the ${project.plan} plan`);
     if (Number.isNaN(to.getTime())) throw new HttpError(400, "to must be a date and time");
     if (to.getTime() > Date.now()) throw new HttpError(400, "to is in the future");
-    const st = await this.status();
+    const t = await this.target(project.cluster_id);
+    if (t.archiveDir === null) throw new HttpError(409, `point-in-time recovery is not set up for cluster ${t.id}: it has no WAL archive directory registered`);
+    const archiveDir = t.archiveDir;
+    const st = await this.status(t.id);
     if (!st.enabled) throw new HttpError(409, "point-in-time recovery is not set up on this server (WAL archiving is off)");
+    // A project that moved here has no history here from before it arrived; what came earlier lives on the cluster it left.
+    const arrived = (await this.control.pool.query<{ at: Date }>(`SELECT max(at) AS at FROM audit_log WHERE action = 'project.move' AND target = $1 AND meta->>'to' = $2`, [ref, t.id])).rows[0]!.at;
+    if (arrived && to < arrived) throw new HttpError(400, `this project moved onto cluster ${t.id} at ${arrived.toISOString()}, so it can only be restored to a moment after that`);
     const base = (await this.control.pool.query<{ id: string; path: string; finished_at: Date }>(
-      `SELECT id, path, finished_at FROM pitr_base_backups WHERE status = 'complete' AND finished_at <= $1 ORDER BY finished_at DESC LIMIT 1`, [to])).rows[0];
+      `SELECT id, path, finished_at FROM pitr_base_backups WHERE status = 'complete' AND cluster_id = $2 AND finished_at <= $1 ORDER BY finished_at DESC LIMIT 1`, [to, t.id])).rows[0];
     if (!base) throw new HttpError(400, st.window ? `the earliest moment that can be restored is ${st.window.earliest.toISOString()}` : "no base backup exists yet");
-    if (this.busy) throw new HttpError(409, "a base backup or recovery is already running");
-    this.busy = true;
+    if (this.busy.has(t.id)) throw new HttpError(409, "a base backup or recovery is already running on this cluster");
+    this.busy.add(t.id);
     const scratch = join(this.opts.scratchDir, `recover-${base.id.slice(0, 8)}-${Date.now()}`);
     let proc: ChildProcess | null = null;
     try {
-      await this.flushArchive();
+      await this.checkVersions(t);
+      await this.flushArchive(t);
       const user = await this.resolveUser();
       await mkdir(this.opts.scratchDir, { recursive: true, mode: 0o700 });
       if (user) await chmod(this.opts.scratchDir, 0o711); // the recovery user has to be able to reach its copy
       await cp(base.path, scratch, { recursive: true });
       await chmod(scratch, 0o700);
       const port = await freePort();
-      const settings = await this.admin(async (c) => Object.fromEntries((await c.query<{ name: string; setting: string }>(
+      const settings = await this.admin(t, async (c) => Object.fromEntries((await c.query<{ name: string; setting: string }>(
         `SELECT name, setting FROM pg_settings WHERE name IN ('max_connections','max_worker_processes','max_wal_senders','max_prepared_transactions','max_locks_per_transaction','shared_preload_libraries','wal_level')`)).rows.map((r) => [r.name, r.setting])));
-      const superuser = decodeURIComponent(new URL(this.control.adminUrl).username);
+      const superuser = decodeURIComponent(new URL(t.adminUrl).username);
       await writeFile(join(scratch, "baas_hba.conf"), "local all all trust\n");
       await writeFile(join(scratch, "postgresql.auto.conf"), [
         // Later settings win, so these override whatever the copied configuration says.
@@ -242,7 +292,7 @@ export class PitrService {
         `lc_messages = 'C'`, `lc_monetary = 'C'`, `lc_numeric = 'C'`, `lc_time = 'C'`, `ssl = off`, `listen_addresses = ''`, `port = ${port}`,
         `unix_socket_directories = ${q(scratch)}`, `hba_file = ${q(join(scratch, "baas_hba.conf"))}`,
         `fsync = off`, `synchronous_commit = off`, `full_page_writes = off`, `log_min_messages = warning`,
-        `restore_command = ${q(`cp "${this.opts.archiveDir}/%f" "%p"`)}`,
+        `restore_command = ${q(`cp "${archiveDir}/%f" "%p"`)}`,
         `recovery_target_time = ${q(to.toISOString().replace("T", " ").replace("Z", "+00"))}`, `recovery_target_action = 'promote'`, `recovery_target_inclusive = on`,
       ].join("\n") + "\n");
       await writeFile(join(scratch, "recovery.signal"), "");
@@ -294,7 +344,7 @@ export class PitrService {
     } finally {
       if (proc) await stopServer(proc).catch(() => {});
       await rm(scratch, { recursive: true, force: true });
-      this.busy = false;
+      this.busy.delete(t.id);
     }
   }
 

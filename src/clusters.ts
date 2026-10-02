@@ -17,8 +17,15 @@ export const MAIN = "main";
 const ID = /^[a-z0-9][a-z0-9-]{0,30}$/;
 const TTL_MS = 30_000;
 
-export type ClusterRow = { id: string; name: string; status: "active" | "draining"; max_projects: number | null; created_at: Date };
+export type ClusterRow = { id: string; name: string; status: "active" | "draining"; max_projects: number | null; created_at: Date; archive_dir: string | null };
 export type ClusterView = ClusterRow & { host: string; projects: number; db_bytes: number | null };
+
+/** Where a cluster's archive_command puts WAL, as baas sees it. It goes into recovery_command, so no quotes or other surprises. */
+const archiveDirOf = (v: unknown): string | null => {
+  if (v === undefined || v === null || v === "") return null;
+  if (typeof v !== "string" || !/^\/[\w@%+=:,.\/-]{0,300}$/.test(v) || v.split("/").includes("..")) throw new HttpError(400, "archive_dir must be an absolute path (letters, digits and . _ - / only)");
+  return v;
+};
 
 const hostOf = (url: string) => { const u = new URL(url); return `${u.hostname}:${u.port || "5432"}`; };
 
@@ -53,7 +60,7 @@ export class ClusterRegistry {
 
   async list(): Promise<ClusterView[]> {
     const rows = (await this.pool.query<ClusterRow & { projects: string; db_bytes: string | null }>(
-      `SELECT c.id, c.name, c.status, c.max_projects, c.created_at,
+      `SELECT c.id, c.name, c.status, c.max_projects, c.created_at, c.archive_dir,
               (SELECT count(*) FROM projects p WHERE p.cluster_id = c.id AND p.status NOT IN ('purged')) AS projects,
               (SELECT sum(u.db_bytes) FROM usage_current u JOIN projects p ON p.ref = u.ref WHERE p.cluster_id = c.id) AS db_bytes
        FROM clusters c ORDER BY c.created_at, c.id`)).rows;
@@ -103,15 +110,16 @@ export class ClusterRegistry {
     }
   }
 
-  async add(input: { id?: unknown; name?: unknown; admin_url?: unknown; max_projects?: unknown }): Promise<ClusterView> {
+  async add(input: { id?: unknown; name?: unknown; admin_url?: unknown; max_projects?: unknown; archive_dir?: unknown }): Promise<ClusterView> {
     if (typeof input.id !== "string" || !ID.test(input.id) || input.id === MAIN) throw new HttpError(400, "id must be 1-31 characters of a-z, 0-9 and -, and not \"main\"");
     if (typeof input.admin_url !== "string") throw new HttpError(400, "admin_url is required");
     const max = input.max_projects === undefined || input.max_projects === null ? null : Number(input.max_projects);
     if (max !== null && (!Number.isInteger(max) || max < 1)) throw new HttpError(400, "max_projects must be a positive whole number");
     const name = typeof input.name === "string" && input.name.trim() ? input.name.trim().slice(0, 80) : input.id;
+    const archiveDir = archiveDirOf(input.archive_dir);
     await this.check(input.admin_url);
     try {
-      await this.pool.query(`INSERT INTO clusters (id, name, admin_url_enc, max_projects) VALUES ($1, $2, $3, $4)`, [input.id, name, this.vault.seal(input.admin_url, `cluster:${input.id}`), max]);
+      await this.pool.query(`INSERT INTO clusters (id, name, admin_url_enc, max_projects, archive_dir) VALUES ($1, $2, $3, $4, $5)`, [input.id, name, this.vault.seal(input.admin_url, `cluster:${input.id}`), max, archiveDir]);
     } catch (e) {
       if ((e as { code?: string }).code === "23505") throw new HttpError(409, "a cluster with that id exists");
       throw e;
@@ -119,8 +127,8 @@ export class ClusterRegistry {
     return (await this.list()).find((c) => c.id === input.id)!;
   }
 
-  async update(id: string, patch: { name?: unknown; status?: unknown; max_projects?: unknown; admin_url?: unknown }): Promise<ClusterView> {
-    const cur = (await this.pool.query<ClusterRow>(`SELECT id, name, status, max_projects, created_at FROM clusters WHERE id = $1`, [id])).rows[0];
+  async update(id: string, patch: { name?: unknown; status?: unknown; max_projects?: unknown; admin_url?: unknown; archive_dir?: unknown }): Promise<ClusterView> {
+    const cur = (await this.pool.query<ClusterRow>(`SELECT id, name, status, max_projects, created_at, archive_dir FROM clusters WHERE id = $1`, [id])).rows[0];
     if (!cur) throw new HttpError(404, "cluster not found");
     const sets: string[] = [], vals: unknown[] = [id];
     const set = (col: string, v: unknown) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
@@ -130,6 +138,10 @@ export class ClusterRegistry {
       const m = patch.max_projects === null ? null : Number(patch.max_projects);
       if (m !== null && (!Number.isInteger(m) || m < 1)) throw new HttpError(400, "max_projects must be a positive whole number or null");
       set("max_projects", m);
+    }
+    if (patch.archive_dir !== undefined) {
+      if (id === MAIN) throw new HttpError(400, "the main cluster's archive directory comes from BAAS_PITR_ARCHIVE_DIR");
+      set("archive_dir", archiveDirOf(patch.archive_dir));
     }
     if (patch.admin_url !== undefined) {
       if (id === MAIN) throw new HttpError(400, "the main cluster's address comes from BAAS_PG_ADMIN_URL");
@@ -190,7 +202,7 @@ export class ClusterMover {
       await dropProject(dstUrl, ref).catch(() => {}); // a leftover from an earlier failed attempt
       built = true;
       await createProjectDatabase(dstUrl, ref, password);
-      await this.backups.runTool("pg_restore", ["--exit-on-error", "--no-owner", "-d", `proj_${ref}`, file], dstUrl);
+      await this.backups.runTool("pg_restore", ["--exit-on-error", "-d", `proj_${ref}`, file], dstUrl);
       await this.checkCopy(srcUrl, dstUrl, ref);
       // The switch: one statement, after which every node reads the project from its new home.
       const sw = await this.pool.query(`UPDATE projects SET cluster_id = $2, moving_to = NULL, updated_at = now() WHERE ref = $1 AND moving_to = $2`, [ref, targetId]);

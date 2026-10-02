@@ -2867,7 +2867,7 @@ function pitrCard(p, s, onDone) {
     return card;
   }
   if (!s.enabled) {
-    card.append(h("p", { class: "muted", id: "pitr-state", "data-state": "off" }, `Switched off: the Postgres server is not archiving its WAL (archive_mode is ${s.archive_mode}).`));
+    card.append(h("p", { class: "muted", id: "pitr-state", "data-state": "off" }, s.archive_dir_configured === false ? `Not set up for this project's database cluster (${s.cluster}): the operator has to register its WAL archive directory (baas admin clusters update ${s.cluster} --archive-dir <path>) and turn on archive_mode on that server.` : `Switched off: the Postgres server is not archiving its WAL (archive_mode is ${s.archive_mode}).`));
     return card;
   }
   if (!s.plan_allows) card.append(h("div", { class: "notice", id: "pitr-plan" }, "This project's plan does not include point-in-time recovery."));
