@@ -20,7 +20,7 @@ curl -XPOST localhost:8080/v1/organizations -H "x-bootstrap-token: $BAAS_BOOTSTR
   -d '{"name":"Acme","slug":"acme","owner_email":"you@example.com","owner_password":"a-long-passphrase"}'   # → {"owner_token":"baas_…","owner":{…}}
 ```
 
-**People and tokens.** Each person signs in to the dashboard with their own email and password, under **Team** (invite by link; roles developer < admin < owner; sessions last 7 days; changing a role or removing someone takes effect immediately; there is always at least one owner member). API tokens remain for scripts and CI, and the CLI accepts either: `baas login --url … --email you@example.com` (password from `--password` or `BAAS_PASSWORD`). An account belongs to one organisation, and an owner can set a new password for someone who lost theirs; there is no self-service reset by email.
+**People and tokens.** Each person signs in to the dashboard with their own email and password, under **Team** (invite by link; roles developer < admin < owner; sessions last 7 days; changing a role or removing someone takes effect immediately; there is always at least one owner member). API tokens remain for scripts and CI, and the CLI accepts either: `baas login --url … --email you@example.com` (password from `--password` or `BAAS_PASSWORD`). An account belongs to one organisation, and an owner can set a new password for someone who lost theirs; if the server can send email (`SMTP_URL`) and knows its dashboard address (`BAAS_DASHBOARD_URL`, or derived from `DASHBOARD_HOST`/`BAAS_DASHBOARD_ORIGINS`), **Forgot password?** emails a link that works once for an hour and signs the account out everywhere; otherwise an owner sets a new password. Members can turn on **Two-step verification** (an authenticator app: 6-digit codes, each usable once, plus eight single-use recovery codes shown once). Signing in then asks for a code, five tries per attempt, and misses count against the address; a reset by email does not switch it off. Turning it off needs the password and a code; an owner can remove it for someone who lost their device and codes (`baas login --email … --code …` for the CLI).
 
 Projects are served at `http://<ref>.localhost:8081` (browsers resolve `*.localhost` themselves; for a real domain see [Production](#production)).
 
@@ -150,7 +150,7 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 - **Realtime** DELETE events carry only the primary key and go to `service_role`, or to other roles only on tables without RLS; filtered subscriptions receive no deletes. One extra query per subscriber per event.
 - **Single node.** One Postgres cluster, one process; request logs and rate-limit state are in memory. No sharding across clusters.
 - Project and role **names are visible** to SQL run inside a project (`pg_database`, `pg_roles`); secrets are not.
-- Dashboard accounts have no email-based password reset, MFA or single sign-on; an owner resets passwords by hand.
+- Dashboard accounts have no single sign-on, and one account belongs to one organisation.
 
 ## Development and tests
 

@@ -1,5 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import { hashPassword, verifyPassword } from "./authsvc.js";
+import { NoMailer, type Mailer } from "./mailer.js";
+import { matchStep, newSecret, otpauthUri } from "./totp.js";
+import type { Vault } from "./vault.js";
 import { ControlPlane, HttpError, RANKS, type Principal, type Role } from "./control.js";
 
 const hash = (t: string) => createHash("sha256").update(t).digest("hex");
@@ -10,8 +13,15 @@ const MIN_PASSWORD = 8;
 const MAX_FAILS = 10;
 const FAIL_WINDOW_MS = 15 * 60_000;
 
+export type MembersOptions = { vault?: Vault; mailer?: Mailer; /** Where the dashboard is reached, for links in emails. Without it, emailed resets are off. */ dashboardUrl?: string; issuer?: string };
+export type MfaChallenge = { mfa_required: true; mfa_token: string };
+const RESET_MS = 3600_000;
+const TICKET_MS = 5 * 60_000;
+const TICKET_TRIES = 5;
+const RESET_COOLDOWN_MS = 60_000;
+
 export type Session = { token: string; expires_at: string; member: MemberView };
-export type MemberView = { id: string; email: string; name: string | null; role: Role };
+export type MemberView = { id: string; email: string; name: string | null; role: Role; mfa?: boolean };
 
 const view = (r: { id: string; email: string; name: string | null; role: Role }): MemberView => ({ id: r.id, email: r.email, name: r.name, role: r.role });
 
@@ -29,7 +39,16 @@ export class Members {
   /** Recent failed sign-ins per address, so a password cannot be guessed by trying forever. */
   private fails = new Map<string, number[]>();
 
-  constructor(private readonly control: ControlPlane) {}
+  private mailer: Mailer;
+  private resetSent = new Map<string, number>();
+
+  constructor(private readonly control: ControlPlane, private readonly opts: MembersOptions = {}) {
+    this.mailer = opts.mailer ?? new NoMailer();
+  }
+
+  get emailResetAvailable() {
+    return this.mailer.configured && !!this.opts.dashboardUrl;
+  }
 
   private get pool() {
     return this.control.pool;
@@ -53,7 +72,7 @@ export class Members {
     return { token, expires_at: expires.toISOString(), member: view(m) };
   }
 
-  async login(email: unknown, password: unknown): Promise<Session> {
+  async login(email: unknown, password: unknown): Promise<Session | MfaChallenge> {
     if (typeof email !== "string" || typeof password !== "string") throw new HttpError(400, "email and password are required");
     const key = email.trim().toLowerCase();
     if (this.throttled(key)) throw new HttpError(429, "too many failed sign-ins; try again in a few minutes", { "retry-after": "900" });
@@ -63,9 +82,49 @@ export class Members {
       this.fails.set(key, [...(this.fails.get(key) ?? []), Date.now()]);
       throw new HttpError(401, "invalid email or password");
     }
+    if ((await this.pool.query(`SELECT 1 FROM member_factors WHERE member_id = $1 AND status = 'verified'`, [m.id])).rowCount) {
+      // A correct password is only half of signing in. Failures at the second step still count against this address.
+      const ticket = `baasmfa_${randomBytes(24).toString("base64url")}`;
+      await this.pool.query(`DELETE FROM member_mfa_tickets WHERE member_id = $1 OR expires_at < now()`, [m.id]);
+      await this.pool.query(`INSERT INTO member_mfa_tickets (member_id, token_hash, expires_at) VALUES ($1, $2, $3)`, [m.id, hash(ticket), new Date(Date.now() + TICKET_MS)]);
+      return { mfa_required: true, mfa_token: ticket };
+    }
     this.fails.delete(key);
     await this.control.audit(`member:${m.id}`, m.org_id, "member.login", m.id);
     return this.session(m);
+  }
+
+  /** Second step of signing in: an authenticator code, or one of the recovery codes. */
+  async loginMfa(ticket: unknown, code: unknown): Promise<Session> {
+    if (typeof ticket !== "string" || typeof code !== "string" || !code.trim()) throw new HttpError(400, "mfa_token and code are required");
+    const t = (await this.pool.query(
+      `UPDATE member_mfa_tickets SET attempts = attempts + 1 WHERE token_hash = $1 AND expires_at > now() AND attempts < $2 RETURNING id, member_id`, [hash(ticket), TICKET_TRIES])).rows[0];
+    if (!t) throw new HttpError(401, "this sign-in has expired; start again");
+    const m = (await this.pool.query(`SELECT id, org_id, email, name, role FROM members WHERE id = $1`, [t.member_id])).rows[0];
+    const key = m.email.toLowerCase();
+    if (this.throttled(key)) throw new HttpError(429, "too many failed sign-ins; try again in a few minutes", { "retry-after": "900" });
+    if (!(await this.checkSecondFactor(t.member_id, code))) {
+      this.fails.set(key, [...(this.fails.get(key) ?? []), Date.now()]);
+      throw new HttpError(401, "that code is not right");
+    }
+    await this.pool.query(`DELETE FROM member_mfa_tickets WHERE member_id = $1`, [t.member_id]);
+    this.fails.delete(key);
+    await this.control.audit(`member:${m.id}`, m.org_id, "member.login", m.id, { mfa: true });
+    return this.session(m);
+  }
+
+  /** True if the code is a current authenticator code that was not used before, or an unused recovery code (which it spends). */
+  private async checkSecondFactor(memberId: string, raw: string): Promise<boolean> {
+    const code = raw.trim().replace(/\s/g, "");
+    const f = (await this.pool.query(`SELECT secret_enc, last_used_step FROM member_factors WHERE member_id = $1 AND status = 'verified'`, [memberId])).rows[0];
+    if (!f || !this.opts.vault) return false;
+    if (/^\d{6}$/.test(code)) {
+      const step = matchStep(this.opts.vault.open(f.secret_enc, `member:${memberId}`), code, Date.now(), Number(f.last_used_step));
+      if (step === null) return false;
+      // Only one of two racing requests with the same code can move the step forward.
+      return !!(await this.pool.query(`UPDATE member_factors SET last_used_step = $2 WHERE member_id = $1 AND last_used_step < $2`, [memberId, step])).rowCount;
+    }
+    return !!(await this.pool.query(`UPDATE member_recovery_codes SET used_at = now() WHERE member_id = $1 AND code_hash = $2 AND used_at IS NULL`, [memberId, hash(code.toLowerCase())])).rowCount;
   }
 
   async logout(p: Principal): Promise<void> {
@@ -74,8 +133,9 @@ export class Members {
 
   async me(p: Principal): Promise<MemberView | null> {
     if (!p.memberId) return null;
-    const r = await this.pool.query(`SELECT id, email, name, role FROM members WHERE id = $1`, [p.memberId]);
-    return r.rows[0] ? view(r.rows[0]) : null;
+    const r = await this.pool.query(
+      `SELECT m.id, m.email, m.name, m.role, EXISTS (SELECT 1 FROM member_factors f WHERE f.member_id = m.id AND f.status = 'verified') AS mfa FROM members m WHERE m.id = $1`, [p.memberId]);
+    return r.rows[0] ? { ...view(r.rows[0]), mfa: r.rows[0].mfa } : null;
   }
 
   /** Create the first owner of a new organisation from the bootstrap call. */
@@ -96,7 +156,9 @@ export class Members {
 
   async list(p: Principal) {
     ControlPlane.require(p, "admin");
-    const members = (await this.pool.query(`SELECT id, email, name, role, created_at FROM members WHERE org_id = $1 ORDER BY created_at`, [p.orgId])).rows;
+    const members = (await this.pool.query(
+      `SELECT m.id, m.email, m.name, m.role, m.created_at, EXISTS (SELECT 1 FROM member_factors f WHERE f.member_id = m.id AND f.status = 'verified') AS mfa
+         FROM members m WHERE m.org_id = $1 ORDER BY m.created_at`, [p.orgId])).rows;
     const invites = (await this.pool.query(
       `SELECT id, email, role, created_at, expires_at FROM invites WHERE org_id = $1 AND accepted_at IS NULL ORDER BY created_at`, [p.orgId])).rows;
     return { members, invites: invites.map((i) => ({ ...i, expired: new Date(i.expires_at) < new Date() })) };
@@ -203,12 +265,106 @@ export class Members {
   }
 
   /** An owner sets a new password for someone who has lost theirs, signing them out everywhere. */
-  async resetPassword(p: Principal, id: string, next: unknown) {
+  async setPasswordFor(p: Principal, id: string, next: unknown) {
     ControlPlane.require(p, "owner");
     const pw = checkPassword(next);
     await this.target(p, id);
     await this.pool.query(`UPDATE members SET password_hash = $1 WHERE id = $2`, [await hashPassword(pw), id]);
     await this.pool.query(`UPDATE api_tokens SET revoked_at = now() WHERE member_id = $1 AND revoked_at IS NULL`, [id]);
     await this.control.audit(p.memberId ? `member:${p.memberId}` : p.tokenId, p.orgId, "member.password_reset", id);
+  }
+
+  // ---- password reset by email ----
+
+  /** Always answers the same, whether or not the address has an account. */
+  async forgotPassword(email: unknown): Promise<void> {
+    if (!this.emailResetAvailable) throw new HttpError(501, "Email is not set up on this server, so passwords cannot be reset by email. Ask an owner to set a new password for you.");
+    const e = checkEmail(email).toLowerCase();
+    const last = this.resetSent.get(e) ?? 0;
+    if (Date.now() - last < RESET_COOLDOWN_MS) return;
+    this.resetSent.set(e, Date.now());
+    const m = (await this.pool.query(`SELECT id, org_id, email FROM members WHERE lower(email) = $1`, [e])).rows[0];
+    if (!m) return;
+    const token = `baasrst_${randomBytes(24).toString("base64url")}`;
+    await this.pool.query(`DELETE FROM member_resets WHERE member_id = $1 AND used_at IS NULL`, [m.id]);
+    await this.pool.query(`INSERT INTO member_resets (member_id, token_hash, expires_at) VALUES ($1, $2, $3)`, [m.id, hash(token), new Date(Date.now() + RESET_MS)]);
+    const link = `${this.opts.dashboardUrl!.replace(/\/+$/, "")}/#/reset/${token}`;
+    // Not awaited: whether a mail was sent must not show in how long the answer takes.
+    void this.mailer.send({
+      to: m.email, subject: "Reset your password",
+      text: `Someone asked to reset the password for this account.\n\nChoose a new password here (the link works once and expires in an hour):\n${link}\n\nIf this was not you, ignore this email: nothing changes.`,
+    }).catch(() => {});
+    await this.control.audit(`member:${m.id}`, m.org_id, "member.reset_requested", m.id);
+  }
+
+  async resetWithToken(token: unknown, password: unknown): Promise<void> {
+    if (typeof token !== "string" || !token) throw new HttpError(400, "token is required");
+    const pw = checkPassword(password);
+    const hashed = await hashPassword(pw);
+    const r = (await this.pool.query(
+      `UPDATE member_resets SET used_at = now() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING member_id`, [hash(token)])).rows[0];
+    if (!r) throw new HttpError(400, "this link is invalid, expired or already used");
+    const m = (await this.pool.query(`UPDATE members SET password_hash = $1 WHERE id = $2 RETURNING org_id`, [hashed, r.member_id])).rows[0];
+    // A reset signs the account out everywhere; a second factor, if there is one, still applies at the next sign-in.
+    await this.pool.query(`UPDATE api_tokens SET revoked_at = now() WHERE member_id = $1 AND revoked_at IS NULL`, [r.member_id]);
+    await this.pool.query(`DELETE FROM member_resets WHERE member_id = $1`, [r.member_id]);
+    await this.control.audit(`member:${r.member_id}`, m.org_id, "member.password_reset_by_email", r.member_id);
+  }
+
+  // ---- authenticator app ----
+
+  private requireMember(p: Principal): string {
+    if (!p.memberId) throw new HttpError(400, "only signed-in members can use an authenticator");
+    return p.memberId;
+  }
+
+  async mfaEnroll(p: Principal) {
+    const id = this.requireMember(p);
+    if (!this.opts.vault) throw new HttpError(501, "the platform key store is needed for authenticators");
+    if ((await this.pool.query(`SELECT 1 FROM member_factors WHERE member_id = $1 AND status = 'verified'`, [id])).rowCount) throw new HttpError(409, "an authenticator is already set up; remove it first");
+    const m = (await this.pool.query(`SELECT email FROM members WHERE id = $1`, [id])).rows[0];
+    const secret = newSecret();
+    await this.pool.query(
+      `INSERT INTO member_factors (member_id, secret_enc) VALUES ($1, $2)
+       ON CONFLICT (member_id) DO UPDATE SET secret_enc = EXCLUDED.secret_enc, status = 'unverified', last_used_step = -1, created_at = now()`,
+      [id, this.opts.vault.seal(secret, `member:${id}`)]);
+    return { secret, uri: otpauthUri(secret, m.email, this.opts.issuer ?? "baas") };
+  }
+
+  /** Confirms the app shows the right codes, turns the requirement on, and hands out recovery codes (once). */
+  async mfaVerify(p: Principal, code: unknown) {
+    const id = this.requireMember(p);
+    if (typeof code !== "string" || !/^\d{6}$/.test(code.trim())) throw new HttpError(400, "enter the 6-digit code from your app");
+    const f = (await this.pool.query(`SELECT secret_enc FROM member_factors WHERE member_id = $1 AND status = 'unverified'`, [id])).rows[0];
+    if (!f || !this.opts.vault) throw new HttpError(400, "start setting up an authenticator first");
+    const step = matchStep(this.opts.vault.open(f.secret_enc, `member:${id}`), code.trim(), Date.now(), -1);
+    if (step === null) throw new HttpError(400, "that code is not right; check the time on your device");
+    await this.pool.query(`UPDATE member_factors SET status = 'verified', verified_at = now(), last_used_step = $2 WHERE member_id = $1`, [id, step]);
+    const codes = Array.from({ length: 8 }, () => { const x = randomBytes(5).toString("hex"); return `${x.slice(0, 5)}-${x.slice(5)}`; });
+    await this.pool.query(`DELETE FROM member_recovery_codes WHERE member_id = $1`, [id]);
+    for (const c of codes) await this.pool.query(`INSERT INTO member_recovery_codes (member_id, code_hash) VALUES ($1, $2)`, [id, hash(c)]);
+    await this.control.audit(`member:${id}`, p.orgId, "member.mfa_enabled", id);
+    return { recovery_codes: codes };
+  }
+
+  /** Removing it needs the password and a current code (or a recovery code), so a stolen session cannot switch it off. */
+  async mfaDisable(p: Principal, password: unknown, code: unknown) {
+    const id = this.requireMember(p);
+    const row = (await this.pool.query(`SELECT password_hash FROM members WHERE id = $1`, [id])).rows[0];
+    if (typeof password !== "string" || !(await verifyPassword(password, row?.password_hash ?? null))) throw new HttpError(400, "password is incorrect");
+    if (typeof code !== "string" || !(await this.checkSecondFactor(id, code))) throw new HttpError(400, "that code is not right");
+    await this.pool.query(`DELETE FROM member_factors WHERE member_id = $1`, [id]);
+    await this.pool.query(`DELETE FROM member_recovery_codes WHERE member_id = $1`, [id]);
+    await this.control.audit(`member:${id}`, p.orgId, "member.mfa_removed", id);
+  }
+
+  /** For someone who lost their device and their recovery codes. */
+  async removeMfaFor(p: Principal, id: string) {
+    ControlPlane.require(p, "owner");
+    await this.target(p, id);
+    await this.pool.query(`DELETE FROM member_factors WHERE member_id = $1`, [id]);
+    await this.pool.query(`DELETE FROM member_recovery_codes WHERE member_id = $1`, [id]);
+    await this.pool.query(`DELETE FROM member_mfa_tickets WHERE member_id = $1`, [id]);
+    await this.control.audit(p.memberId ? `member:${p.memberId}` : p.tokenId, p.orgId, "member.mfa_reset", id);
   }
 }

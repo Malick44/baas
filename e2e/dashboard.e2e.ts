@@ -12,6 +12,7 @@ import { text, use } from "../src/ai-testkit.js";
 import type { LlmClient, LlmRequest, LlmResponse } from "../src/ai/llm.js";
 import { MemoryMailer } from "../src/mailer.js";
 import { makePlatform } from "../src/platform-testkit.js";
+import { codeFor, stepAt } from "../src/totp.js";
 
 /** A tiny rule-based stand-in for the model, so the dashboard's AI tab can be driven end to end. */
 class RuleLlm implements LlmClient {
@@ -1594,6 +1595,110 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await np.goto(`${base}/#/projects`);
     await np.reload();
     await np.waitForSelector("#member-form");
+    await fresh.close();
+    await page.goto(`${base}/#/projects`);
+    await page.waitForSelector("#project-grid");
+  });
+
+  step("members turn on two-step verification, recover by email, and an owner can reset a lost device", async () => {
+    const base = `http://127.0.0.1:${apiPort}`;
+    const inv = await t.api("POST", "/v1/members/invites", { token: owner, body: { email: "secure@example.com", role: "developer" } });
+    const fresh = await browser.newContext();
+    const np = await fresh.newPage();
+    np.on("pageerror", (e) => problems.push(`secure pageerror: ${e.message}`));
+    await np.goto(`${base}/#/invite/${inv.json.token}`);
+    await np.fill("#invite-password", "secure-password-1");
+    await np.fill("#invite-confirm", "secure-password-1");
+    await np.click("#accept-invite");
+    await np.waitForSelector("#project-grid");
+
+    // Turn it on: key, then a code from it, then the recovery codes.
+    await np.click("#avatar");
+    await np.click("#menu-mfa");
+    await np.waitForSelector("#mfa-secret code");
+    const secret = (await np.locator("#mfa-secret code").first().textContent())!.trim();
+    assert.match(secret, /^[A-Z2-7]{20,}$/);
+    await np.fill("#mfa-code", "000000");
+    await np.click("dialog button[type=submit]");
+    await np.waitForFunction(() => /not right/.test(document.querySelector("dialog .notice.bad")?.textContent ?? ""));
+    await np.fill("#mfa-code", codeFor(secret, stepAt(Date.now())));
+    await np.click("dialog button[type=submit]");
+    await np.waitForSelector("#recovery-codes");
+    const recovery = (await np.textContent("#recovery-codes"))!.trim().split("\n");
+    assert.equal(recovery.length, 8);
+    await shot("member-recovery-codes");
+    await np.click("dialog button[type=submit]");
+    await np.reload();
+    await np.click("#avatar");
+    await np.click("#menu-mfa");
+    await np.waitForSelector("#mfa-state");
+    await np.click("dialog button:has-text('Cancel')");
+
+    // Signing in now asks for a code.
+    await np.click("#avatar");
+    await np.click("#signout");
+    await np.fill("#login-email", "secure@example.com");
+    await np.fill("#login-password", "secure-password-1");
+    await np.click("#signin-member");
+    await np.waitForSelector("#code-form, #member-error:not([hidden])");
+    assert.equal(await np.locator("#member-error:not([hidden])").count(), 0, await np.locator("#member-error").textContent().catch(() => "no error element"));
+    await np.fill("#login-code", "123456");
+    await np.click("#verify-code");
+    await np.locator("#code-error:not([hidden])").waitFor();
+    await np.fill("#login-code", codeFor(secret, stepAt(Date.now()) + 1));
+    await np.click("#verify-code");
+    await np.waitForSelector("#project-grid");
+
+    // A recovery code stands in for the app, once.
+    await np.click("#avatar");
+    await np.click("#signout");
+    await np.fill("#login-email", "secure@example.com");
+    await np.fill("#login-password", "secure-password-1");
+    await np.click("#signin-member");
+    await np.fill("#login-code", recovery[0]!);
+    await np.click("#verify-code");
+    await np.waitForSelector("#project-grid");
+
+    // Forgot the password: the link arrives by email and works once; the second factor still applies afterwards.
+    await np.click("#avatar");
+    await np.click("#signout");
+    await np.waitForSelector("#forgot-password:not([hidden])");
+    await np.fill("#login-email", "secure@example.com");
+    await np.click("#forgot-password");
+    await np.click("dialog button[type=submit]");
+    await np.locator("#toasts .toast.ok", { hasText: "a link is on its way" }).waitFor();
+    await np.waitForFunction(() => true);
+    let link = "";
+    for (let i = 0; i < 40 && !link; i++) { link = /http:\/\/[^\s]+\/#\/reset\/baasrst_[\w-]+/.exec(mailer.last("secure@example.com")?.text ?? "")?.[0] ?? ""; if (!link) await new Promise((r) => setTimeout(r, 50)); }
+    assert.ok(link, "a reset email was sent");
+    await np.goto(link);
+    await np.reload();
+    await np.waitForSelector("#reset-form");
+    await np.fill("#reset-new", "brand-new-password-2");
+    await np.fill("#reset-again", "something-else-entirely");
+    await np.click("#do-reset");
+    await np.locator("#reset-error:not([hidden])").waitFor();
+    await np.fill("#reset-again", "brand-new-password-2");
+    await np.click("#do-reset");
+    await np.waitForSelector("#member-form");
+    await np.fill("#login-email", "secure@example.com");
+    await np.fill("#login-password", "brand-new-password-2");
+    await np.click("#signin-member");
+    await np.waitForSelector("#code-form");
+
+    // They lost the device and the codes: the owner removes the authenticator.
+    await page.goto(`${base}/#/team`);
+    await page.reload();
+    await page.waitForSelector("tr[data-member='secure@example.com'] [data-mfa=on]");
+    await page.locator("tr[data-member='secure@example.com'] button[aria-label='Row actions']").click();
+    await page.click("[data-action=member-remove-mfa]");
+    await page.click("dialog button[type=submit]");
+    await page.locator("tr[data-member='secure@example.com'] [data-mfa=on]").waitFor({ state: "detached" });
+    await np.click("button:has-text('Back')");
+    await np.fill("#login-email", "secure@example.com");
+    await np.fill("#login-password", "brand-new-password-2");
+    await np.click("#signin-member");
+    await np.waitForSelector("#project-grid");
     await fresh.close();
     await page.goto(`${base}/#/projects`);
     await page.waitForSelector("#project-grid");

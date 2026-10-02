@@ -17,7 +17,7 @@ class CliError extends Error {}
 const USAGE = `baas <command>
 
   login --url <api-url> --token <token>   save credentials
-  login --url <api-url> --email <e> [--password <p>]   sign in as a member (password may come from BAAS_PASSWORD)
+  login --url <api-url> --email <e> [--password <p>] [--code <6 digits>]   sign in as a member (password may come from BAAS_PASSWORD; code if you use an authenticator)
   logout | whoami
   projects list | create <name> | pause|resume|delete <ref>
   link <ref>                              remember a project for this directory
@@ -134,8 +134,15 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           const password = String(flags.password ?? io.env.BAAS_PASSWORD ?? "");
           if (!password) throw new CliError("a password is needed: pass --password or set BAAS_PASSWORD");
           const res = await f(`${url}/v1/auth/login`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: String(flags.email), password }) });
-          const data = (await res.json().catch(() => ({}))) as { token?: string; error?: string };
-          if (!res.ok || !data.token) throw new CliError(data.error ?? `sign-in failed (${res.status})`);
+          let data = (await res.json().catch(() => ({}))) as { token?: string; error?: string; mfa_required?: boolean; mfa_token?: string };
+          if (res.ok && data.mfa_required) {
+            const code = String(flags.code ?? io.env.BAAS_MFA_CODE ?? "");
+            if (!code) throw new CliError("this account uses an authenticator: add --code <6 digits> (or a recovery code), or set BAAS_MFA_CODE");
+            const second = await f(`${url}/v1/auth/mfa`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mfa_token: data.mfa_token, code }) });
+            data = (await second.json().catch(() => ({}))) as typeof data;
+            if (!second.ok) throw new CliError(data.error ?? `sign-in failed (${second.status})`);
+          } else if (!res.ok) throw new CliError(data.error ?? `sign-in failed (${res.status})`);
+          if (!data.token) throw new CliError("sign-in failed");
           token = data.token;
         }
         if (!token) throw new CliError("usage: baas login --url <api-url> (--token <token> | --email <email> [--password <password>])");

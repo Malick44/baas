@@ -8,6 +8,7 @@ import { after, before, describe, it } from "node:test";
 import { runCli } from "./cli.js";
 import { Scripted, propose, query, text } from "./ai-testkit.js";
 import { BOOT, makePlatform, PG_BIN } from "./platform-testkit.js";
+import { codeFor, stepAt } from "./totp.js";
 
 const ADMIN = process.env.BAAS_TEST_PG_URL;
 
@@ -62,6 +63,15 @@ describe("cli", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     assert.equal(r.code, 0, r.err);
     assert.match(r.out, /Logged in/);
     assert.equal((await readFile(join(cfg, "config.json"), "utf8")).includes("cli-password-1"), false, "the password is not stored");
+    const sess = (await t.api("POST", "/v1/auth/login", { body: { email: "cli-member@example.com", password: "cli-password-1" } })).json.token;
+    const enr = await t.api("POST", "/v1/me/mfa/enroll", { token: sess });
+    assert.equal((await t.api("POST", "/v1/me/mfa/verify", { token: sess, body: { code: codeFor(enr.json.secret, stepAt(Date.now())) } })).status, 200);
+    const needCode = await run("login", "--url", apiUrl, "--email", "cli-member@example.com", "--password", "cli-password-1");
+    assert.equal(needCode.code, 1);
+    assert.match(needCode.err, /authenticator/);
+    assert.equal((await run("login", "--url", apiUrl, "--email", "cli-member@example.com", "--password", "cli-password-1", "--code", "000000")).code, 1);
+    const withCode = await run("login", "--url", apiUrl, "--email", "cli-member@example.com", "--password", "cli-password-1", "--code", codeFor(enr.json.secret, stepAt(Date.now()) + 1));
+    assert.equal(withCode.code, 0, withCode.err);
     assert.equal((await run("login", "--url", apiUrl, "--token", owner)).code, 0, "switch back");
   });
 

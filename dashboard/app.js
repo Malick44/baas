@@ -252,6 +252,7 @@ function appbar(project) {
       h("button", { role: "menuitem", onclick: () => { closeMenus(); location.hash = "#/projects"; } }, "All projects"),
       S.me.role !== "developer" && h("button", { role: "menuitem", id: "menu-team", onclick: () => { closeMenus(); location.hash = "#/team"; } }, "Team"),
       S.me.member && h("button", { role: "menuitem", id: "menu-password", onclick: () => { closeMenus(); passwordDialog(); } }, "Change password"),
+      S.me.member && h("button", { role: "menuitem", id: "menu-mfa", onclick: () => { closeMenus(); mfaDialog(); } }, "Two-step verification"),
       h("button", { role: "menuitem", id: "signout", onclick: logout }, "Sign out")));
   } }, initials);
   const search = h("button", { class: "searchbox", id: "open-palette", title: "Search pages (Ctrl/⌘+K)", onclick: openPalette }, icon("search", 15), h("span", null, "Search…"), h("kbd", null, "⌘K"));
@@ -402,20 +403,45 @@ function renderLogin() {
     h("label", { class: "check" }, rememberMember, "Remember on this device"),
     memberErr,
     h("button", { class: "primary", type: "submit", id: "signin-member" }, "Sign in"));
+  const forgot = h("button", { type: "button", class: "linkish", id: "forgot-password", hidden: true, onclick: () => forgotDialog(email.value) }, "Forgot password?");
+  fetch("/v1/config").then((r) => r.json()).then((c) => { forgot.hidden = !c.member_email_reset; }).catch(() => {});
+  memberForm.insertBefore(forgot, memberErr);
+  const finish = (data) => { startSession(data.token, rememberMember.checked); location.hash = "#/projects"; route(); };
   memberForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
       const res = await fetch("/v1/auth/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: email.value, password: password.value }) });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
-      startSession(data.token, rememberMember.checked);
-      location.hash = "#/projects";
-      route();
+      if (data.mfa_required) return codeStep(data.mfa_token);
+      finish(data);
     } catch (ex) {
       memberErr.hidden = false;
       memberErr.textContent = ex.message;
     }
   });
+  /** The second step: the six digits from the authenticator app, or a recovery code. */
+  function codeStep(ticket) {
+    const err2 = h("div", { class: "notice bad", hidden: true, id: "code-error" });
+    const code = h("input", { id: "login-code", name: "code", autocomplete: "one-time-code", inputmode: "text", required: true, placeholder: "123456" });
+    const f2 = h("form", { class: "stack", id: "code-form" },
+      h("h1", null, "Two-step verification"),
+      h("p", { class: "muted" }, "Enter the 6-digit code from your authenticator app, or one of your recovery codes."),
+      h("label", { class: "field" }, "Code", code), err2,
+      h("button", { class: "primary", type: "submit", id: "verify-code" }, "Verify"),
+      h("button", { type: "button", class: "linkish", onclick: () => renderLogin() }, "Back"));
+    f2.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      try {
+        const res = await fetch("/v1/auth/mfa", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mfa_token: ticket, code: code.value }) });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+        finish(data);
+      } catch (ex) { err2.hidden = false; err2.textContent = ex.message; }
+    });
+    mount(h("div", { class: "login" }, h("div", { class: "card" }, f2)));
+    code.focus();
+  }
 
   const err = h("div", { class: "notice bad", hidden: true, id: "login-error" });
   const token = h("input", { id: "token", name: "token", type: "password", autocomplete: "off", placeholder: "baas_…", required: true });
@@ -476,6 +502,80 @@ function renderInvite(token) {
   mount(h("div", { class: "login" }, h("div", { class: "card" }, form)));
 }
 
+function forgotDialog(prefill) {
+  return dialog("Reset your password", () => h("div", { class: "stack" },
+    h("p", { class: "muted" }, "Enter your account's email address. If it has an account, we send a link that lets you choose a new password."),
+    h("input", { name: "email", id: "forgot-email", type: "email", required: true, value: prefill || "", autocomplete: "username" })), {
+    confirmLabel: "Send link",
+    onSubmit: async (fd) => {
+      const res = await fetch("/v1/auth/forgot", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: fd.get("email") }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+      toast("If that address has an account, a link is on its way", "ok");
+      return true;
+    },
+  });
+}
+
+/** The page a reset email opens. The token stays in the URL fragment, which is never sent to a server. */
+function renderReset(token) {
+  const err = h("div", { class: "notice bad", hidden: true, id: "reset-error" });
+  const pw = h("input", { id: "reset-new", name: "password", type: "password", autocomplete: "new-password", required: true, minlength: 8 });
+  const again = h("input", { id: "reset-again", name: "again", type: "password", autocomplete: "new-password", required: true });
+  const form = h("form", { class: "stack", id: "reset-form" },
+    h("h1", null, "Choose a new password"),
+    h("p", { class: "muted" }, "You will be signed out everywhere and asked to sign in again."),
+    h("label", { class: "field" }, "New password", pw, h("span", { class: "muted hint" }, "At least 8 characters.")),
+    h("label", { class: "field" }, "Repeat password", again), err,
+    h("button", { class: "primary", type: "submit", id: "do-reset" }, "Set password"));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      if (pw.value !== again.value) throw new Error("The passwords do not match.");
+      const res = await fetch("/v1/auth/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token, password: pw.value }) });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `${res.status} ${res.statusText}`);
+      S.token = S.me = null;
+      localStorage.removeItem("baas.token"); sessionStorage.removeItem("baas.token");
+      location.hash = "";
+      route();
+      toast("Password changed. Sign in with the new one.", "ok");
+    } catch (ex) { err.hidden = false; err.textContent = ex.message; }
+  });
+  mount(h("div", { class: "login" }, h("div", { class: "card" }, form)));
+}
+
+/** Set up or remove the authenticator app for the signed-in member. */
+async function mfaDialog() {
+  const on = S.me.member?.mfa;
+  if (on) {
+    await dialog("Two-step verification", () => h("div", { class: "stack" },
+      h("p", null, h("span", { class: "chip healthy", id: "mfa-state" }, "On"), " Signing in needs a code from your authenticator app."),
+      h("p", { class: "muted" }, "To turn it off, confirm with your password and a current code (or a recovery code)."),
+      h("label", { class: "field" }, "Password", h("input", { name: "password", id: "mfa-off-password", type: "password", autocomplete: "current-password", required: true })),
+      h("label", { class: "field" }, "Code", h("input", { name: "code", id: "mfa-off-code", autocomplete: "one-time-code", required: true }))), {
+      confirmLabel: "Turn off", danger: true,
+      onSubmit: async (fd) => { await api("POST", "/v1/me/mfa/disable", { password: fd.get("password"), code: fd.get("code") }); toast("Two-step verification is off", "ok"); return true; },
+    });
+  } else {
+    let started = null;
+    try { started = await api("POST", "/v1/me/mfa/enroll"); } catch (ex) { toast(ex.message, "bad"); return; }
+    let codes = null;
+    const ok = await dialog("Set up two-step verification", () => h("div", { class: "stack" },
+      h("p", { class: "muted" }, "In an authenticator app (1Password, Authy, Google Authenticator…), add an account with this key, then enter the 6-digit code it shows."),
+      h("div", { class: "kv", id: "mfa-secret" }, h("span", { class: "k" }, "Key"), ...copyable(started.secret), h("span", { class: "k" }, "Link"), ...copyable(started.uri)),
+      h("label", { class: "field" }, "Code from the app", h("input", { name: "code", id: "mfa-code", autocomplete: "one-time-code", inputmode: "numeric", required: true, pattern: "[0-9]{6}", placeholder: "123456" }))), {
+      confirmLabel: "Turn on",
+      onSubmit: async (fd) => { codes = (await api("POST", "/v1/me/mfa/verify", { code: fd.get("code") })).recovery_codes; return true; },
+    });
+    if (!ok) return;
+    await dialog("Save your recovery codes", () => h("div", { class: "stack" },
+      h("p", null, "Each code works once if you lose your device. They are shown only now: store them somewhere safe."),
+      h("pre", { id: "recovery-codes" }, codes.join("\n")),
+      h("button", { type: "button", onclick: async () => { await navigator.clipboard?.writeText(codes.join("\n")).catch(() => {}); toast("Copied"); } }, "Copy codes")), { confirmLabel: "I have saved them" });
+  }
+  S.me = await api("GET", "/v1/me");
+}
+
 function passwordDialog() {
   return dialog("Change password", () => h("div", { class: "stack" },
     h("label", { class: "field" }, "Current password", h("input", { name: "current", id: "pw-current", type: "password", autocomplete: "current-password", required: true })),
@@ -512,10 +612,14 @@ async function renderTeam() {
       h("tbody", null, members.map((m) => {
         const you = m.id === S.me.member?.id;
         const above = ranks.indexOf(m.role) > mine;
-        return h("tr", { "data-member": m.email }, h("td", null, m.name ? [h("div", null, m.name), h("div", { class: "muted" }, m.email)] : m.email, you && h("span", { class: "chip" }, "you")),
+        return h("tr", { "data-member": m.email }, h("td", null, m.name ? [h("div", null, m.name), h("div", { class: "muted" }, m.email)] : m.email, you && h("span", { class: "chip" }, "you"), m.mfa && h("span", { class: "chip healthy", "data-mfa": "on", title: "Signs in with an authenticator" }, "2-step")),
           h("td", null, m.role), h("td", { class: "muted" }, new Date(m.created_at).toLocaleDateString()),
           h("td", { class: "right" }, rowMenu([
             ["Change role", () => roleDialog(m, draw), { action: "member-role", disabled: above, why: above ? "You cannot change someone with a higher role" : "" }],
+            ...(m.mfa && !above && S.me.role === "owner" && !you ? [["Remove authenticator", async () => {
+              if (!(await confirmBox("Remove authenticator", `Remove ${m.email}'s second factor? Use this when they lost their device and recovery codes. Anyone with their password can then sign in without a code.`, { confirmLabel: "Remove authenticator" }))) return;
+              try { await api("DELETE", `/v1/members/${m.id}/mfa`); toast("Authenticator removed", "ok"); draw(); } catch (ex) { toast(ex.message, "bad"); }
+            }, { danger: true, action: "member-remove-mfa" }]] : []),
             ["Set new password", () => resetDialog(m), { action: "member-password", disabled: S.me.role !== "owner" || you, why: S.me.role !== "owner" ? "Only owners can set another member's password" : "" }],
             [you ? "Leave organisation" : "Remove from organisation", async () => {
               if (!(await confirmBox(you ? "Leave organisation" : "Remove member", you ? "You will be signed out." : `Remove ${m.email}? They are signed out everywhere and can only return by invitation.`, { confirmLabel: you ? "Leave" : "Remove" }))) return;
@@ -2792,6 +2896,8 @@ async function route() {
   if (RT) { RT.close(); RT = null; }
   const inv = /^#\/invite\/(baasinv_[A-Za-z0-9_-]+)$/.exec(location.hash);
   if (inv) return renderInvite(inv[1]);
+  const rst = /^#\/reset\/(baasrst_[A-Za-z0-9_-]+)$/.exec(location.hash);
+  if (rst) return renderReset(rst[1]);
   if (!S.token) {
     S.token = localStorage.getItem("baas.token") || sessionStorage.getItem("baas.token");
     if (S.token) { try { S.me = await api("GET", "/v1/me"); } catch { S.token = null; } }

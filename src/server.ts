@@ -26,6 +26,7 @@ const platform = await createPlatform({
   // Email for confirmation, password reset and magic links is offered only when the operator provides an SMTP server.
   mail: process.env.SMTP_URL ? { smtpUrl: process.env.SMTP_URL, from: process.env.MAIL_FROM } : undefined,
   dashboardHost: process.env.BAAS_DASHBOARD_HOST || undefined,
+  dashboardUrl: process.env.BAAS_DASHBOARD_URL || undefined,
   // Where the dashboard is opened from; these origins are always allowed by a project's CORS list. Add more with BAAS_DASHBOARD_ORIGINS (comma separated).
   dashboardOrigins: [`http://localhost:${process.env.PORT ?? 8080}`, `http://127.0.0.1:${process.env.PORT ?? 8080}`, ...(process.env.BAAS_DASHBOARD_ORIGINS ?? "").split(",").map((x) => x.trim()).filter(Boolean)],
   // Edge functions may not reach private or local addresses unless the operator opens it up or lists exceptions (host:port, comma separated).

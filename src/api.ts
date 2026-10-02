@@ -13,7 +13,9 @@ import { DEFAULT_TEMPLATES } from "./mailer.js";
 import { Members } from "./members.js";
 import { PROVIDERS } from "./oauth.js";
 import { PLANS, planOf } from "./plans.js";
+import type { Mailer } from "./mailer.js";
 import type { UsageService } from "./usage.js";
+import type { Vault } from "./vault.js";
 
 /** Optional platform services the management API exposes. Each route group is mounted only if its service is given. */
 export type ApiOps = {
@@ -29,6 +31,12 @@ export type ApiOps = {
   gateway?: { domain: string; scheme: string; port: number | null };
   /** Hostname the dashboard is served on behind a proxy; certificates may be issued for it too. */
   dashboardHost?: string;
+  /** For sealing authenticator secrets. */
+  vault?: Vault;
+  /** Sends members' password reset emails. */
+  mailer?: Mailer;
+  /** Public address of the dashboard, for links in emails (for example https://baas.example.com). */
+  dashboardUrl?: string;
   /** Directory holding the dashboard's static files. */
   dashboardDir?: string;
 };
@@ -62,7 +70,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     return reply.code(500).send({ error: "internal error" });
   });
 
-  const members = new Members(control);
+  const members = new Members(control, { vault: ops.vault, mailer: ops.mailer, dashboardUrl: ops.dashboardUrl });
 
   const bearer = (req: FastifyRequest) => /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
 
@@ -89,6 +97,30 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
   app.post("/v1/auth/login", async (req) => {
     const b = body(req);
     return members.login(b.email, b.password);
+  });
+  app.post("/v1/auth/mfa", async (req) => {
+    const b = body(req);
+    return members.loginMfa(b.mfa_token, b.code);
+  });
+  app.post("/v1/auth/forgot", async (req, reply) => {
+    await members.forgotPassword(body(req).email);
+    return reply.code(202).send({});
+  });
+  app.post("/v1/auth/reset", async (req, reply) => {
+    const b = body(req);
+    await members.resetWithToken(b.token, b.password);
+    return reply.code(204).send();
+  });
+  app.post("/v1/me/mfa/enroll", async (req) => members.mfaEnroll(await principal(req)));
+  app.post("/v1/me/mfa/verify", async (req) => members.mfaVerify(await principal(req), body(req).code));
+  app.post("/v1/me/mfa/disable", async (req, reply) => {
+    const b = body(req);
+    await members.mfaDisable(await principal(req), b.password, b.code);
+    return reply.code(204).send();
+  });
+  app.delete<{ Params: { id: string } }>("/v1/members/:id/mfa", async (req, reply) => {
+    await members.removeMfaFor(await principal(req), req.params.id);
+    return reply.code(204).send();
   });
   app.post("/v1/auth/logout", async (req, reply) => {
     await members.logout(await principal(req));
@@ -121,7 +153,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     return reply.code(204).send();
   });
   app.post<{ Params: { id: string } }>("/v1/members/:id/password", async (req, reply) => {
-    await members.resetPassword(await principal(req), req.params.id, body(req).password);
+    await members.setPasswordFor(await principal(req), req.params.id, body(req).password);
     return reply.code(204).send();
   });
 
@@ -328,7 +360,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
   }
 
   // ---- dashboard ----
-  app.get("/v1/config", async () => ({ gateway: ops.gateway ?? null }));
+  app.get("/v1/config", async () => ({ gateway: ops.gateway ?? null, member_email_reset: members.emailResetAvailable }));
   if (ops.dashboardDir) {
     const dir = ops.dashboardDir;
     const types: Record<string, string> = { "index.html": "text/html; charset=utf-8", "app.js": "text/javascript; charset=utf-8", "style.css": "text/css; charset=utf-8" };

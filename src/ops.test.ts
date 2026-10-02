@@ -395,7 +395,7 @@ describe("platform ops", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
       for (const f of ["..%2Fpackage.json", "%2e%2e%2f%2e%2e%2fetc%2fpasswd", "secrets.txt", "index.html%00"]) assert.equal((await t.api("GET", `/dashboard/${f}`)).status, 404, f);
     });
     it("tells clients where the data plane lives", async () => {
-      assert.deepEqual((await t.api("GET", "/v1/config")).json, { gateway: { domain: "localhost", scheme: "http", port: 8081 } });
+      assert.deepEqual((await t.api("GET", "/v1/config")).json, { gateway: { domain: "localhost", scheme: "http", port: 8081 }, member_email_reset: false });
     });
   });
 

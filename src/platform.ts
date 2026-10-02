@@ -39,6 +39,8 @@ export type PlatformConfig = {
   dashboardDir?: string;
   /** Hostname the dashboard is served on behind a TLS proxy (for certificate checks). */
   dashboardHost?: string;
+  /** Full address of the dashboard for links in emails (overrides one derived from dashboardHost or dashboardOrigins). */
+  dashboardUrl?: string;
   /** Origins the dashboard runs on. Always allowed by the data plane's CORS, so restricting a project's cors_origins cannot lock the dashboard out. */
   dashboardOrigins?: string[];
   realtimeCheckMs?: number;
@@ -86,8 +88,9 @@ export async function createPlatform(cfg: PlatformConfig) {
   const usage = new UsageService(control, cfg.pgAdminUrl, storage);
   const publicUrl = (ref: string) => `${cfg.publicScheme}://${ref}.${cfg.gatewayDomain}${cfg.publicPort ? `:${cfg.publicPort}` : ""}`;
   const functions = new FunctionService(control, { publicUrl, ...cfg.functions });
+  const mailer = mailerFrom(cfg.mail);
   const auth = new AuthService(pm, {
-    adminUrl: cfg.pgAdminUrl, vault, mailer: mailerFrom(cfg.mail), publicUrl, secureCookies: cfg.publicScheme === "https",
+    adminUrl: cfg.pgAdminUrl, vault, mailer, publicUrl, secureCookies: cfg.publicScheme === "https",
     log: (m) => console.error(`[auth] ${m}`), ...cfg.auth,
   });
   const realtime = new RealtimeHub(pm, cfg.pgAdminUrl, { checkMs: cfg.realtimeCheckMs });
@@ -103,7 +106,8 @@ export async function createPlatform(cfg: PlatformConfig) {
     alwaysAllow: [...(cfg.dashboardOrigins ?? []), ...(cfg.dashboardHost ? [`https://${cfg.dashboardHost}`] : [])],
   });
   const api: FastifyInstance = buildApi(control, cfg.bootstrapToken, {
-    admin, usage, backups, functions, ai, pipelines, extensions, auth,
+    admin, usage, backups, functions, ai, pipelines, extensions, auth, vault, mailer,
+    dashboardUrl: cfg.dashboardUrl ?? (cfg.dashboardHost ? `https://${cfg.dashboardHost}` : cfg.dashboardOrigins?.[0]),
     gateway: { domain: cfg.gatewayDomain, scheme: cfg.publicScheme, port: cfg.publicPort },
     dashboardDir: cfg.dashboardDir ?? defaultDashboardDir, dashboardHost: cfg.dashboardHost,
   });
