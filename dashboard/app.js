@@ -2199,10 +2199,16 @@ async function authUsers(body, p, cfg) {
               mail.push(["Send magic link", () => mailTo("/auth/v1/magiclink", u.email, `Sign-in link sent to ${u.email}`), { action: "send-magic" }]);
               if (unconfirmed) mail.push(["Resend confirmation email", () => mailTo("/auth/v1/resend", u.email, `Confirmation email sent to ${u.email}`), { action: "resend-confirm" }]);
             }
+            const verified = (u.factors || []).filter((f) => f.status === "verified");
+            if (verified.length) mail.push(["Remove authenticator (MFA)", async () => {
+              if (!(await confirmBox("Remove authenticator", `Remove the second factor from ${u.email}? Use this when they lost their device. Their sessions that used it end, and anyone with their password can then sign in without a code.`, { confirmLabel: "Remove authenticator" }))) return;
+              try { await gw(`/auth/v1/admin/users/${u.id}/factors`, { method: "DELETE" }); toast("Authenticator removed", "ok"); ({ users, total } = await load()); draw(); } catch (ex) { toast(ex.message, "bad"); }
+            }, { danger: true, action: "remove-mfa" }]);
             if (unconfirmed) mail.push(["Mark email as confirmed", async () => { try { await gw(`/auth/v1/admin/users/${u.id}`, { method: "PUT", body: { email_confirm: true } }); toast("Email confirmed", "ok"); ({ users, total } = await load()); draw(); } catch (ex) { toast(ex.message, "bad"); } }, { action: "confirm-email" }]);
             return h("tr", { "data-email": u.email },
               h("td", null, u.email), h("td", { class: "mono" }, u.id), h("td", null, fmtDate(u.created_at)), h("td", null, fmtDate(u.last_sign_in_at)),
-              h("td", null, banned ? h("span", { class: "bad" }, "banned") : unconfirmed ? h("span", { class: "warn", "data-status": "unconfirmed", title: "Has not confirmed the email address" }, "unconfirmed") : "active"),
+              h("td", null, banned ? h("span", { class: "bad" }, "banned") : unconfirmed ? h("span", { class: "warn", "data-status": "unconfirmed", title: "Has not confirmed the email address" }, "unconfirmed") : "active",
+                (u.factors || []).some((f) => f.status === "verified") ? h("span", { class: "chip healthy", "data-mfa": "on", title: "Has an authenticator app set up" }, "MFA") : null),
               h("td", { class: "row" },
                 h("button", { class: "small", onclick: async () => { await gw(`/auth/v1/admin/users/${u.id}`, { method: "PUT", body: { ban_duration: banned ? "none" : "876000h" } }); toast(banned ? "User unbanned" : "User banned", "ok"); ({ users, total } = await load()); draw(); } }, banned ? "Unban" : "Ban"),
                 h("button", { class: "small danger", "data-action": "delete-user", onclick: async () => { if (await confirmBox("Delete user", `Delete ${u.email}? Their sessions end immediately.`, { confirmLabel: "Delete" })) { await gw(`/auth/v1/admin/users/${u.id}`, { method: "DELETE" }); toast("User deleted", "ok"); ({ users, total } = await load()); draw(); } } }, "Delete"),

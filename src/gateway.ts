@@ -215,11 +215,25 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
     if (grant === "refresh_token") return A.refresh(ctx.ref, ctx.project, jsonBody(req));
     throw new AuthError(400, "unsupported_grant_type", "grant_type must be password or refresh_token");
   });
-  authRoute("GET", "/user", (ctx) => A.me(ctx.ref, ctx.who.claims));
+  authRoute("GET", "/user", (ctx) => A.me(ctx.ref, ctx.project, ctx.who.claims));
   authRoute("PUT", "/user", (ctx, req) => A.updateMe(ctx.ref, ctx.project, ctx.who.claims, jsonBody(req)));
   authRoute("POST", "/logout", async (ctx) => {
     await A.logout(ctx.ref, ctx.who.claims);
   }, { status: 204 });
+  // Multi-factor authentication: enrol an authenticator app, then answer a challenge with its code to upgrade the session to aal2.
+  authRoute("POST", "/factors", (ctx, req) => A.mfaEnroll(ctx.ref, ctx.project, ctx.who.claims, jsonBody(req)), { status: 200 });
+  app.route({
+    method: ["POST", "DELETE"], url: "/auth/v1/factors/:id/:action",
+    handler: async (req, reply) =>
+      withCtx(req, reply, async (ctx) => {
+        const { id, action } = req.params as { id: string; action: string };
+        if (req.method === "POST" && action === "challenge") return reply.send(await A.mfaChallenge(ctx.ref, ctx.project, ctx.who.claims, id));
+        if (req.method === "POST" && action === "verify") return reply.send(await A.mfaVerify(ctx.ref, ctx.project, ctx.who.claims, id, jsonBody(req)));
+        throw new HttpError(404, "not found");
+      }),
+  });
+  app.delete("/auth/v1/factors/:id", (req, reply) =>
+    withCtx(req, reply, async (ctx) => reply.send(await A.mfaUnenroll(ctx.ref, ctx.project, ctx.who.claims, (req.params as { id: string }).id))));
   authRoute("POST", "/recover", (ctx, req) => A.recover(ctx.ref, ctx.project, jsonBody(req), redirectParam(req)));
   authRoute("POST", "/magiclink", (ctx, req) => A.magicLink(ctx.ref, ctx.project, jsonBody(req), redirectParam(req)));
   authRoute("POST", "/otp", (ctx, req) => A.magicLink(ctx.ref, ctx.project, jsonBody(req), redirectParam(req)));
@@ -286,9 +300,22 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
     }, { anonymous: true }));
   authRoute("GET", "/admin/users", (ctx, req) => {
     const q = req.query as Record<string, string>;
-    return A.adminList(ctx.ref, Math.max(1, Number(q.page) || 1), Math.min(200, Math.max(1, Number(q.per_page) || 50)));
+    return A.adminList(ctx.ref, ctx.project, Math.max(1, Number(q.page) || 1), Math.min(200, Math.max(1, Number(q.per_page) || 50)));
   }, { serviceOnly: true });
   authRoute("POST", "/admin/users", (ctx, req) => A.adminCreate(ctx.ref, jsonBody(req)), { serviceOnly: true, status: 201 });
+  app.delete("/auth/v1/admin/users/:id/factors", (req, reply) =>
+    withCtx(req, reply, async (ctx) => {
+      if (ctx.who.role !== "service_role") throw new AuthError(403, "not_admin", "User not allowed");
+      await A.adminRemoveFactors(ctx.ref, ctx.project, (req.params as { id: string }).id);
+      return reply.code(204).send();
+    }));
+  app.delete("/auth/v1/admin/users/:id/factors/:fid", (req, reply) =>
+    withCtx(req, reply, async (ctx) => {
+      if (ctx.who.role !== "service_role") throw new AuthError(403, "not_admin", "User not allowed");
+      const p = req.params as { id: string; fid: string };
+      await A.adminRemoveFactors(ctx.ref, ctx.project, p.id, p.fid);
+      return reply.code(204).send();
+    }));
   app.route({
     method: ["GET", "PUT", "DELETE"], url: "/auth/v1/admin/users/:id",
     handler: async (req, reply) =>

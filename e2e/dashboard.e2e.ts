@@ -1303,6 +1303,30 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     assert.equal((await t.api("GET", `/v1/projects/${ref}/settings`, { token: owner })).json.email_templates.recovery.subject, "");
   });
 
+  step("shows who has an authenticator and removes a lost one", async () => {
+    const { codeFor, stepAt } = await import("../src/totp.js");
+    const email = "mfa-user@example.com";
+    const su = await (await rest("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email, password: "secret123" }) })).json();
+    const call = async (path: string, token: string, body: unknown = {}) => (await rest(path, { method: "POST", body: JSON.stringify(body), headers: { authorization: `Bearer ${token}` } })).json();
+    const factor = await call("/auth/v1/factors", su.access_token);
+    const challenge = await call(`/auth/v1/factors/${factor.id}/challenge`, su.access_token);
+    const upgraded = await call(`/auth/v1/factors/${factor.id}/verify`, su.access_token, { challenge_id: challenge.id, code: codeFor(factor.totp.secret, stepAt(Date.now())) });
+    assert.ok(upgraded.access_token);
+
+    await tab("auth", "users");
+    await page.waitForSelector(`#users tr[data-email='${email}'] [data-mfa=on]`);
+    assert.equal(await page.locator("#users [data-mfa=on]").count(), 1, "only the user who set one up");
+    await shot("07-users-mfa");
+    await page.locator(`#users tr[data-email='${email}'] button[aria-label='Row actions']`).click();
+    await page.click(".menu [data-action=remove-mfa]");
+    assert.match((await page.textContent("dialog"))!, /lost their device/);
+    await page.click("dialog button[type=submit]");
+    await toast("Authenticator removed");
+    await page.waitForFunction((e) => !document.querySelector(`#users tr[data-email='${e}'] [data-mfa=on]`), email);
+    assert.equal((await rest("/auth/v1/token?grant_type=refresh_token", { method: "POST", body: JSON.stringify({ refresh_token: upgraded.refresh_token }) })).status, 400, "the upgraded session ended");
+    await t.sql(owner, ref, `delete from auth.users where email = '${email}'`);
+  });
+
   step("keeps toasts tidy: repeats count up, at most three show, and a click dismisses", async () => {
     await tab("auth", "sessions");
     const save = async (fill: () => Promise<void>) => { await fill(); await page.click("#save-settings"); };

@@ -32,7 +32,26 @@ CREATE TABLE IF NOT EXISTS auth.identities (
   UNIQUE (provider, provider_id)
 );
 CREATE INDEX IF NOT EXISTS identities_user ON auth.identities (user_id);
-GRANT ALL ON auth.one_time_tokens, auth.identities TO service_role;
+CREATE TABLE IF NOT EXISTS auth.mfa_factors (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users ON DELETE CASCADE,
+  factor_type text NOT NULL CHECK (factor_type = 'totp'),
+  friendly_name text,
+  status text NOT NULL DEFAULT 'unverified' CHECK (status IN ('unverified', 'verified')),
+  secret_enc text NOT NULL,
+  last_used_step bigint NOT NULL DEFAULT -1,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS mfa_factors_user ON auth.mfa_factors (user_id);
+CREATE TABLE IF NOT EXISTS auth.mfa_challenges (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  factor_id uuid NOT NULL REFERENCES auth.mfa_factors ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  verified_at timestamptz
+);
+ALTER TABLE auth.refresh_tokens ADD COLUMN IF NOT EXISTS aal text NOT NULL DEFAULT 'aal1';
+GRANT ALL ON auth.one_time_tokens, auth.identities, auth.mfa_factors, auth.mfa_challenges TO service_role;
 `;
 
 export const PROJECT_SCHEMA_SQL = `

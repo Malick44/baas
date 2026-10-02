@@ -177,6 +177,51 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
       setSession({ ...session, user: body }, "USER_UPDATED");
       return { data: { user: body }, error: null, status: res.status };
     },
+    /** Authenticator-app sign-in. A password gives an aal1 session; answering a challenge upgrades it to aal2, which policies can require. */
+    mfa: {
+      async enroll(c: { factorType?: "totp"; friendlyName?: string; issuer?: string } = {}): Promise<Result<{ id: string; type: "totp"; friendly_name: string | null; totp: { secret: string; uri: string } }>> {
+        if (!session) return { data: null, error: { message: "Auth session missing" }, status: 401 };
+        const { res, body } = await authCall("/factors", { method: "POST", body: JSON.stringify({ factor_type: c.factorType ?? "totp", friendly_name: c.friendlyName, issuer: c.issuer }), headers: { authorization: `Bearer ${await token()}` } });
+        return res.ok ? { data: body, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not enrol"), status: res.status };
+      },
+      async challenge(c: { factorId: string }): Promise<Result<{ id: string; expires_at: number }>> {
+        if (!session) return { data: null, error: { message: "Auth session missing" }, status: 401 };
+        const { res, body } = await authCall(`/factors/${encodeURIComponent(c.factorId)}/challenge`, { method: "POST", headers: { authorization: `Bearer ${await token()}` } });
+        return res.ok ? { data: body, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not create a challenge"), status: res.status };
+      },
+      async verify(c: { factorId: string; challengeId: string; code: string }): Promise<Result<Session>> {
+        if (!session) return { data: null, error: { message: "Auth session missing" }, status: 401 };
+        const { res, body } = await authCall(`/factors/${encodeURIComponent(c.factorId)}/verify`, { method: "POST", body: JSON.stringify({ challenge_id: c.challengeId, code: c.code }), headers: { authorization: `Bearer ${await token()}` } });
+        if (!res.ok) return { data: null, error: err(res.status, body, "verification failed"), status: res.status };
+        setSession(body as Session, "SIGNED_IN");
+        return { data: body as Session, error: null, status: res.status };
+      },
+      /** Challenge and verify in one call, for the usual "enter your code" screen. */
+      async challengeAndVerify(c: { factorId: string; code: string }): Promise<Result<Session>> {
+        const ch = await auth.mfa.challenge({ factorId: c.factorId });
+        if (ch.error) return { data: null, error: ch.error, status: ch.status };
+        return auth.mfa.verify({ factorId: c.factorId, challengeId: ch.data!.id, code: c.code });
+      },
+      async unenroll(c: { factorId: string }): Promise<Result<{ id: string }>> {
+        if (!session) return { data: null, error: { message: "Auth session missing" }, status: 401 };
+        const { res, body } = await authCall(`/factors/${encodeURIComponent(c.factorId)}`, { method: "DELETE", headers: { authorization: `Bearer ${await token()}` } });
+        return res.ok ? { data: body, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not remove the factor"), status: res.status };
+      },
+      async listFactors(): Promise<Result<{ totp: Array<{ id: string; friendly_name: string | null; status: string }>; all: Array<{ id: string; friendly_name: string | null; status: string }> }>> {
+        const u = await auth.getUser();
+        if (u.error) return { data: null, error: u.error, status: u.status };
+        const all = ((u.data!.user.factors as Array<{ id: string; friendly_name: string | null; status: string }> | undefined) ?? []).filter((f) => f.status === "verified");
+        return { data: { totp: all, all }, error: null, status: 200 };
+      },
+      /** Where this session is, and where it would be after answering a challenge. */
+      async getAuthenticatorAssuranceLevel(): Promise<Result<{ currentLevel: "aal1" | "aal2" | null; nextLevel: "aal1" | "aal2" | null }>> {
+        if (!session) return { data: { currentLevel: null, nextLevel: null }, error: null, status: 200 };
+        let current: "aal1" | "aal2" = "aal1";
+        try { current = JSON.parse(atob(session.access_token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"))).aal === "aal2" ? "aal2" : "aal1"; } catch { /* treat as aal1 */ }
+        const f = await auth.mfa.listFactors();
+        return { data: { currentLevel: current, nextLevel: f.data && f.data.all.length ? "aal2" : current }, error: null, status: 200 };
+      },
+    },
     async signOut(): Promise<{ error: ApiError | null }> {
       if (session) await authCall("/logout", { method: "POST", headers: { authorization: `Bearer ${session.access_token}` } }).catch(() => {});
       setSession(null, "SIGNED_OUT");

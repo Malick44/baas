@@ -268,6 +268,27 @@ describe("client sdk: email and provider sign-in", { skip: !ADMIN && "set BAAS_T
     await c.auth.signOut();
   });
 
+  it("enrols an authenticator and upgrades the session with a code", async () => {
+    const { codeFor, stepAt } = await import("./totp.js");
+    assert.equal((await c.auth.signUp({ email: "mfa-sdk@example.com", password: "password-123" })).error, null);
+    // (signed up before confirmation was required for this project? the earlier tests in this suite confirm by email, so confirm directly)
+    await t.sql(owner, ref, "update auth.users set email_confirmed_at = now() where email = 'mfa-sdk@example.com'");
+    assert.equal((await c.auth.signInWithPassword({ email: "mfa-sdk@example.com", password: "password-123" })).error, null);
+    assert.deepEqual((await c.auth.mfa.getAuthenticatorAssuranceLevel()).data, { currentLevel: "aal1", nextLevel: "aal1" });
+    const e = await c.auth.mfa.enroll({ friendlyName: "phone" });
+    assert.equal(e.error, null, JSON.stringify(e.error));
+    assert.deepEqual((await c.auth.mfa.listFactors()).data!.all, [], "not counted until verified");
+    const bad = await c.auth.mfa.challengeAndVerify({ factorId: e.data!.id, code: "000000" === codeFor(e.data!.totp.secret, stepAt(Date.now())) ? "111111" : "000000" });
+    assert.equal(bad.error!.code, "mfa_verification_failed");
+    const ok = await c.auth.mfa.challengeAndVerify({ factorId: e.data!.id, code: codeFor(e.data!.totp.secret, stepAt(Date.now())) });
+    assert.equal(ok.error, null, JSON.stringify(ok.error));
+    assert.deepEqual((await c.auth.mfa.getAuthenticatorAssuranceLevel()).data, { currentLevel: "aal2", nextLevel: "aal2" });
+    assert.equal((await c.auth.mfa.listFactors()).data!.all.length, 1);
+    assert.equal((await c.auth.mfa.unenroll({ factorId: e.data!.id })).error, null);
+    assert.equal((await c.auth.mfa.listFactors()).data!.all.length, 0);
+    await c.auth.signOut();
+  });
+
   it("builds the provider address and reads a failure from the URL", async () => {
     const r = await c.auth.signInWithOAuth({ provider: "github", options: { redirectTo: "https://app.example.com/cb", skipBrowserRedirect: true } });
     assert.equal(r.data!.url, `http://${ref}.localhost:${gwPort}/auth/v1/authorize?provider=github&redirect_to=${encodeURIComponent("https://app.example.com/cb")}`);
