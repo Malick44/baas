@@ -2593,6 +2593,7 @@ async function authUrls(body, p, cfg, canEdit) {
   const rpId = h("input", { id: "auth-rp-id", placeholder: "app.example.com (default: the site URL's host)", value: w.rp_id || "", autocomplete: "off", disabled: !canEdit });
   const rpOrigins = h("textarea", { id: "auth-rp-origins", class: "code", rows: 3, placeholder: "https://app.example.com (default: the site URL's origin)", disabled: !canEdit, spellcheck: "false" }, (w.origins || []).join("\n"));
   const needUv = h("input", { type: "checkbox", id: "auth-rp-uv", checked: w.require_user_verification === true, disabled: !canEdit });
+  const passwordless = h("input", { type: "checkbox", id: "auth-rp-passwordless", checked: w.passwordless === true, disabled: !canEdit });
   clear(body);
   body.append(h("div", { class: "stack" }, h("div", { class: "page-head" }, h("h1", null, "URL configuration")),
     h("p", { class: "muted pagehint" }, "Where emailed links and provider sign-ins may send people back to. Anything else is refused, so a link cannot be pointed at someone else's site."),
@@ -2606,13 +2607,14 @@ async function authUrls(body, p, cfg, canEdit) {
       formRow("Relying party ID", rpId, "A domain your app's pages are on, without scheme or port. Passkeys only work on that domain and its subdomains."),
       formRow("Allowed origins", rpOrigins, "One origin per line, exactly as the browser shows it (https://app.example.com; plain http only for localhost)."),
       formRow("Verification", h("label", { class: "check" }, needUv, "Require a PIN or biometric, not just a touch")),
+      formRow("Passwordless", h("label", { class: "check" }, passwordless, "Let people sign in and sign up with a passkey alone"), "Adds sign-in without a password or code (the browser offers the passkeys it holds for this site) and sign-up with nothing but a passkey. Always needs a PIN or biometric. New passkeys are then made discoverable. Needs the site URL or relying party above."),
       h("div", { class: "row" }, h("button", { class: "primary", id: "save-urls", disabled: !canEdit, onclick: async () => {
         try {
           const lines = list.value.split("\n").map((x) => x.trim()).filter(Boolean);
           const patch = { redirect_urls: lines, cors_origins: cors.value.split("\n").map((x) => x.trim()).filter(Boolean) };
           if (site.value.trim()) patch.site_url = site.value.trim();
           const origins = rpOrigins.value.split("\n").map((x) => x.trim()).filter(Boolean);
-          patch.webauthn = { ...(rpId.value.trim() ? { rp_id: rpId.value.trim() } : {}), ...(origins.length ? { origins } : {}), ...(needUv.checked ? { require_user_verification: true } : {}) };
+          patch.webauthn = { ...(rpId.value.trim() ? { rp_id: rpId.value.trim() } : {}), ...(origins.length ? { origins } : {}), ...(needUv.checked ? { require_user_verification: true } : {}), ...(passwordless.checked ? { passwordless: true } : {}) };
           await saveAuthSettings(p, patch);
           toast("URL configuration saved", "ok");
         } catch (ex) { toast(ex.message, "bad"); }

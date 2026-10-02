@@ -66,7 +66,7 @@ const SETTINGS_KEYS = {
     isObj(v) && Object.entries(v).every(([f, t]) =>
       (f === "rp_id" && typeof t === "string" && /^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$/.test(t) && !/^\d+(\.\d+){3}$/.test(t)) ||
       (f === "rp_name" && typeof t === "string" && t.length >= 1 && t.length <= 60 && !/[\r\n<>]/.test(t)) ||
-      (f === "require_user_verification" && typeof t === "boolean") ||
+      (f === "require_user_verification" && typeof t === "boolean") || (f === "passwordless" && typeof t === "boolean") ||
       (f === "origins" && Array.isArray(t) && t.length <= 20 && t.every((o) => typeof o === "string" && isOrigin(o)))),
   sms_template: (v: unknown) => typeof v === "string" && v.length <= 160 && v.includes("{{ .Token }}") && !/[\r\n]/.test(v),
   site_url: (v: unknown) => typeof v === "string" && /^https?:\/\//.test(v),

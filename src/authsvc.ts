@@ -198,6 +198,7 @@ export class AuthService {
     const custom = (project.settings.oidc_providers ?? {}) as Record<string, { enabled?: boolean; client_id?: string; secret_enc?: string; issuer?: string }>;
     for (const [name, c] of Object.entries(custom)) external[name] = c?.enabled === true && !!c.client_id && !!c.secret_enc && !!c.issuer && !!this.opts.vault;
     external.phone = this.sms.configured;
+    external.passkey = this.passkeyReady(project);
     return { external, disable_signup: project.settings.disable_signup === true, mailer_autoconfirm: !this.confirmRequired(project), email_delivery: this.mailer.configured, password_min_length: this.minPassword(project) };
   }
 
@@ -451,7 +452,7 @@ export class AuthService {
         rp: { id: rp.id, name: rp.name },
         user: { id: Buffer.from(u.id.replace(/-/g, ""), "hex").toString("base64url"), name: u.email ?? u.phone ?? u.id, displayName: u.email ?? u.phone ?? u.id },
         challenge, pubKeyCredParams: ALGS.map((alg) => ({ type: "public-key", alg })), timeout: 300_000, attestation: "none",
-        authenticatorSelection: { residentKey: "preferred", userVerification: uv },
+        authenticatorSelection: { residentKey: this.passwordless(project) ? "required" : "preferred", userVerification: uv },
         excludeCredentials: have.map((h) => ({ type: "public-key", id: h.credential_id })),
       } } } };
     }
@@ -507,6 +508,122 @@ export class AuthService {
     const sessionId = typeof claims.session_id === "string" && /^[0-9a-f-]{36}$/.test(claims.session_id) ? claims.session_id : randomUUID();
     await this.db(ref, (c) => c.query(`UPDATE auth.refresh_tokens SET revoked = true WHERE session_id = $1`, [sessionId]));
     return this.session(ref, project, u, sessionId, "aal2");
+  }
+
+  // ---- passkeys as the only way in (no password, no code) ----
+
+  private passwordless(project: Resolved) {
+    return ((project.settings.webauthn ?? {}) as { passwordless?: boolean }).passwordless === true;
+  }
+
+  private passkeyReady(project: Resolved) {
+    if (!this.passwordless(project)) return false;
+    try { this.webauthnRp(project); return true; } catch { return false; }
+  }
+
+  private requirePasskeys(project: Resolved) {
+    if (!this.passwordless(project)) throw new AuthError(422, "passkey_signin_disabled", "Signing in with a passkey is not turned on for this project (webauthn.passwordless)");
+    return this.webauthnRp(project);
+  }
+
+  /**
+   * Start a passkey sign-in or sign-up with nobody signed in. Sign-in asks for any discoverable passkey for this site; sign-up
+   * reserves the new account's id and asks the browser to make one. The person is always verified (PIN, fingerprint, face): a
+   * passkey on its own replaces a password, so it has to be worth one.
+   */
+  async passkeyOptions(ref: string, project: Resolved, body: Record<string, unknown>) {
+    const rp = this.requirePasskeys(project);
+    await this.ensure(ref, project);
+    const purpose = body.purpose === undefined ? "signin" : body.purpose;
+    if (purpose !== "signin" && purpose !== "signup") throw new AuthError(422, "validation_failed", "purpose must be signin or signup");
+    let name: string | null = null;
+    let meta: object = {};
+    if (purpose === "signup") {
+      if (project.settings.disable_signup === true) throw new AuthError(422, "signup_disabled", "Signups not allowed for this instance");
+      if (body.friendly_name !== undefined && body.friendly_name !== null) {
+        if (typeof body.friendly_name !== "string" || !body.friendly_name.trim() || body.friendly_name.length > 60) throw new AuthError(422, "validation_failed", "friendly_name must be 1-60 characters");
+        name = body.friendly_name.trim();
+      }
+      if (body.data !== undefined && body.data !== null) {
+        if (typeof body.data !== "object" || Array.isArray(body.data) || JSON.stringify(body.data).length > 10_000) throw new AuthError(422, "validation_failed", "data must be an object under 10 kB");
+        meta = body.data;
+      }
+    }
+    const userId = purpose === "signup" ? randomUUID() : null;
+    const challenge = newChallenge();
+    const row = await this.db(ref, async (c) => {
+      await c.query(`DELETE FROM auth.passkey_challenges WHERE created_at < now() - interval '1 hour'`);
+      // Nobody is signed in, so anyone can ask: keep the table from being filled.
+      if (Number((await c.query(`SELECT count(*)::int AS n FROM auth.passkey_challenges`)).rows[0].n) >= 5000) throw new AuthError(429, "over_request_rate_limit", "Too many passkey requests, try again in a few minutes");
+      return (await c.query<{ id: string; created_at: Date }>(
+        `INSERT INTO auth.passkey_challenges (challenge, purpose, user_id, friendly_name, user_meta) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
+        [challenge, purpose, userId, name, JSON.stringify(meta)])).rows[0]!;
+    });
+    const expires_at = Math.floor(row.created_at.getTime() / 1000) + 300;
+    if (purpose === "signin") return { id: row.id, purpose, expires_at, publicKey: { challenge, rpId: rp.id, timeout: 300_000, userVerification: "required", allowCredentials: [] } };
+    const handle = Buffer.from(userId!.replace(/-/g, ""), "hex").toString("base64url");
+    const label = name ?? "Passkey user";
+    return { id: row.id, purpose, expires_at, publicKey: {
+      rp: { id: rp.id, name: rp.name }, user: { id: handle, name: label, displayName: label },
+      challenge, pubKeyCredParams: ALGS.map((alg) => ({ type: "public-key", alg })), timeout: 300_000, attestation: "none",
+      authenticatorSelection: { residentKey: "required", userVerification: "required" },
+    } };
+  }
+
+  /** Finish a passkey sign-in (returns a session) or sign-up (creates the account first). Either way the session is aal2: the passkey was unlocked by the person. */
+  async passkeyVerify(ref: string, project: Resolved, body: Record<string, unknown>) {
+    const rp = this.requirePasskeys(project);
+    await this.ensure(ref, project);
+    const bad = (why?: string) => new AuthError(400, "passkey_verification_failed", why ? `The passkey was not accepted: ${why}` : "The passkey was not accepted, or the request expired");
+    const cr = body.credential_response as { id?: unknown; response?: Record<string, unknown> } | undefined;
+    const resp = cr?.response;
+    const b64 = (v: unknown) => (typeof v === "string" && /^[\w-]{1,20000}$/.test(v) ? Buffer.from(v, "base64url") : null);
+    if (typeof body.challenge_id !== "string" || !/^[0-9a-f-]{36}$/.test(body.challenge_id) || !resp || typeof cr?.id !== "string") throw bad();
+    const clientDataJSON = b64(resp.clientDataJSON);
+    if (!clientDataJSON) throw bad();
+    // One try per challenge: taking it is what spends it.
+    const ch = await this.db(ref, async (c) => (await c.query<{ challenge: string; purpose: "signin" | "signup"; user_id: string | null; friendly_name: string | null; user_meta: object }>(
+      `DELETE FROM auth.passkey_challenges WHERE id = $1 AND created_at > now() - interval '5 minutes' RETURNING challenge, purpose, user_id, friendly_name, user_meta`, [body.challenge_id])).rows[0]);
+    if (!ch) throw bad();
+    const expect = { challenge: ch.challenge, rpId: rp.id, origins: rp.origins, requireUserVerification: true };
+    try {
+      if (ch.purpose === "signup") {
+        if (project.settings.disable_signup === true) throw new AuthError(422, "signup_disabled", "Signups not allowed for this instance");
+        const attestationObject = b64(resp.attestationObject);
+        if (!attestationObject) throw new WebAuthnError("the attestation is missing");
+        const reg = verifyRegistration({ attestationObject, clientDataJSON }, expect);
+        const user = await this.db(ref, async (c) => {
+          const u = (await c.query<UserRow>(
+            `INSERT INTO auth.users (id, email, encrypted_password, raw_user_meta_data, raw_app_meta_data, email_confirmed_at)
+             VALUES ($1, NULL, NULL, $2, '{"provider":"passkey","providers":["passkey"]}'::jsonb, NULL) RETURNING *`, [ch.user_id, JSON.stringify(ch.user_meta)])).rows[0]!;
+          const f = (await c.query<{ id: string }>(`INSERT INTO auth.mfa_factors (user_id, factor_type, friendly_name, status) VALUES ($1, 'webauthn', $2, 'verified') RETURNING id`, [u.id, ch.friendly_name])).rows[0]!;
+          await c.query(`INSERT INTO auth.webauthn_credentials (factor_id, credential_id, public_key, sign_count, aaguid) VALUES ($1, $2, $3, $4, $5)`, [f.id, reg.credentialId, reg.publicKey, reg.signCount, reg.aaguid]);
+          await c.query(`UPDATE auth.users SET last_sign_in_at = now() WHERE id = $1`, [u.id]);
+          return u;
+        }).catch((e) => { if ((e as { code?: string }).code === "23505") throw new WebAuthnError("this passkey is already registered"); throw e; });
+        return await this.session(ref, project, user, randomUUID(), "aal2");
+      }
+      const authenticatorData = b64(resp.authenticatorData), signature = b64(resp.signature);
+      if (!authenticatorData || !signature) throw new WebAuthnError("the assertion is incomplete");
+      const cred = await this.db(ref, async (c) => (await c.query<{ factor_id: string; user_id: string; public_key: string; sign_count: string; credential_id: string }>(
+        `SELECT w.factor_id, w.credential_id, w.public_key, w.sign_count, m.user_id FROM auth.webauthn_credentials w JOIN auth.mfa_factors m ON m.id = w.factor_id
+         WHERE w.credential_id = $1 AND m.status = 'verified'`, [cr.id])).rows[0]);
+      if (!cred) throw new WebAuthnError("this passkey is not known here");
+      const handle = b64(resp.userHandle);
+      if (resp.userHandle !== undefined && resp.userHandle !== null && resp.userHandle !== "" && (!handle || handle.toString("hex") !== cred.user_id.replace(/-/g, "")))
+        throw new WebAuthnError("this passkey belongs to a different account");
+      const count = verifyAssertion({ authenticatorData, clientDataJSON, signature }, expect, { publicKey: cred.public_key, signCount: Number(cred.sign_count) });
+      const moved = await this.db(ref, (c) => c.query(`UPDATE auth.webauthn_credentials SET sign_count = $2 WHERE factor_id = $1 AND sign_count = $3`, [cred.factor_id, count, cred.sign_count]));
+      if (!moved.rowCount) throw new WebAuthnError("this response was already used");
+      const user = await this.getUser(ref, cred.user_id);
+      if (!user) throw new WebAuthnError("this passkey is not known here");
+      if (user.banned_until && user.banned_until > new Date()) throw new AuthError(400, "user_banned", "User is banned");
+      await this.db(ref, (c) => c.query(`UPDATE auth.users SET last_sign_in_at = now() WHERE id = $1`, [user.id]));
+      return await this.session(ref, project, user, randomUUID(), "aal2");
+    } catch (e) {
+      if (e instanceof WebAuthnError) throw bad(e.message);
+      throw e;
+    }
   }
 
   async mfaUnenroll(ref: string, project: Resolved, claims: Record<string, unknown>, factorId: string) {

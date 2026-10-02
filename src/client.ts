@@ -99,6 +99,30 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
     return { data: body as Session, error: null, status: res.status };
   }
 
+  async function passkeyCeremony(start: { purpose: "signin" | "signup"; friendly_name?: string; data?: object }): Promise<Result<{ user: User; session: Session }>> {
+    const creds = opts.credentials ?? (globalThis as { navigator?: { credentials?: CredentialsApi } }).navigator?.credentials;
+    if (!creds) return { data: null, error: { message: "This environment cannot use passkeys" }, status: 400 };
+    const o1 = await authCall("/passkey/options", { method: "POST", body: JSON.stringify(start) });
+    if (!o1.res.ok) return { data: null, error: err(o1.res.status, o1.body, "could not start the passkey request"), status: o1.res.status };
+    const o = o1.body.publicKey;
+    let cred: any;
+    try {
+      cred = start.purpose === "signup"
+        ? await creds.create({ publicKey: { ...o, challenge: fromB64u(o.challenge), user: { ...o.user, id: fromB64u(o.user.id) } } })
+        : await creds.get({ publicKey: { ...o, challenge: fromB64u(o.challenge), allowCredentials: [] } });
+    } catch (ex) {
+      return { data: null, error: { message: (ex as Error).message || "the passkey was not used" }, status: 400 };
+    }
+    const r = cred.response;
+    const response = start.purpose === "signup"
+      ? { clientDataJSON: toB64u(r.clientDataJSON), attestationObject: toB64u(r.attestationObject) }
+      : { clientDataJSON: toB64u(r.clientDataJSON), authenticatorData: toB64u(r.authenticatorData), signature: toB64u(r.signature), ...(r.userHandle ? { userHandle: toB64u(r.userHandle) } : {}) };
+    const v = await authCall("/passkey/verify", { method: "POST", body: JSON.stringify({ challenge_id: o1.body.id, credential_response: { id: cred.id, rawId: toB64u(cred.rawId), type: cred.type, response } }) });
+    if (!v.res.ok) return { data: null, error: err(v.res.status, v.body, "the passkey was not accepted"), status: v.res.status };
+    setSession(v.body as Session, "SIGNED_IN");
+    return { data: { user: v.body.user, session: v.body }, error: null, status: v.res.status };
+  }
+
   const auth = {
     /** Resolves with a session, or with just the user when the project wants the email address confirmed first. */
     async signUp(c: ({ email: string; phone?: undefined } | { phone: string; email?: undefined }) & { password: string; options?: { data?: object; emailRedirectTo?: string } }): Promise<Result<{ user: User | null; session: Session | null }>> {
@@ -166,6 +190,17 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
       if (!res.ok) return { data: null, error: err(res.status, body, "sign in failed"), status: res.status };
       setSession(body as Session, "SIGNED_IN");
       return { data: { user: body.user, session: body }, error: null, status: res.status };
+    },
+    /**
+     * Sign in with a passkey alone: no email, password or code. The browser offers the passkeys it holds for this site.
+     * Needs a browser (or pass `credentials` to createClient) and `webauthn.passwordless` turned on for the project.
+     */
+    async signInWithPasskey(): Promise<Result<{ user: User; session: Session }>> {
+      return passkeyCeremony({ purpose: "signin" });
+    },
+    /** Create an account that has nothing but a passkey. Add an email or phone later with updateUser. */
+    async signUpWithPasskey(c: { displayName?: string; data?: object } = {}): Promise<Result<{ user: User; session: Session }>> {
+      return passkeyCeremony({ purpose: "signup", friendly_name: c.displayName, data: c.data });
     },
     async refreshSession(): Promise<Result<Session>> {
       if (!session) return { data: null, error: { message: "no session" }, status: 401 };

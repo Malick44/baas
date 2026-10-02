@@ -75,8 +75,18 @@ CREATE TABLE IF NOT EXISTS auth.webauthn_credentials (
   aaguid text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS auth.passkey_challenges (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  challenge text NOT NULL,
+  purpose text NOT NULL CHECK (purpose IN ('signin', 'signup')),
+  user_id uuid,
+  friendly_name text,
+  user_meta jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS passkey_challenges_created ON auth.passkey_challenges (created_at);
 ALTER TABLE auth.refresh_tokens ADD COLUMN IF NOT EXISTS aal text NOT NULL DEFAULT 'aal1';
-GRANT ALL ON auth.one_time_tokens, auth.identities, auth.mfa_factors, auth.mfa_challenges, auth.phone_codes, auth.webauthn_credentials TO service_role;
+GRANT ALL ON auth.one_time_tokens, auth.identities, auth.mfa_factors, auth.mfa_challenges, auth.phone_codes, auth.webauthn_credentials, auth.passkey_challenges TO service_role;
 `;
 
 export const PROJECT_SCHEMA_SQL = `

@@ -1836,6 +1836,61 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     stub.close();
   });
 
+  step("signs up and in with a passkey alone in a real browser, after switching it on in the dashboard", async () => {
+    const sdk = ts.transpileModule(readFileSync(join(import.meta.dirname, "..", "src", "client.ts"), "utf8"), { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
+    const stub = http.createServer((req, res) => {
+      if (req.url === "/client.js") { res.setHeader("content-type", "text/javascript"); return res.end(sdk); }
+      res.setHeader("content-type", "text/html");
+      res.end("<!doctype html><title>passwordless</title><p>stub</p>");
+    });
+    const stubPort = await freePort();
+    await new Promise<void>((r) => stub.listen(stubPort, "127.0.0.1", r));
+    const origin = `http://localhost:${stubPort}`;
+    const patch = await t.api("PATCH", `/v1/projects/${ref}/settings`, { token: owner, body: { webauthn: { rp_id: "localhost", origins: [origin] }, cors_origins: [origin] } });
+    assert.equal(patch.status, 200, patch.text);
+    t.platform.dir.forget(ref);
+    // Switch it on where an operator would: Authentication -> URL configuration.
+    await page.goto(`http://127.0.0.1:${apiPort}/#/p/${ref}/auth/urls`);
+    await page.waitForSelector("#auth-rp-passwordless");
+    assert.equal(await page.isChecked("#auth-rp-passwordless"), false);
+    await page.check("#auth-rp-passwordless");
+    await page.click("#save-urls");
+    await toast("URL configuration saved");
+    t.platform.dir.forget(ref);
+    const saved = (await t.api("GET", `/v1/projects/${ref}/settings`, { token: owner })).json;
+    assert.deepEqual(saved.settings?.webauthn ?? saved.webauthn, { rp_id: "localhost", origins: [origin], passwordless: true });
+    const pk = await ctx.newPage();
+    const issues: string[] = [];
+    pk.on("pageerror", (e) => issues.push(e.message));
+    pk.on("console", (m) => { if (m.type() === "error" && !/status of 4\d\d/.test(m.text())) issues.push(m.text()); });
+    await pk.addInitScript("window.__name = (f) => f");
+    await pk.goto(`${origin}/`);
+    const cdp = await ctx.newCDPSession(pk);
+    await cdp.send("WebAuthn.enable");
+    const { authenticatorId } = await cdp.send("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
+    const out = await pk.evaluate(async ({ url, anon }) => {
+      const { createClient } = await import("/client.js");
+      const c = createClient(url, anon, {});
+      const level = async () => (await c.auth.mfa.getAuthenticatorAssuranceLevel()).data?.currentLevel;
+      const up = await c.auth.signUpWithPasskey({ displayName: "virtual", data: { via: "passkey" } });
+      const id = up.data?.user.id;
+      const afterUp = await level();
+      await c.auth.signOut();
+      const gone = (await c.auth.getUser()).error !== null;
+      const inn = await c.auth.signInWithPasskey();
+      const me = (await c.auth.getUser()).data?.user;
+      return { up: up.error?.message ?? null, afterUp, gone, inn: inn.error?.message ?? null, same: inn.data?.user.id === id, level: await level(), meta: me?.user_metadata, email: me?.email ?? null };
+    }, { url: `http://${ref}.localhost:${gwPort}`, anon: (await t.api("GET", `/v1/projects/${ref}/api-keys`, { token: owner })).json.anon });
+    assert.deepEqual(out, { up: null, afterUp: "aal2", gone: true, inn: null, same: true, level: "aal2", meta: { via: "passkey" }, email: null });
+    const creds = await cdp.send("WebAuthn.getCredentials", { authenticatorId });
+    assert.equal(creds.credentials.length, 1);
+    assert.equal(creds.credentials[0]!.isResidentCredential, true, "a discoverable credential, found without being told which one");
+    await cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId });
+    assert.deepEqual(issues, []);
+    await pk.close();
+    stub.close();
+  });
+
   step("deletes the project after typed confirmation and returns to the list", async () => {
     await page.goto(`http://127.0.0.1:${apiPort}/#/p/${ref}/settings`);
     await page.waitForSelector("#delete-project");

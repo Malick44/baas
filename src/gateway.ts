@@ -215,6 +215,9 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
     if (grant === "refresh_token") return A.refresh(ctx.ref, ctx.project, jsonBody(req));
     throw new AuthError(400, "unsupported_grant_type", "grant_type must be password or refresh_token");
   });
+  // Passkeys as the only way in: ask for options, let the browser answer, send the answer back for a session.
+  authRoute("POST", "/passkey/options", (ctx, req) => A.passkeyOptions(ctx.ref, ctx.project, jsonBody(req)));
+  authRoute("POST", "/passkey/verify", (ctx, req) => A.passkeyVerify(ctx.ref, ctx.project, jsonBody(req)));
   authRoute("GET", "/user", (ctx) => A.me(ctx.ref, ctx.project, ctx.who.claims));
   authRoute("PUT", "/user", (ctx, req) => A.updateMe(ctx.ref, ctx.project, ctx.who.claims, jsonBody(req)));
   authRoute("POST", "/logout", async (ctx) => {

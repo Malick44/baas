@@ -65,13 +65,13 @@ export class SoftAuthenticator {
   }
 
   /** What navigator.credentials.get() resolves with. */
-  get(options: { challenge: string; rpId: string }, origin: string, o: { rpId?: string; up?: boolean; type?: string; challenge?: string; count?: number; tamper?: boolean; id?: string } = {}) {
+  get(options: { challenge: string; rpId: string }, origin: string, o: { rpId?: string; up?: boolean; type?: string; challenge?: string; count?: number; tamper?: boolean; id?: string; userHandle?: string } = {}) {
     this.signCount = o.count ?? this.signCount + 1;
     const clientDataJSON = this.client(o.type ?? "webauthn.get", o.challenge ?? options.challenge, origin);
     const authenticatorData = this.authData(o.rpId ?? options.rpId, { attested: false, up: o.up, count: this.signCount });
     const data = Buffer.concat([authenticatorData, sha256(clientDataJSON)]);
     const signature = this.alg === "ES256" ? createSign("sha256").update(data).sign(this.priv) : this.alg === "RS256" ? createSign("sha256").update(data).sign(this.priv) : cryptoSign(null, data, this.priv);
     if (o.tamper) signature.writeUInt8(signature.readUInt8(signature.length - 1) ^ 1, signature.length - 1);
-    return { id: o.id ?? this.credentialId.toString("base64url"), rawId: this.credentialId.toString("base64url"), type: "public-key", response: { clientDataJSON: clientDataJSON.toString("base64url"), authenticatorData: authenticatorData.toString("base64url"), signature: signature.toString("base64url") } };
+    return { id: o.id ?? this.credentialId.toString("base64url"), rawId: this.credentialId.toString("base64url"), type: "public-key", response: { clientDataJSON: clientDataJSON.toString("base64url"), authenticatorData: authenticatorData.toString("base64url"), signature: signature.toString("base64url"), ...(o.userHandle ? { userHandle: o.userHandle } : {}) } };
   }
 }
