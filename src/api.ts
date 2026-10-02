@@ -203,6 +203,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     const given = (settings.auth_providers ?? {}) as Record<string, { enabled?: boolean; client_id?: string; secret_set?: boolean }>;
     return {
       email_delivery: ops.auth ? ops.auth.emailConfigured : false,
+      sms_delivery: ops.auth ? ops.auth.smsConfigured : false,
       callback_url: base ? `${base}/auth/v1/callback` : null,
       custom_providers: Object.entries((settings.oidc_providers ?? {}) as Record<string, Record<string, unknown>>).map(([id, v]) => ({ id, label: v.label ?? id, enabled: v.enabled === true, issuer: v.issuer ?? "", client_id: v.client_id ?? "", scopes: v.scopes ?? "openid email profile", secret_set: v.secret_set === true })),
       providers: Object.entries(PROVIDERS).map(([id, v]) => ({ id, label: v.label, enabled: given[id]?.enabled === true, client_id: given[id]?.client_id ?? "", secret_set: given[id]?.secret_set === true })),

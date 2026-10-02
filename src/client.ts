@@ -86,9 +86,9 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
 
   const auth = {
     /** Resolves with a session, or with just the user when the project wants the email address confirmed first. */
-    async signUp(c: { email: string; password: string; options?: { data?: object; emailRedirectTo?: string } }): Promise<Result<{ user: User | null; session: Session | null }>> {
+    async signUp(c: ({ email: string; phone?: undefined } | { phone: string; email?: undefined }) & { password: string; options?: { data?: object; emailRedirectTo?: string } }): Promise<Result<{ user: User | null; session: Session | null }>> {
       const q = c.options?.emailRedirectTo ? `?redirect_to=${encodeURIComponent(c.options.emailRedirectTo)}` : "";
-      const { res, body } = await authCall(`/signup${q}`, { method: "POST", body: JSON.stringify({ email: c.email, password: c.password, data: c.options?.data }) });
+      const { res, body } = await authCall(`/signup${q}`, { method: "POST", body: JSON.stringify({ ...(c.phone !== undefined ? { phone: c.phone } : { email: c.email }), password: c.password, data: c.options?.data }) });
       if (!res.ok) return { data: null, error: err(res.status, body, "sign up failed"), status: res.status };
       if (!body?.access_token) return { data: { user: body as User, session: null }, error: null, status: res.status };
       setSession(body as Session, "SIGNED_IN");
@@ -100,16 +100,20 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
       const { res, body } = await authCall(`/recover${q}`, { method: "POST", body: JSON.stringify({ email }) });
       return res.ok ? { data: {}, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not send the email"), status: res.status };
     },
-    /** Email a sign-in link. Creates the account on first use unless shouldCreateUser is false. */
-    async signInWithOtp(c: { email: string; options?: { emailRedirectTo?: string; shouldCreateUser?: boolean; data?: object } }): Promise<Result<{}>> {
+    /** Email a sign-in link, or text a code with `phone`. Creates the account on first use unless shouldCreateUser is false. */
+    async signInWithOtp(c: ({ email: string; phone?: undefined } | { phone: string; email?: undefined }) & { options?: { emailRedirectTo?: string; shouldCreateUser?: boolean; data?: object } }): Promise<Result<{}>> {
+      if (c.phone !== undefined) {
+        const sms = await authCall("/otp", { method: "POST", body: JSON.stringify({ phone: c.phone, create_user: c.options?.shouldCreateUser, data: c.options?.data }) });
+        return sms.res.ok ? { data: {}, error: null, status: sms.res.status } : { data: null, error: err(sms.res.status, sms.body, "could not send the text"), status: sms.res.status };
+      }
       const q = c.options?.emailRedirectTo ? `?redirect_to=${encodeURIComponent(c.options.emailRedirectTo)}` : "";
       const { res, body } = await authCall(`/magiclink${q}`, { method: "POST", body: JSON.stringify({ email: c.email, create_user: c.options?.shouldCreateUser, data: c.options?.data }) });
       return res.ok ? { data: {}, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not send the email"), status: res.status };
     },
     /** Trade the token from an email link for a session (for apps that handle the link themselves). */
-    async verifyOtp(c: { type: "signup" | "recovery" | "magiclink" | "email"; token: string; email?: string }): Promise<Result<{ user: User; session: Session }>> {
+    async verifyOtp(c: { type: "signup" | "recovery" | "magiclink" | "email" | "sms"; token: string; email?: string; phone?: string }): Promise<Result<{ user: User; session: Session }>> {
       // With `email`, `token` is the six-digit code from the message; without it, the long token from the link.
-      const { res, body } = await authCall("/verify", { method: "POST", body: JSON.stringify({ type: c.type, token: c.token, ...(c.email ? { email: c.email } : {}) }) });
+      const { res, body } = await authCall("/verify", { method: "POST", body: JSON.stringify({ type: c.type, token: c.token, ...(c.email ? { email: c.email } : {}), ...(c.phone ? { phone: c.phone } : {}) }) });
       if (!res.ok) return { data: null, error: err(res.status, body, "verification failed"), status: res.status };
       setSession(body as Session, "SIGNED_IN");
       return { data: { user: body.user, session: body }, error: null, status: res.status };
@@ -142,7 +146,7 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
       setSession(s, "SIGNED_IN");
       return { data: { session: s, type: f.get("type") ?? "" }, error: null, status: 200 };
     },
-    async signInWithPassword(c: { email: string; password: string }): Promise<Result<{ user: User; session: Session }>> {
+    async signInWithPassword(c: ({ email: string; phone?: undefined } | { phone: string; email?: undefined }) & { password: string }): Promise<Result<{ user: User; session: Session }>> {
       const { res, body } = await authCall("/token?grant_type=password", { method: "POST", body: JSON.stringify(c) });
       if (!res.ok) return { data: null, error: err(res.status, body, "sign in failed"), status: res.status };
       setSession(body as Session, "SIGNED_IN");

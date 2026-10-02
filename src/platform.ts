@@ -12,6 +12,7 @@ import { ExtensionService } from "./extensions.js";
 import { FunctionService } from "./functions.js";
 import { buildGateway } from "./gateway.js";
 import { mailerFrom, type Mailer } from "./mailer.js";
+import { smsFrom, type SmsSender, type TwilioConfig } from "./sms.js";
 import { migrate } from "./migrate.js";
 import { PipelineService, type PipelineOptions } from "./pipelines.js";
 import { planOf } from "./plans.js";
@@ -38,6 +39,8 @@ export type PlatformConfig = {
   purgeRetentionMs: number;
   dashboardDir?: string;
   /** Hostname the dashboard is served on behind a TLS proxy (for certificate checks). */
+  /** Text messages for phone sign-in: a sender (tests) or Twilio credentials. */
+  sms?: { sender?: SmsSender; twilio?: TwilioConfig };
   dashboardHost?: string;
   /** Full address of the dashboard for links in emails (overrides one derived from dashboardHost or dashboardOrigins). */
   dashboardUrl?: string;
@@ -48,7 +51,7 @@ export type PlatformConfig = {
   functions?: { egress?: "public" | "open"; egressAllow?: string[] };
   /** Outgoing email for confirmation, password reset and magic links. Leave out to switch those flows off. Give `mailer` to supply your own (tests do). */
   mail?: { smtpUrl?: string; from?: string; mailer?: Mailer };
-  auth?: Pick<AuthOptions, "providerOverrides" | "emailCooldownMs" | "maxEmailsPerHour" | "fetch" | "oidcAllowPrivate">;
+  auth?: Pick<AuthOptions, "providerOverrides" | "emailCooldownMs" | "maxEmailsPerHour" | "fetch" | "oidcAllowPrivate" | "smsCooldownMs" | "maxSmsPerHour">;
   /** Webhook pipelines. `tickMs` is how often pending changes are delivered (default 5 s). */
   pipelines?: PipelineOptions & { tickMs?: number };
   /** Server-side cap on any single data-plane query (default 20 s). Users cannot raise it with SET statement_timeout. */
@@ -90,7 +93,7 @@ export async function createPlatform(cfg: PlatformConfig) {
   const functions = new FunctionService(control, { publicUrl, ...cfg.functions });
   const mailer = mailerFrom(cfg.mail);
   const auth = new AuthService(pm, {
-    adminUrl: cfg.pgAdminUrl, vault, mailer, publicUrl, secureCookies: cfg.publicScheme === "https",
+    adminUrl: cfg.pgAdminUrl, vault, mailer, sms: smsFrom(cfg.sms), publicUrl, secureCookies: cfg.publicScheme === "https",
     log: (m) => console.error(`[auth] ${m}`), ...cfg.auth,
   });
   const realtime = new RealtimeHub(pm, cfg.pgAdminUrl, { checkMs: cfg.realtimeCheckMs });

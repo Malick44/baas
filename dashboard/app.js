@@ -2473,13 +2473,13 @@ async function authUsers(body, p, cfg) {
               try { await gw(`/auth/v1/admin/users/${u.id}/factors`, { method: "DELETE" }); toast("Authenticator removed", "ok"); ({ users, total } = await load()); draw(); } catch (ex) { toast(ex.message, "bad"); }
             }, { danger: true, action: "remove-mfa" }]);
             if (unconfirmed) mail.push(["Mark email as confirmed", async () => { try { await gw(`/auth/v1/admin/users/${u.id}`, { method: "PUT", body: { email_confirm: true } }); toast("Email confirmed", "ok"); ({ users, total } = await load()); draw(); } catch (ex) { toast(ex.message, "bad"); } }, { action: "confirm-email" }]);
-            return h("tr", { "data-email": u.email },
-              h("td", null, u.email), h("td", { class: "mono" }, u.id), h("td", null, fmtDate(u.created_at)), h("td", null, fmtDate(u.last_sign_in_at)),
+            return h("tr", { "data-email": u.email || u.phone },
+              h("td", null, u.email || u.phone, !u.email && u.phone && h("span", { class: "chip", title: "Signs in with a text message" }, "phone")), h("td", { class: "mono" }, u.id), h("td", null, fmtDate(u.created_at)), h("td", null, fmtDate(u.last_sign_in_at)),
               h("td", null, banned ? h("span", { class: "bad" }, "banned") : unconfirmed ? h("span", { class: "warn", "data-status": "unconfirmed", title: "Has not confirmed the email address" }, "unconfirmed") : "active",
                 (u.factors || []).some((f) => f.status === "verified") ? h("span", { class: "chip healthy", "data-mfa": "on", title: "Has an authenticator app set up" }, "MFA") : null),
               h("td", { class: "row" },
                 h("button", { class: "small", onclick: async () => { await gw(`/auth/v1/admin/users/${u.id}`, { method: "PUT", body: { ban_duration: banned ? "none" : "876000h" } }); toast(banned ? "User unbanned" : "User banned", "ok"); ({ users, total } = await load()); draw(); } }, banned ? "Unban" : "Ban"),
-                h("button", { class: "small danger", "data-action": "delete-user", onclick: async () => { if (await confirmBox("Delete user", `Delete ${u.email}? Their sessions end immediately.`, { confirmLabel: "Delete" })) { await gw(`/auth/v1/admin/users/${u.id}`, { method: "DELETE" }); toast("User deleted", "ok"); ({ users, total } = await load()); draw(); } } }, "Delete"),
+                h("button", { class: "small danger", "data-action": "delete-user", onclick: async () => { if (await confirmBox("Delete user", `Delete ${u.email || u.phone}? Their sessions end immediately.`, { confirmLabel: "Delete" })) { await gw(`/auth/v1/admin/users/${u.id}`, { method: "DELETE" }); toast("User deleted", "ok"); ({ users, total } = await load()); draw(); } } }, "Delete"),
                 mail.length ? rowMenu(mail) : null));
           })))
         : h("div", { class: "empty" }, "No users yet. They appear here when someone signs up through the API."))));
@@ -2556,6 +2556,8 @@ async function authProviders(body, p, cfg, canEdit) {
       h("thead", null, h("tr", null, ["Provider", "Status", "Client ID", ""].map((x) => h("th", null, x)))),
       h("tbody", null,
         h("tr", { "data-row": "email" }, h("td", null, "Email"), h("td", null, h("span", { class: "chip healthy" }, "Enabled")), h("td", { class: "muted" }, "Built in"), h("td", { class: "actions-cell" }, h("a", { href: `#/p/${p.ref}/auth/email` }, "Email settings"))),
+        h("tr", { "data-row": "phone" }, h("td", null, "Phone"), h("td", null, h("span", { class: `chip ${state.sms_delivery ? "healthy" : "paused"}`, "data-status": state.sms_delivery ? "enabled" : "unavailable" }, state.sms_delivery ? "Enabled" : "Needs a text provider")),
+          h("td", { class: "muted" }, state.sms_delivery ? "Sign in with a code sent by text" : "The operator sets TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_FROM"), h("td", { class: "actions-cell" })),
         state.providers.map((pr) => h("tr", { "data-row": pr.id },
           h("td", null, h("button", { class: "linkish", "data-action": "configure", disabled: !canEdit, onclick: () => sheet(pr) }, pr.label)),
           h("td", null, h("span", { class: `chip ${pr.enabled ? "healthy" : "paused"}`, "data-status": pr.enabled ? "enabled" : "disabled" }, pr.enabled ? "Enabled" : pr.secret_set ? "Disabled" : "Not set up")),

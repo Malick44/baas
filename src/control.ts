@@ -54,6 +54,7 @@ const SETTINGS_KEYS = {
       (f === "enabled" && typeof t === "boolean") || (f === "label" && typeof t === "string" && t.length <= 60 && !/[\r\n<>]/.test(t)) ||
       (f === "issuer" && typeof t === "string" && t.length <= 300 && isIssuer(t)) || (f === "client_id" && typeof t === "string" && t.length <= 300) ||
       (f === "secret" && typeof t === "string" && t.length <= 2000) || (f === "scopes" && typeof t === "string" && t.length <= 300 && /^[\x21\x23-\x5b\x5d-\x7e]+( [\x21\x23-\x5b\x5d-\x7e]+)*$/.test(t) && t.split(" ").includes("openid")))))),
+  sms_template: (v: unknown) => typeof v === "string" && v.length <= 160 && v.includes("{{ .Token }}") && !/[\r\n]/.test(v),
   site_url: (v: unknown) => typeof v === "string" && /^https?:\/\//.test(v),
   redirect_urls: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string"),
   cors_origins: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string"),

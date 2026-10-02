@@ -25,6 +25,7 @@ const platform = await createPlatform({
     : undefined,
   // Email for confirmation, password reset and magic links is offered only when the operator provides an SMTP server.
   mail: process.env.SMTP_URL ? { smtpUrl: process.env.SMTP_URL, from: process.env.MAIL_FROM } : undefined,
+  sms: process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_FROM ? { twilio: { accountSid: process.env.TWILIO_ACCOUNT_SID, authToken: process.env.TWILIO_AUTH_TOKEN, from: process.env.TWILIO_FROM } } : undefined,
   dashboardHost: process.env.BAAS_DASHBOARD_HOST || undefined,
   dashboardUrl: process.env.BAAS_DASHBOARD_URL || undefined,
   // Where the dashboard is opened from; these origins are always allowed by a project's CORS list. Add more with BAAS_DASHBOARD_ORIGINS (comma separated).

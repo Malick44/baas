@@ -1166,7 +1166,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
   step("configures sign-in providers and URLs", async () => {
     await tab("auth", "providers");
     await page.waitForSelector("#provider-table");
-    assert.deepEqual(await page.locator("#provider-table tbody tr td:first-child").allTextContents(), ["Email", "Google", "GitHub", "GitLab", "Discord", "Microsoft"]);
+    assert.deepEqual(await page.locator("#provider-table tbody tr td:first-child").allTextContents(), ["Email", "Phone", "Google", "GitHub", "GitLab", "Discord", "Microsoft"]);
     assert.match((await page.textContent("#callback-note"))!, new RegExp(`http://${ref}\\.localhost:${gwPort}/auth/v1/callback`));
     await shot("06k-auth-providers");
 

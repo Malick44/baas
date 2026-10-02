@@ -7,6 +7,7 @@ import { DEFAULT_TEMPLATES, htmlFromText, NoMailer, renderTemplate, type Mailer,
 import { matchStep, newSecret, otpauthUri, stepAt } from "./totp.js";
 import { isProvider, PROVIDERS, type OAuthProvider, type Profile } from "./oauth.js";
 import { guardedJson, OidcClient, OidcError, profileFromClaims } from "./oidc.js";
+import { NoSms, type SmsSender } from "./sms.js";
 import type { PoolManager } from "./pools.js";
 import { AUTH_EXTRAS_SQL, urlFor } from "./provision.js";
 import type { Vault } from "./vault.js";
@@ -43,11 +44,12 @@ type UserRow = {
   id: string; email: string | null; encrypted_password: string | null; email_confirmed_at: Date | null;
   raw_app_meta_data: Record<string, unknown>; raw_user_meta_data: Record<string, unknown>;
   banned_until: Date | null; created_at: Date; updated_at: Date; last_sign_in_at: Date | null;
+  phone?: string | null; phone_confirmed_at?: Date | null;
 };
 
 export const publicUser = (u: UserRow) => ({
   id: u.id, aud: "authenticated", role: "authenticated", email: u.email,
-  email_confirmed_at: u.email_confirmed_at, confirmed_at: u.email_confirmed_at, phone: "",
+  email_confirmed_at: u.email_confirmed_at, phone_confirmed_at: u.phone_confirmed_at ?? null, confirmed_at: u.email_confirmed_at ?? u.phone_confirmed_at ?? null, phone: u.phone ?? "",
   last_sign_in_at: u.last_sign_in_at, app_metadata: u.raw_app_meta_data, user_metadata: u.raw_user_meta_data,
   created_at: u.created_at, updated_at: u.updated_at, banned_until: u.banned_until,
 });
@@ -106,6 +108,11 @@ export type AuthOptions = {
   fetch?: typeof fetch;
   /** Let custom OpenID Connect providers sit on private or local addresses (tests, or an identity provider inside your own network). */
   oidcAllowPrivate?: boolean;
+  /** Sends the codes for phone sign-in. Without one, phone sign-in is off. */
+  sms?: SmsSender;
+  /** Minimum time between texts to the same number, and the most texts one project may send per hour. */
+  smsCooldownMs?: number;
+  maxSmsPerHour?: number;
   /** Minimum time between emails to the same address, and the most emails one project may send per hour. */
   emailCooldownMs?: number;
   maxEmailsPerHour?: number;
@@ -148,10 +155,18 @@ export class AuthService {
   private cooldown = new Map<string, number>();
   private hourly = new Map<string, { n: number; until: number }>();
   private mailer: Mailer;
+  private sms: SmsSender;
+  private smsCooldown = new Map<string, number>();
+  private smsHourly = new Map<string, { n: number; until: number }>();
   private oidc: OidcClient;
   constructor(private pm: PoolManager, private opts: AuthOptions = {}) {
     this.mailer = opts.mailer ?? new NoMailer();
+    this.sms = opts.sms ?? new NoSms();
     this.oidc = new OidcClient(opts.oidcAllowPrivate === true);
+  }
+
+  get smsConfigured() {
+    return this.sms.configured;
   }
 
   get emailConfigured() {
@@ -183,6 +198,7 @@ export class AuthService {
     for (const name of Object.keys(PROVIDERS)) external[name] = providers[name]?.enabled === true && !!providers[name]?.client_id && !!providers[name]?.secret_enc && !!this.opts.vault;
     const custom = (project.settings.oidc_providers ?? {}) as Record<string, { enabled?: boolean; client_id?: string; secret_enc?: string; issuer?: string }>;
     for (const [name, c] of Object.entries(custom)) external[name] = c?.enabled === true && !!c.client_id && !!c.secret_enc && !!c.issuer && !!this.opts.vault;
+    external.phone = this.sms.configured;
     return { external, disable_signup: project.settings.disable_signup === true, mailer_autoconfirm: !this.confirmRequired(project), email_delivery: this.mailer.configured, password_min_length: this.minPassword(project) };
   }
 
@@ -202,7 +218,7 @@ export class AuthService {
     const now = Math.floor(Date.now() / 1000);
     const access = signJwt(
       {
-        iss: "baas", aud: "authenticated", sub: user.id, role: "authenticated", email: user.email, session_id: sessionId,
+        iss: "baas", aud: "authenticated", sub: user.id, role: "authenticated", email: user.email, phone: user.phone ?? "", session_id: sessionId,
         app_metadata: user.raw_app_meta_data, user_metadata: user.raw_user_meta_data, aal, iat: now, exp: now + ttl,
       },
       secret,
@@ -223,6 +239,7 @@ export class AuthService {
 
   /** Sign up. Returns a session, or just the user when the project requires the email address to be confirmed first. */
   async signup(ref: string, project: Resolved, body: Record<string, unknown>, redirectTo?: unknown) {
+    if (body.phone !== undefined && body.email === undefined) return this.phoneSignup(ref, project, body);
     if (project.settings.disable_signup === true) throw new AuthError(422, "signup_disabled", "Signups not allowed for this instance");
     const { email, password } = this.validate(body.email, body.password, this.minPassword(project));
     const meta = body.data !== null && typeof body.data === "object" && !Array.isArray(body.data) ? body.data : {};
@@ -252,6 +269,7 @@ export class AuthService {
   }
 
   async passwordLogin(ref: string, project: Resolved, body: Record<string, unknown>) {
+    if (body.phone !== undefined && body.email === undefined) return this.phonePasswordLogin(ref, project, body);
     const email = typeof body.email === "string" ? body.email.toLowerCase() : "";
     const password = typeof body.password === "string" ? body.password : "";
     const key = `${ref}:${email}`;
@@ -550,6 +568,7 @@ export class AuthService {
 
   /** A sign-in link by email. Creates the account on first use unless sign-ups are off or the app said not to. */
   async magicLink(ref: string, project: Resolved, body: Record<string, unknown>, redirectTo?: unknown) {
+    if (body.phone !== undefined && body.email === undefined) return this.phoneOtp(ref, project, body);
     this.requireMail();
     const email = this.emailOf(body.email);
     const redirect = this.redirectFor(project, redirectTo ?? body.redirect_to);
@@ -581,8 +600,154 @@ export class AuthService {
     return {};
   }
 
+
+  // ---- phone sign-in (text message codes) ----
+
+  private requireSms() {
+    if (!this.sms.configured) throw new AuthError(501, "sms_provider_disabled", "Text message delivery is not configured for this platform");
+  }
+
+  /** Numbers are stored in E.164 form, so "+1 (415) 555-0100" and "+14155550100" are the same person. */
+  private phoneOf(v: unknown): string {
+    const s = typeof v === "string" ? v.replace(/[\s().-]/g, "") : "";
+    if (!/^\+[1-9]\d{6,14}$/.test(s)) throw new AuthError(422, "validation_failed", "Unable to validate phone number: use international format, like +14155550100");
+    return s;
+  }
+
+  private smsGate(ref: string, phone: string) {
+    const now = Date.now();
+    const key = `${ref}:${phone}`;
+    const gap = this.opts.smsCooldownMs ?? 60_000;
+    if ((this.smsCooldown.get(key) ?? 0) > now) throw new AuthError(429, "over_sms_send_rate_limit", `For security purposes, you can only request this once every ${Math.round(gap / 1000)} seconds`);
+    const h = this.smsHourly.get(ref);
+    if (h && h.until > now && h.n >= (this.opts.maxSmsPerHour ?? 30)) throw new AuthError(429, "over_sms_send_rate_limit", "This project has sent too many text messages this hour; try again later");
+    this.smsCooldown.set(key, now + gap);
+    if (this.smsCooldown.size > 20_000) this.smsCooldown.delete(this.smsCooldown.keys().next().value!);
+    if (!h || h.until <= now) this.smsHourly.set(ref, { n: 1, until: now + 3600_000 });
+    else h.n++;
+  }
+
+  private async userByPhone(ref: string, phone: string): Promise<UserRow | undefined> {
+    return this.db(ref, async (c) => (await c.query<UserRow>(`SELECT * FROM auth.users WHERE phone = $1`, [phone])).rows[0]);
+  }
+
+  private async insertPhoneUser(ref: string, phone: string, password: string | null, meta: object): Promise<UserRow> {
+    const hash = password === null ? null : await this.slots.run(ref, () => hashPassword(password));
+    try {
+      return await this.db(ref, async (c) =>
+        (await c.query<UserRow>(
+          `INSERT INTO auth.users (email, phone, encrypted_password, raw_user_meta_data, raw_app_meta_data, email_confirmed_at)
+           VALUES (NULL, $1, $2, $3, '{"provider":"phone","providers":["phone"]}'::jsonb, NULL) RETURNING *`,
+          [phone, hash, JSON.stringify(meta)],
+        )).rows[0]!,
+      );
+    } catch (err) {
+      if ((err as { code?: string }).code === "23505") throw new AuthError(422, "user_already_exists", "User already registered");
+      throw err;
+    }
+  }
+
+  private async sendCode(ref: string, project: Resolved, user: UserRow) {
+    const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+    await this.db(ref, async (c) => {
+      await c.query(`UPDATE auth.phone_codes SET used_at = now() WHERE user_id = $1 AND used_at IS NULL`, [user.id]); // only the newest code works
+      await c.query(`INSERT INTO auth.phone_codes (user_id, code_hash, expires_at) VALUES ($1, $2, now() + interval '10 minutes')`, [user.id, codeHash(user.id, "sms", code)]);
+    });
+    const template = typeof project.settings.sms_template === "string" && project.settings.sms_template ? project.settings.sms_template : "Your verification code is {{ .Token }}";
+    await this.sms.send({ to: user.phone!, body: renderTemplate(template, { ConfirmationURL: "", Email: "", SiteURL: "", Token: code }) });
+  }
+
+  async phoneSignup(ref: string, project: Resolved, body: Record<string, unknown>) {
+    this.requireSms();
+    if (project.settings.disable_signup === true) throw new AuthError(422, "signup_disabled", "Signups not allowed for this instance");
+    const phone = this.phoneOf(body.phone);
+    const min = this.minPassword(project);
+    if (typeof body.password !== "string" || body.password.length < min) throw new AuthError(422, "weak_password", `Password should be at least ${min} characters`);
+    if (body.password.length > 256) throw new AuthError(422, "weak_password", "Password is too long");
+    const meta = body.data !== null && typeof body.data === "object" && !Array.isArray(body.data) ? (body.data as object) : {};
+    await this.ensure(ref, project);
+    this.smsGate(ref, phone);
+    const user = await this.insertPhoneUser(ref, phone, body.password, meta);
+    await this.sendCode(ref, project, user).catch((e) => this.opts.log?.(`text to ${phone} failed: ${(e as Error).message}`));
+    return publicUser(user);
+  }
+
+  /** A sign-in code by text. Creates the account on first use unless sign-ups are off or the app said not to. Answers the same either way. */
+  async phoneOtp(ref: string, project: Resolved, body: Record<string, unknown>) {
+    this.requireSms();
+    const phone = this.phoneOf(body.phone);
+    this.smsGate(ref, phone);
+    await this.ensure(ref, project);
+    let user = await this.userByPhone(ref, phone);
+    if (!user) {
+      if (body.create_user === false || project.settings.disable_signup === true) return {};
+      const meta = body.data !== null && typeof body.data === "object" && !Array.isArray(body.data) ? (body.data as object) : {};
+      user = await this.insertPhoneUser(ref, phone, null, meta).catch(async (e) => {
+        if ((e as { errorCode?: string }).errorCode === "user_already_exists") return (await this.userByPhone(ref, phone))!;
+        throw e;
+      });
+    }
+    await this.sendCode(ref, project, user).catch((e) => this.opts.log?.(`text to ${phone} failed: ${(e as Error).message}`));
+    return {};
+  }
+
+  async verifyPhone(ref: string, project: Resolved, input: { phone?: unknown; token?: unknown; type?: unknown }) {
+    const gone = () => new AuthError(403, "otp_expired", "Code is invalid or has expired");
+    if (input.type !== undefined && input.type !== "sms") throw new AuthError(422, "validation_failed", "type must be sms");
+    this.requireSms();
+    const phone = this.phoneOf(input.phone);
+    if (typeof input.token !== "string" || !/^\d{6}$/.test(input.token)) throw gone();
+    await this.ensure(ref, project);
+    const key = `sms:${ref}:${phone}`;
+    this.attempts.check(key);
+    const code = input.token;
+    const uid = await this.db(ref, async (c) => {
+      const u = (await c.query<{ id: string }>(`SELECT id FROM auth.users WHERE phone = $1`, [phone])).rows[0];
+      if (!u) return null;
+      const t = (await c.query<{ id: string; code_hash: string; attempts: number }>(
+        `SELECT id, code_hash, attempts FROM auth.phone_codes WHERE user_id = $1 AND used_at IS NULL AND expires_at > now() ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [u.id])).rows[0];
+      if (!t || t.attempts >= MAX_CODE_TRIES) return null;
+      const given = Buffer.from(codeHash(u.id, "sms", code), "hex");
+      const real = Buffer.from(t.code_hash, "hex");
+      if (given.length === real.length && timingSafeEqual(given, real)) {
+        await c.query(`UPDATE auth.phone_codes SET used_at = now() WHERE id = $1`, [t.id]);
+        return u.id;
+      }
+      await c.query(`UPDATE auth.phone_codes SET attempts = attempts + 1 WHERE id = $1`, [t.id]);
+      return null;
+    });
+    if (!uid) { this.attempts.fail(key); throw gone(); }
+    this.attempts.clear(key);
+    const user = await this.db(ref, async (c) =>
+      (await c.query<UserRow>(`UPDATE auth.users SET phone_confirmed_at = coalesce(phone_confirmed_at, now()), last_sign_in_at = now(), updated_at = now() WHERE id = $1 RETURNING *`, [uid])).rows[0],
+    );
+    if (!user) throw gone();
+    if (user.banned_until && user.banned_until > new Date()) throw new AuthError(400, "user_banned", "User is banned");
+    return { session: await this.session(ref, project, user), redirectTo: null as string | null, type: "sms" };
+  }
+
+  async phonePasswordLogin(ref: string, project: Resolved, body: Record<string, unknown>) {
+    const phone = this.phoneOf(body.phone);
+    const password = typeof body.password === "string" ? body.password : "";
+    const key = `${ref}:${phone}`;
+    this.attempts.check(key);
+    await this.ensure(ref, project);
+    const user = await this.userByPhone(ref, phone);
+    const ok = await this.slots.run(ref, () => verifyPassword(password, user?.encrypted_password ?? null));
+    if (!user || !ok) {
+      this.attempts.fail(key);
+      throw new AuthError(400, "invalid_credentials", "Invalid login credentials");
+    }
+    if (user.banned_until && user.banned_until > new Date()) throw new AuthError(400, "user_banned", "User is banned");
+    if (!user.phone_confirmed_at) throw new AuthError(400, "phone_not_confirmed", "Phone not confirmed");
+    this.attempts.clear(key);
+    await this.db(ref, (c) => c.query(`UPDATE auth.users SET last_sign_in_at = now() WHERE id = $1`, [user.id]));
+    return this.session(ref, project, user);
+  }
+
   /** Trade a one-time link token for a session. The token works once, until it expires. */
-  async verify(ref: string, project: Resolved, input: { token?: unknown; type?: unknown; email?: unknown }) {
+  async verify(ref: string, project: Resolved, input: { token?: unknown; type?: unknown; email?: unknown; phone?: unknown }) {
+    if (input.phone !== undefined) return this.verifyPhone(ref, project, input);
     const gone = () => new AuthError(403, "otp_expired", "Email link or code is invalid or has expired");
     const want = input.type === undefined || input.type === "" ? undefined : TOKEN_TYPES[String(input.type)];
     if (input.type !== undefined && input.type !== "" && !want) throw new AuthError(422, "validation_failed", "type must be signup, recovery, magiclink or email");

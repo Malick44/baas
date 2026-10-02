@@ -276,7 +276,7 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
   app.post("/auth/v1/verify", (req, reply) =>
     withCtx(req, reply, async (ctx) => {
       const b = jsonBody(req);
-      const r = await A.verify(ctx.ref, ctx.project, { token: b.token ?? b.token_hash, type: b.type, email: b.email });
+      const r = await A.verify(ctx.ref, ctx.project, { token: b.token ?? b.token_hash, type: b.type, email: b.email, phone: b.phone });
       return reply.send(r.session);
     }, { anonymous: true }));
   app.get("/auth/v1/authorize", (req, reply) =>

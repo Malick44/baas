@@ -21,6 +21,19 @@ CREATE TABLE IF NOT EXISTS auth.one_time_tokens (
 ALTER TABLE auth.one_time_tokens ADD COLUMN IF NOT EXISTS code_hash text;
 ALTER TABLE auth.one_time_tokens ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS one_time_tokens_user ON auth.one_time_tokens (user_id, token_type);
+ALTER TABLE auth.users ADD COLUMN IF NOT EXISTS phone text;
+ALTER TABLE auth.users ADD COLUMN IF NOT EXISTS phone_confirmed_at timestamptz;
+CREATE UNIQUE INDEX IF NOT EXISTS users_phone_key ON auth.users (phone) WHERE phone IS NOT NULL;
+CREATE TABLE IF NOT EXISTS auth.phone_codes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users ON DELETE CASCADE,
+  code_hash text NOT NULL,
+  attempts int NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL,
+  used_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS phone_codes_user ON auth.phone_codes (user_id);
 CREATE TABLE IF NOT EXISTS auth.identities (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES auth.users ON DELETE CASCADE,
@@ -51,7 +64,7 @@ CREATE TABLE IF NOT EXISTS auth.mfa_challenges (
   verified_at timestamptz
 );
 ALTER TABLE auth.refresh_tokens ADD COLUMN IF NOT EXISTS aal text NOT NULL DEFAULT 'aal1';
-GRANT ALL ON auth.one_time_tokens, auth.identities, auth.mfa_factors, auth.mfa_challenges TO service_role;
+GRANT ALL ON auth.one_time_tokens, auth.identities, auth.mfa_factors, auth.mfa_challenges, auth.phone_codes TO service_role;
 `;
 
 export const PROJECT_SCHEMA_SQL = `
