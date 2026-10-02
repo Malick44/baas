@@ -2315,7 +2315,7 @@ async function authEmail(body, p, cfg, canEdit) {
       h("label", { class: "check" }, confirm, "Require people to confirm their email address before they can sign in"),
       formRow("Sender name", from, "Appears as the name on every email this project sends.")),
     h("div", { class: "card stack" }, h("h3", null, "Templates"),
-      h("p", { class: "muted" }, "Plain text. Variables: {{ .ConfirmationURL }} is the link, {{ .Email }} the person's address, {{ .SiteURL }} your site URL."),
+      h("p", { class: "muted" }, "Plain text. Variables: {{ .ConfirmationURL }} is the link, {{ .Email }} the person's address, {{ .Token }} a six-digit code for apps that cannot open a link, {{ .SiteURL }} your site URL."),
       formRow("Email", kind), formRow("Subject", subject), formRow("Message", text),
       h("div", { class: "row" },
         h("button", { class: "primary", id: "save-email", disabled: !canEdit, onclick: async () => {

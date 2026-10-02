@@ -256,6 +256,18 @@ describe("client sdk: email and provider sign-in", { skip: !ADMIN && "set BAAS_T
     assert.equal((await c.auth.resend({ type: "signup", email: "sdk@example.com" })).error, null);
   });
 
+  it("signs in with the six-digit code from the email", async () => {
+    assert.equal((await c.auth.signInWithOtp({ email: "codes@example.com" })).error, null);
+    const code = /enter this code in the app: (\d{6})/.exec(mail.last("codes@example.com")!.text)![1]!;
+    const bad = await c.auth.verifyOtp({ type: "email", email: "codes@example.com", token: code === "000000" ? "111111" : "000000" });
+    assert.equal(bad.error!.status, 403);
+    const ok = await c.auth.verifyOtp({ type: "email", email: "codes@example.com", token: code });
+    assert.equal(ok.error, null, JSON.stringify(ok.error));
+    assert.equal(ok.data!.user.email, "codes@example.com");
+    assert.equal((await c.auth.getUser()).data!.user.email, "codes@example.com");
+    await c.auth.signOut();
+  });
+
   it("builds the provider address and reads a failure from the URL", async () => {
     const r = await c.auth.signInWithOAuth({ provider: "github", options: { redirectTo: "https://app.example.com/cb", skipBrowserRedirect: true } });
     assert.equal(r.data!.url, `http://${ref}.localhost:${gwPort}/auth/v1/authorize?provider=github&redirect_to=${encodeURIComponent("https://app.example.com/cb")}`);

@@ -18,7 +18,7 @@ describe("small pieces", () => {
     assert.equal(redirectAllowed({}, "https://app.example.com"), false);
   });
   it("fills templates with only the known variables and escapes the HTML version", () => {
-    assert.equal(renderTemplate("Hi {{ .Email }} {{.ConfirmationURL}} {{ .Secret }}", { Email: "a@b.co", ConfirmationURL: "http://x/y", SiteURL: "" }), "Hi a@b.co http://x/y ");
+    assert.equal(renderTemplate("Hi {{ .Email }} {{.ConfirmationURL}} {{ .Secret }}", { Email: "a@b.co", ConfirmationURL: "http://x/y", SiteURL: "", Token: "123456" }), "Hi a@b.co http://x/y ");
     const html = htmlFromText("Hello <script>alert(1)</script>\n\nOpen http://x/y?a=1&b=2 now");
     assert.ok(!html.includes("<script>"));
     assert.match(html, /&lt;script&gt;/);
@@ -320,6 +320,66 @@ describe("email flows and sign-in with providers", { skip: !ADMIN && "set BAAS_T
       assert.equal((await gw("POST", "/auth/v1/verify", { body: { type: "magiclink", token: "short" } })).status, 403);
       assert.equal((await gw("POST", "/auth/v1/verify", { body: { type: "magiclink", token: "x".repeat(43) } })).status, 403);
       assert.equal((await gw("POST", "/auth/v1/verify", { body: { type: "magiclink", token } })).status, 200, "the right kind still works afterwards");
+    });
+  });
+
+  describe("six-digit codes in the same emails", () => {
+    const codeOf = (to: string) => /enter this code in the app: (\d{6})/.exec(mail.last(to)!.text)![1]!;
+    const verify = (body: Record<string, unknown>) => gw("POST", "/auth/v1/verify", { body });
+    before(async () => { await settings(p.ref, { email_confirm: false, email_templates: { confirmation: { subject: "", body: "" } } }); }); // back to the default templates, which carry the code
+
+    it("signs in with the code from a magic-link email, for apps that cannot open a link", async () => {
+      await wait(350);
+      assert.equal((await gw("POST", "/auth/v1/otp", { body: { email: "code1@example.com" } })).status, 200);
+      const code = codeOf("code1@example.com");
+      assert.match(code, /^\d{6}$/);
+      const v = await verify({ email: "code1@example.com", token: code, type: "email" });
+      assert.equal(v.status, 200, v.text);
+      assert.equal(v.json.user.email, "code1@example.com");
+      assert.ok(v.json.user.email_confirmed_at, "entering the code proves the address");
+      assert.equal((await verify({ email: "code1@example.com", token: code, type: "email" })).status, 403, "a code works once");
+      assert.ok(!JSON.stringify((await t.sql(owner, p.ref, "select * from auth.one_time_tokens")).json).includes(code), "the code itself is never stored");
+    });
+
+    it("confirms a sign-up and recovers a password with a code too, and the code belongs to one address and one kind", async () => {
+      await settings(p.ref, { email_confirm: true });
+      await signup("code2@example.com", "old-password-1");
+      const signupCode = codeOf("code2@example.com");
+      assert.equal((await verify({ email: "someone-else@example.com", token: signupCode, type: "signup" })).status, 403, "wrong address");
+      assert.equal((await verify({ email: "code2@example.com", token: signupCode, type: "recovery" })).status, 403, "wrong kind");
+      assert.equal((await verify({ email: "code2@example.com", token: signupCode, type: "signup" })).status, 200);
+      await settings(p.ref, { email_confirm: false });
+      await wait(350);
+      await gw("POST", "/auth/v1/recover", { body: { email: "code2@example.com" } });
+      const rec = await verify({ email: "code2@example.com", token: codeOf("code2@example.com"), type: "recovery" });
+      assert.equal(rec.status, 200, rec.text);
+      assert.equal((await gw("PUT", "/auth/v1/user", { key: rec.json.access_token, body: { password: "new-password-1" } })).status, 200);
+      assert.equal((await login("code2@example.com", "new-password-1")).status, 200);
+    });
+
+    it("gives only a few tries per code, then the code is dead even if it is right", async () => {
+      await wait(350);
+      await gw("POST", "/auth/v1/otp", { body: { email: "code3@example.com" } });
+      const code = codeOf("code3@example.com");
+      const wrong = code === "000000" ? "111111" : "000000";
+      for (let i = 0; i < 5; i++) assert.equal((await verify({ email: "code3@example.com", token: wrong, type: "email" })).status, 403);
+      assert.equal((await verify({ email: "code3@example.com", token: code, type: "email" })).status, 403, "too many wrong guesses: the right code no longer works");
+      await wait(350);
+      await gw("POST", "/auth/v1/otp", { body: { email: "code3@example.com" } });
+      assert.notEqual(codeOf("code3@example.com"), code);
+      for (let i = 0; i < 4; i++) await verify({ email: "code3@example.com", token: wrong, type: "email" });
+      assert.equal((await verify({ email: "code3@example.com", token: codeOf("code3@example.com"), type: "email" })).status, 429, "and the address is rate limited for a while after ten failures");
+    });
+
+    it("rejects malformed codes, unknown addresses and expired codes without saying which", async () => {
+      await wait(350);
+      await gw("POST", "/auth/v1/otp", { body: { email: "code4@example.com" } });
+      const code = codeOf("code4@example.com");
+      for (const bad of ["12345", "1234567", "abcdef", " 123456", "123 456", 123456 as unknown as string, ""]) assert.equal((await verify({ email: "code4@example.com", token: bad, type: "email" })).status, 403, JSON.stringify(bad));
+      assert.equal((await verify({ email: "nobody@example.com", token: "123456", type: "email" })).status, 403);
+      assert.equal((await verify({ email: "not an email", token: "123456", type: "email" })).status, 403);
+      await t.sql(owner, p.ref, "update auth.one_time_tokens set expires_at = now() - interval '1 minute'");
+      assert.equal((await verify({ email: "code4@example.com", token: code, type: "email" })).status, 403);
     });
   });
 

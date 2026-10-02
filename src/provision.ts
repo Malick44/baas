@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS auth.one_time_tokens (
   expires_at timestamptz NOT NULL,
   used_at timestamptz
 );
+ALTER TABLE auth.one_time_tokens ADD COLUMN IF NOT EXISTS code_hash text;
+ALTER TABLE auth.one_time_tokens ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS one_time_tokens_user ON auth.one_time_tokens (user_id, token_type);
 CREATE TABLE IF NOT EXISTS auth.identities (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

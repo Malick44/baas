@@ -57,12 +57,12 @@ export function htmlFromText(text: string): string {
 
 export type TemplateKind = "confirmation" | "recovery" | "magic_link";
 export const DEFAULT_TEMPLATES: Record<TemplateKind, { subject: string; body: string }> = {
-  confirmation: { subject: "Confirm your email address", body: "Hello,\n\nFollow this link to confirm your email address ({{ .Email }}):\n\n{{ .ConfirmationURL }}\n\nIf you did not sign up, you can ignore this message." },
-  recovery: { subject: "Reset your password", body: "Hello,\n\nFollow this link to choose a new password for {{ .Email }}:\n\n{{ .ConfirmationURL }}\n\nIf you did not ask for this, you can ignore this message. Your password stays the same." },
-  magic_link: { subject: "Your sign-in link", body: "Hello,\n\nFollow this link to sign in as {{ .Email }}:\n\n{{ .ConfirmationURL }}\n\nIf you did not ask for this, you can ignore this message." },
+  confirmation: { subject: "Confirm your email address", body: "Hello,\n\nFollow this link to confirm your email address ({{ .Email }}):\n\n{{ .ConfirmationURL }}\n\nOr enter this code in the app: {{ .Token }}\n\nIf you did not sign up, you can ignore this message." },
+  recovery: { subject: "Reset your password", body: "Hello,\n\nFollow this link to choose a new password for {{ .Email }}:\n\n{{ .ConfirmationURL }}\n\nOr enter this code in the app: {{ .Token }}\n\nIf you did not ask for this, you can ignore this message. Your password stays the same." },
+  magic_link: { subject: "Your sign-in link", body: "Hello,\n\nFollow this link to sign in as {{ .Email }}:\n\n{{ .ConfirmationURL }}\n\nOr enter this code in the app: {{ .Token }}\n\nIf you did not ask for this, you can ignore this message." },
 };
 
 /** Fill {{ .Name }} placeholders. Only the variables below exist; anything else becomes empty. */
-export function renderTemplate(text: string, vars: { ConfirmationURL: string; Email: string; SiteURL: string }): string {
+export function renderTemplate(text: string, vars: { ConfirmationURL: string; Email: string; SiteURL: string; Token: string }): string {
   return text.replace(/\{\{\s*\.(\w+)\s*\}\}/g, (_m, k: string) => (vars as Record<string, string>)[k] ?? "");
 }

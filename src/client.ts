@@ -107,8 +107,9 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
       return res.ok ? { data: {}, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not send the email"), status: res.status };
     },
     /** Trade the token from an email link for a session (for apps that handle the link themselves). */
-    async verifyOtp(c: { type: "signup" | "recovery" | "magiclink" | "email"; token: string }): Promise<Result<{ user: User; session: Session }>> {
-      const { res, body } = await authCall("/verify", { method: "POST", body: JSON.stringify({ type: c.type, token: c.token }) });
+    async verifyOtp(c: { type: "signup" | "recovery" | "magiclink" | "email"; token: string; email?: string }): Promise<Result<{ user: User; session: Session }>> {
+      // With `email`, `token` is the six-digit code from the message; without it, the long token from the link.
+      const { res, body } = await authCall("/verify", { method: "POST", body: JSON.stringify({ type: c.type, token: c.token, ...(c.email ? { email: c.email } : {}) }) });
       if (!res.ok) return { data: null, error: err(res.status, body, "verification failed"), status: res.status };
       setSession(body as Session, "SIGNED_IN");
       return { data: { user: body.user, session: body }, error: null, status: res.status };

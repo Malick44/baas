@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, scrypt, timingSafeEqual, createHash, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomInt, scrypt, timingSafeEqual, createHash, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import pg from "pg";
 import { HttpError, type Resolved } from "./control.js";
@@ -116,6 +116,8 @@ export class OAuthFailure extends AuthError {
   }
 }
 
+const codeHash = (userId: string, type: string, code: string) => createHash("sha256").update(`${userId}:${type}:${code}`).digest("hex");
+const MAX_CODE_TRIES = 5;
 const b64 = (b: Buffer | string) => Buffer.from(b).toString("base64url");
 const TOKEN_TYPES: Record<string, "confirmation" | "recovery" | "magiclink"> = { signup: "confirmation", confirmation: "confirmation", recovery: "recovery", magiclink: "magiclink", email: "magiclink" };
 const TOKEN_TTL = { confirmation: 24 * 3600_000, recovery: 3600_000, magiclink: 3600_000 };
@@ -396,17 +398,19 @@ export class AuthService {
     if (!user.email) return;
     await this.ensure(ref, project);
     const raw = randomBytes(32).toString("base64url");
+    // A six-digit code goes in the same email, for apps that cannot take a link. It is only checked together with the address, a few tries at a time.
+    const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
     await this.db(ref, async (c) => {
-      // Only the newest link of each kind works.
+      // Only the newest link or code of each kind works.
       await c.query(`UPDATE auth.one_time_tokens SET used_at = now() WHERE user_id = $1 AND token_type = $2 AND used_at IS NULL`, [user.id, type]);
-      await c.query(`INSERT INTO auth.one_time_tokens (user_id, token_type, token_hash, redirect_to, expires_at) VALUES ($1, $2, $3, $4, now() + ($5::int * interval '1 millisecond'))`,
-        [user.id, type, hashToken(raw), redirectTo, TOKEN_TTL[type]]);
+      await c.query(`INSERT INTO auth.one_time_tokens (user_id, token_type, token_hash, code_hash, redirect_to, expires_at) VALUES ($1, $2, $3, $4, $5, now() + ($6::int * interval '1 millisecond'))`,
+        [user.id, type, hashToken(raw), codeHash(user.id, type, code), redirectTo, TOKEN_TTL[type]]);
     });
     const base = this.opts.publicUrl?.(ref) ?? "";
     const url = `${base}/auth/v1/verify?token=${raw}&type=${type === "confirmation" ? "signup" : type}`;
     const kind = TEMPLATE_OF[type];
     const custom = ((project.settings.email_templates ?? {}) as Record<string, { subject?: string; body?: string }>)[kind] ?? {};
-    const vars = { ConfirmationURL: url, Email: user.email, SiteURL: typeof project.settings.site_url === "string" ? project.settings.site_url : "" };
+    const vars = { ConfirmationURL: url, Token: code, Email: user.email, SiteURL: typeof project.settings.site_url === "string" ? project.settings.site_url : "" };
     const subject = renderTemplate(custom.subject || DEFAULT_TEMPLATES[kind].subject, vars);
     const text = renderTemplate(custom.body || DEFAULT_TEMPLATES[kind].body, vars);
     const fromName = typeof project.settings.mailer_from_name === "string" && project.settings.mailer_from_name ? project.settings.mailer_from_name : undefined;
@@ -468,22 +472,53 @@ export class AuthService {
   }
 
   /** Trade a one-time link token for a session. The token works once, until it expires. */
-  async verify(ref: string, project: Resolved, input: { token?: unknown; type?: unknown }) {
-    if (typeof input.token !== "string" || !/^[\w-]{20,100}$/.test(input.token)) throw new AuthError(403, "otp_expired", "Email link is invalid or has expired");
+  async verify(ref: string, project: Resolved, input: { token?: unknown; type?: unknown; email?: unknown }) {
+    const gone = () => new AuthError(403, "otp_expired", "Email link or code is invalid or has expired");
     const want = input.type === undefined || input.type === "" ? undefined : TOKEN_TYPES[String(input.type)];
     if (input.type !== undefined && input.type !== "" && !want) throw new AuthError(422, "validation_failed", "type must be signup, recovery, magiclink or email");
     await this.ensure(ref, project);
-    const row = await this.db(ref, async (c) =>
-      (await c.query<{ user_id: string; token_type: "confirmation" | "recovery" | "magiclink"; redirect_to: string | null }>(
-        `UPDATE auth.one_time_tokens SET used_at = now() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() AND ($2::text IS NULL OR token_type = $2) RETURNING user_id, token_type, redirect_to`,
-        [hashToken(input.token as string), want ?? null],
-      )).rows[0],
-    );
-    if (!row) throw new AuthError(403, "otp_expired", "Email link is invalid or has expired");
+    type Row = { user_id: string; token_type: "confirmation" | "recovery" | "magiclink"; redirect_to: string | null };
+    let row: Row | undefined;
+    if (input.email !== undefined) {
+      // A six-digit code is only meaningful with the address it was sent to, and only a few guesses are allowed per code.
+      if (typeof input.token !== "string" || !/^\d{6}$/.test(input.token) || typeof input.email !== "string" || !EMAIL.test(input.email)) throw gone();
+      const email = input.email.toLowerCase();
+      this.attempts.check(`code:${ref}:${email}`);
+      const code = input.token;
+      const out = await this.db(ref, async (c) => {
+        const u = (await c.query<{ id: string }>(`SELECT id FROM auth.users WHERE email = $1`, [email])).rows[0];
+        if (!u) return { ok: false as const };
+        const t = (await c.query<Row & { id: string; code_hash: string; attempts: number }>(
+          `SELECT id, user_id, token_type, redirect_to, code_hash, attempts FROM auth.one_time_tokens
+           WHERE user_id = $1 AND used_at IS NULL AND expires_at > now() AND code_hash IS NOT NULL AND ($2::text IS NULL OR token_type = $2)
+           ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [u.id, want ?? null])).rows[0];
+        if (!t || t.attempts >= MAX_CODE_TRIES) return { ok: false as const };
+        const given = Buffer.from(codeHash(u.id, t.token_type, code), "hex");
+        const real = Buffer.from(t.code_hash, "hex");
+        if (given.length === real.length && timingSafeEqual(given, real)) {
+          await c.query(`UPDATE auth.one_time_tokens SET used_at = now() WHERE id = $1`, [t.id]);
+          return { ok: true as const, row: { user_id: t.user_id, token_type: t.token_type, redirect_to: t.redirect_to } };
+        }
+        await c.query(`UPDATE auth.one_time_tokens SET attempts = attempts + 1 WHERE id = $1`, [t.id]);
+        return { ok: false as const };
+      });
+      if (!out.ok) { this.attempts.fail(`code:${ref}:${email}`); throw gone(); }
+      this.attempts.clear(`code:${ref}:${email}`);
+      row = out.row;
+    } else {
+      if (typeof input.token !== "string" || !/^[\w-]{20,100}$/.test(input.token)) throw gone();
+      row = await this.db(ref, async (c) =>
+        (await c.query<Row>(
+          `UPDATE auth.one_time_tokens SET used_at = now() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() AND ($2::text IS NULL OR token_type = $2) RETURNING user_id, token_type, redirect_to`,
+          [hashToken(input.token as string), want ?? null],
+        )).rows[0],
+      );
+    }
+    if (!row) throw gone();
     const u = await this.db(ref, async (c) =>
       (await c.query<UserRow>(`UPDATE auth.users SET email_confirmed_at = coalesce(email_confirmed_at, now()), last_sign_in_at = now(), updated_at = now() WHERE id = $1 RETURNING *`, [row.user_id])).rows[0],
     );
-    if (!u) throw new AuthError(403, "otp_expired", "Email link is invalid or has expired");
+    if (!u) throw gone();
     if (u.banned_until && u.banned_until > new Date()) throw new AuthError(400, "user_banned", "User is banned");
     const session = await this.session(ref, project, u);
     // The redirect was checked when the link was made, but the owner may have tightened the list since.
