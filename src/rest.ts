@@ -1,12 +1,13 @@
 import type pg from "pg";
 import { HttpError } from "./control.js";
 import type { ApiRole, PoolManager } from "./pools.js";
+import { buildEmbeds, loadRelationships, parseSelectTree } from "./rest-embed.js";
 
 /**
  * PostgREST-compatible subset over one project's `public` schema.
  * Supported: select (columns, aliases), filters (eq neq gt gte lt lte like ilike is in, not.), or/and (flat),
  * order, limit/offset/Range, Prefer count/return/resolution, single-object Accept, POST/PATCH/DELETE, upsert, rpc.
- * Not supported: embedded resources, JSON path operators, casts. Unfiltered PATCH/DELETE is rejected.
+ * Embedded resources (select=*,orders(*)) follow foreign keys: see rest-embed.ts. Not supported: JSON path operators, casts. Unfiltered PATCH/DELETE is rejected.
  * Every value is a bound parameter; identifiers are validated, then quoted.
  */
 
@@ -100,22 +101,10 @@ export function buildFilters(table: string, query: Record<string, string | strin
       continue;
     }
     if (RESERVED.has(key)) continue;
+    if (key.includes(".")) continue; // filters on an embedded resource: <name>.<column>=…, applied where the embed is built
     for (const v of vals) conds.push(condition(`${qt}.${ident(key, "column")}`, v, params));
   }
   return conds;
-}
-
-function parseSelect(sel: string | undefined): string {
-  if (!sel || sel === "*") return "*";
-  return splitTop(sel)
-    .map((item) => {
-      if (item === "*") return "*";
-      if (/[()!>]|::/.test(item)) throw bad("embedded resources, casts and JSON operators in select are not supported");
-      const parts = item.split(":");
-      if (parts.length > 2) throw bad("malformed select item");
-      return parts.length === 1 ? ident(parts[0]!, "column") : `${ident(parts[1]!, "column")} AS ${ident(parts[0]!, "alias")}`;
-    })
-    .join(", ");
 }
 
 function parseOrder(order: string | undefined): string {
@@ -245,9 +234,7 @@ async function run(pm: PoolManager, req: RestRequest): Promise<RestResponse> {
   const ctx = { role: req.role, claims: req.claims, readOnly };
 
   if (readOnly) {
-    const select = parseSelect(q(req.query, "select"));
-    const conds = buildFilters(table, req.query, params);
-    const where = conds.length ? ` WHERE ${conds.join(" AND ")}` : "";
+    const tree = parseSelectTree(q(req.query, "select"));
     let limit = nonNegInt(q(req.query, "limit"), "limit");
     let offset = nonNegInt(q(req.query, "offset"), "offset") ?? 0;
     const range = /^(\d+)-(\d*)$/.exec(header(req.headers, "range") ?? "");
@@ -257,8 +244,20 @@ async function run(pm: PoolManager, req: RestRequest): Promise<RestResponse> {
     }
     limit = Math.min(limit ?? MAX_ROWS, MAX_ROWS);
     const order = parseOrder(q(req.query, "order"));
-    const sql = AGG(`SELECT ${select} FROM ${qt}${where}${order} LIMIT ${limit} OFFSET ${offset}`);
     const out = await pm.withRole(req.ref, ctx, async (c) => {
+      const conds = buildFilters(table, req.query, params);
+      const selects = [...tree.columns];
+      const dotted = Object.keys(req.query).filter((k) => k.includes(".") && !["or", "and"].includes(k));
+      if (tree.embeds.length) {
+        const used = new Set<string>();
+        const built = buildEmbeds(await loadRelationships(c), table, qt, tree.embeds, req.query, params, used);
+        selects.push(...built.selects);
+        conds.push(...built.inner);
+        const stray = dotted.find((k) => !used.has(k));
+        if (stray) throw bad(`the filter ${JSON.stringify(stray.slice(0, 64))} does not match an embedded resource in select`);
+      } else if (dotted.length) throw bad(`the filter ${JSON.stringify(dotted[0]!.slice(0, 64))} refers to an embedded resource, but select embeds none`);
+      const where = conds.length ? ` WHERE ${conds.join(" AND ")}` : "";
+      const sql = AGG(`SELECT ${selects.join(", ") || "*"} FROM ${qt}${where}${order} LIMIT ${limit} OFFSET ${offset}`);
       const rows = (await c.query<{ body: string; n: number }>(sql, params)).rows[0]!;
       let total: number | undefined;
       if (pf.count === "exact") total = Number((await c.query(`SELECT count(*)::int AS n FROM ${qt}${where}`, params)).rows[0].n);
