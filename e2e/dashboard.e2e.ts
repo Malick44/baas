@@ -1239,6 +1239,45 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     assert.equal((await preflight("https://elsewhere.example.com")).headers.get("access-control-allow-origin"), "*");
   });
 
+
+  step("adds, edits and removes a custom OpenID Connect provider", async () => {
+    await tab("auth", "providers");
+    await page.waitForSelector("#add-oidc");
+    await page.click("#add-oidc");
+    await page.fill("#oidc-id", "acme-sso");
+    await page.fill("#oidc-label", "Acme SSO");
+    await page.fill("#oidc-issuer", "https://login.example.com");
+    await page.fill("#oidc-client-id", "acme-client");
+    await page.fill("#oidc-scopes", "email profile");
+    await page.click("dialog button[type=submit]");
+    await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+    assert.match((await page.textContent("dialog .notice.bad"))!, /invalid value for oidc_providers/);
+    await page.fill("#oidc-scopes", "openid email profile");
+    await page.click("dialog button[type=submit]");
+    await page.waitForFunction(() => /needs an issuer/.test(document.querySelector("dialog .notice.bad")?.textContent ?? ""));
+    await page.fill("#oidc-secret", "oidc-super-secret");
+    await page.click("dialog button[type=submit]");
+    await toast("Provider saved");
+    await page.waitForSelector("tr[data-row=acme-sso][data-custom]");
+    assert.match((await page.textContent("tr[data-row=acme-sso]"))!, /Acme SSO\s*OIDC\s*Enabled\s*acme-client/);
+    assert.ok(!(await t.api("GET", `/v1/projects/${ref}/settings`, { token: owner })).text.includes("oidc-super-secret"));
+    t.platform.dir.forget(ref);
+    assert.equal((await (await rest("/auth/v1/settings")).json()).external["acme-sso"], true);
+
+    await page.click("tr[data-row=acme-sso] [data-action=configure]");
+    assert.equal(await page.isDisabled("#oidc-id"), true, "the name cannot change once created");
+    assert.match((await page.getAttribute("#oidc-secret", "placeholder"))!, /A secret is saved/);
+    await page.uncheck("#oidc-enabled");
+    await page.click("dialog button[type=submit]");
+    await page.waitForFunction(() => document.querySelector("tr[data-row=acme-sso] .chip[data-status]")?.getAttribute("data-status") === "disabled");
+    await shot("06l-custom-oidc");
+
+    await page.click("tr[data-row=acme-sso] [data-action=remove-provider]");
+    await page.click("dialog button[type=submit]");
+    await page.locator("tr[data-row=acme-sso]").waitFor({ state: "detached" });
+    t.platform.dir.forget(ref);
+    assert.equal((await (await rest("/auth/v1/settings")).json()).external["acme-sso"], undefined);
+  });
   step("manages confirmation emails, templates and the email actions on users", async () => {
     await tab("auth", "email");
     await page.waitForSelector("#mail-on");

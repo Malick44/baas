@@ -6,6 +6,7 @@ import { signJwt } from "./keys.js";
 import { DEFAULT_TEMPLATES, htmlFromText, NoMailer, renderTemplate, type Mailer, type TemplateKind } from "./mailer.js";
 import { matchStep, newSecret, otpauthUri, stepAt } from "./totp.js";
 import { isProvider, PROVIDERS, type OAuthProvider, type Profile } from "./oauth.js";
+import { guardedJson, OidcClient, OidcError, profileFromClaims } from "./oidc.js";
 import type { PoolManager } from "./pools.js";
 import { AUTH_EXTRAS_SQL, urlFor } from "./provision.js";
 import type { Vault } from "./vault.js";
@@ -103,6 +104,8 @@ export type AuthOptions = {
   /** Point a provider at a different server (a self-hosted GitHub, or a stand-in during tests). */
   providerOverrides?: Record<string, Partial<Pick<OAuthProvider, "authUrl" | "tokenUrl" | "userUrl" | "emailsUrl">>>;
   fetch?: typeof fetch;
+  /** Let custom OpenID Connect providers sit on private or local addresses (tests, or an identity provider inside your own network). */
+  oidcAllowPrivate?: boolean;
   /** Minimum time between emails to the same address, and the most emails one project may send per hour. */
   emailCooldownMs?: number;
   maxEmailsPerHour?: number;
@@ -145,8 +148,10 @@ export class AuthService {
   private cooldown = new Map<string, number>();
   private hourly = new Map<string, { n: number; until: number }>();
   private mailer: Mailer;
+  private oidc: OidcClient;
   constructor(private pm: PoolManager, private opts: AuthOptions = {}) {
     this.mailer = opts.mailer ?? new NoMailer();
+    this.oidc = new OidcClient(opts.oidcAllowPrivate === true);
   }
 
   get emailConfigured() {
@@ -176,6 +181,8 @@ export class AuthService {
     const providers = (project.settings.auth_providers ?? {}) as Record<string, { enabled?: boolean; client_id?: string; secret_enc?: string }>;
     const external: Record<string, boolean> = { email: true };
     for (const name of Object.keys(PROVIDERS)) external[name] = providers[name]?.enabled === true && !!providers[name]?.client_id && !!providers[name]?.secret_enc && !!this.opts.vault;
+    const custom = (project.settings.oidc_providers ?? {}) as Record<string, { enabled?: boolean; client_id?: string; secret_enc?: string; issuer?: string }>;
+    for (const [name, c] of Object.entries(custom)) external[name] = c?.enabled === true && !!c.client_id && !!c.secret_enc && !!c.issuer && !!this.opts.vault;
     return { external, disable_signup: project.settings.disable_signup === true, mailer_autoconfirm: !this.confirmRequired(project), email_delivery: this.mailer.configured, password_min_length: this.minPassword(project) };
   }
 
@@ -632,12 +639,23 @@ export class AuthService {
   // ---- sign in with an outside provider ----
 
   private providerConfig(ref: string, project: Resolved, name: unknown) {
+    const off = (n: string) => new AuthError(400, "provider_disabled", `Unsupported provider: ${n} is not enabled for this project`);
+    if (typeof name === "string" && !isProvider(name) && Object.hasOwn((project.settings.oidc_providers ?? {}) as object, name)) {
+      const c = ((project.settings.oidc_providers ?? {}) as Record<string, { enabled?: boolean; client_id?: string; secret_enc?: string; issuer?: string; scopes?: string }>)[name]!;
+      if (!c.enabled || !c.client_id || !c.secret_enc || !c.issuer || !this.opts.vault) throw off(name);
+      return { kind: "oidc" as const, name, issuer: c.issuer, scopes: c.scopes || "openid email profile", clientId: c.client_id, secret: this.opts.vault.open(c.secret_enc, `${ref}:oauth:${name}`) };
+    }
     if (!isProvider(name)) throw new AuthError(400, "validation_failed", "Unsupported provider");
     const cfg = ((project.settings.auth_providers ?? {}) as Record<string, { enabled?: boolean; client_id?: string; secret_enc?: string }>)[name];
-    if (!cfg?.enabled || !cfg.client_id || !cfg.secret_enc || !this.opts.vault) throw new AuthError(400, "provider_disabled", `Unsupported provider: ${name} is not enabled for this project`);
+    if (!cfg?.enabled || !cfg.client_id || !cfg.secret_enc || !this.opts.vault) throw off(name);
     const base = PROVIDERS[name]!;
     const o = this.opts.providerOverrides?.[name] ?? {};
-    return { name, provider: { ...base, ...o } as OAuthProvider, clientId: cfg.client_id, secret: this.opts.vault.open(cfg.secret_enc, `${ref}:oauth:${name}`) };
+    return { kind: "oauth" as const, name, provider: { ...base, ...o } as OAuthProvider, clientId: cfg.client_id, secret: this.opts.vault.open(cfg.secret_enc, `${ref}:oauth:${name}`) };
+  }
+
+  /** What an ID token must echo back, derived from the flow's nonce so nothing extra has to be stored. */
+  private oidcNonce(project: Resolved, nonce: string) {
+    return createHmac("sha256", project.secrets!.jwtSecret).update(`oidc-nonce:${nonce}`).digest("base64url");
   }
 
   private stateKey(project: Resolved) {
@@ -651,19 +669,24 @@ export class AuthService {
   }
 
   /** Where to send the browser to start signing in. `nonce` must also be set as a cookie, to bind the flow to this browser. */
-  authorize(ref: string, project: Resolved, providerName: unknown, redirectTo: unknown) {
+  async authorize(ref: string, project: Resolved, providerName: unknown, redirectTo: unknown) {
     const cfg = this.providerConfig(ref, project, providerName);
     const redirect = this.redirectFor(project, redirectTo);
     if (!redirect) throw new AuthError(400, "validation_failed", "redirect_to is required: set a site URL or pass an allowed redirect_to");
     const nonce = randomBytes(16).toString("base64url");
     const payload = b64(JSON.stringify({ p: cfg.name, r: redirect, n: nonce, e: Math.floor(Date.now() / 1000) + 600 }));
     const state = `${payload}.${createHmac("sha256", this.stateKey(project)).update(payload).digest("base64url")}`;
-    const q = new URLSearchParams({ client_id: cfg.clientId, redirect_uri: this.callbackUrl(ref), response_type: "code", scope: cfg.provider.scopes, state });
-    if (cfg.provider.pkce) {
+    let authUrl: string;
+    const q = new URLSearchParams({ client_id: cfg.clientId, redirect_uri: this.callbackUrl(ref), response_type: "code", scope: cfg.kind === "oidc" ? cfg.scopes : cfg.provider.scopes, state });
+    if (cfg.kind === "oidc") {
+      try { authUrl = (await this.oidc.discover(cfg.issuer)).authorization_endpoint; } catch (e) { throw new AuthError(502, "provider_error", (e as Error).message); }
+      q.set("nonce", this.oidcNonce(project, nonce));
+    } else authUrl = cfg.provider.authUrl;
+    if (cfg.kind === "oidc" || cfg.provider.pkce) {
       q.set("code_challenge", createHash("sha256").update(this.pkceVerifier(project, nonce)).digest("base64url"));
       q.set("code_challenge_method", "S256");
     }
-    return { url: `${cfg.provider.authUrl}${cfg.provider.authUrl.includes("?") ? "&" : "?"}${q}`, nonce };
+    return { url: `${authUrl}${authUrl.includes("?") ? "&" : "?"}${q}`, nonce };
   }
 
   private async fetchJson(url: string, init: RequestInit): Promise<any> {
@@ -706,16 +729,19 @@ export class AuthService {
     const cfg = this.providerConfig(ref, project, st.p);
     let profile: Profile;
     try {
-      const body = new URLSearchParams({ grant_type: "authorization_code", code: one("code"), redirect_uri: this.callbackUrl(ref), client_id: cfg.clientId, client_secret: cfg.secret });
-      if (cfg.provider.pkce) body.set("code_verifier", this.pkceVerifier(project, st.n));
-      const tok = await this.fetchJson(cfg.provider.tokenUrl, { method: "POST", headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" }, body });
-      if (typeof tok?.access_token !== "string") throw new Error("the provider did not return an access token");
-      const auth = { authorization: `Bearer ${tok.access_token}`, accept: "application/json", "user-agent": "baas-auth" };
-      const user = await this.fetchJson(cfg.provider.userUrl, { headers: auth });
-      const emails = cfg.provider.emailsUrl ? await this.fetchJson(cfg.provider.emailsUrl, { headers: auth }).catch(() => []) : undefined;
-      profile = cfg.provider.profile(user, Array.isArray(emails) ? emails : undefined);
+      if (cfg.kind === "oidc") profile = await this.oidcProfile(ref, project, cfg, one("code"), st.n);
+      else {
+        const body = new URLSearchParams({ grant_type: "authorization_code", code: one("code"), redirect_uri: this.callbackUrl(ref), client_id: cfg.clientId, client_secret: cfg.secret });
+        if (cfg.provider.pkce) body.set("code_verifier", this.pkceVerifier(project, st.n));
+        const tok = await this.fetchJson(cfg.provider.tokenUrl, { method: "POST", headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" }, body });
+        if (typeof tok?.access_token !== "string") throw new Error("the provider did not return an access token");
+        const auth = { authorization: `Bearer ${tok.access_token}`, accept: "application/json", "user-agent": "baas-auth" };
+        const user = await this.fetchJson(cfg.provider.userUrl, { headers: auth });
+        const emails = cfg.provider.emailsUrl ? await this.fetchJson(cfg.provider.emailsUrl, { headers: auth }).catch(() => []) : undefined;
+        profile = cfg.provider.profile(user, Array.isArray(emails) ? emails : undefined);
+      }
     } catch (e) {
-      throw fail(502, "provider_error", (e as Error).message);
+      throw fail(502, "provider_error", e instanceof OidcError ? e.message : (e as Error).message);
     }
     if (!profile.id || profile.id === "undefined") throw fail(502, "provider_error", "The provider did not say who you are");
     await this.ensure(ref, project);
@@ -724,6 +750,21 @@ export class AuthService {
       throw e;
     });
     return { session: await this.session(ref, project, user), redirectTo: back };
+  }
+
+  private async oidcProfile(ref: string, project: Resolved, cfg: { name: string; issuer: string; clientId: string; secret: string }, code: string, flowNonce: string): Promise<Profile> {
+    const disco = await this.oidc.discover(cfg.issuer);
+    const form = new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: this.callbackUrl(ref), code_verifier: this.pkceVerifier(project, flowNonce) });
+    const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+    const methods = disco.token_endpoint_auth_methods_supported;
+    if (methods && !methods.includes("client_secret_post") && methods.includes("client_secret_basic"))
+      headers.authorization = `Basic ${Buffer.from(`${encodeURIComponent(cfg.clientId)}:${encodeURIComponent(cfg.secret)}`).toString("base64")}`;
+    else { form.set("client_id", cfg.clientId); form.set("client_secret", cfg.secret); }
+    const r = await guardedJson(disco.token_endpoint, { method: "POST", headers, body: form.toString() }, this.opts.oidcAllowPrivate === true);
+    if (r.status !== 200 || typeof r.json?.id_token !== "string") throw new OidcError(`the provider answered ${r.status}${r.json?.error_description ? `: ${r.json.error_description}` : r.json?.error ? `: ${String(r.json.error)}` : " without an ID token"}`);
+    const claims = await this.oidc.verifyIdToken(r.json.id_token, { disco, clientId: cfg.clientId, nonce: this.oidcNonce(project, flowNonce) });
+    const needMore = typeof claims.email !== "string" && typeof r.json.access_token === "string";
+    return profileFromClaims(claims, needMore ? await this.oidc.userinfo(disco, r.json.access_token) : null);
   }
 
   /** Find or create the user for a provider identity, linking to an existing account only when the provider vouches for the address. */

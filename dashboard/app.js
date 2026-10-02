@@ -2415,6 +2415,37 @@ async function authProviders(body, p, cfg, canEdit) {
     });
     if (ok) { toast(`${pr.label} saved`, "ok"); state = await api("GET", `/v1/projects/${p.ref}/auth-config`); draw(); }
   };
+  /** A provider that speaks OpenID Connect: only the issuer is needed, the endpoints come from its discovery document. */
+  const customSheet = async (pr) => {
+    const isNew = !pr;
+    const cur = pr || { id: "", label: "", issuer: "", client_id: "", scopes: "openid email profile", enabled: true, secret_set: false };
+    const slug = h("input", { id: "oidc-id", autocomplete: "off", value: cur.id, placeholder: "acme-sso", pattern: "[a-z][a-z0-9\\-]{1,30}", required: true, disabled: !isNew });
+    const label = h("input", { id: "oidc-label", autocomplete: "off", value: cur.label, placeholder: "Acme SSO" });
+    const issuer = h("input", { id: "oidc-issuer", type: "url", autocomplete: "off", value: cur.issuer, placeholder: "https://login.example.com", required: true });
+    const clientId = h("input", { id: "oidc-client-id", autocomplete: "off", value: cur.client_id, required: true });
+    const secret = h("input", { id: "oidc-secret", type: "password", autocomplete: "new-password", placeholder: cur.secret_set ? "A secret is saved. Leave empty to keep it." : "Client secret" });
+    const scopes = h("input", { id: "oidc-scopes", autocomplete: "off", value: cur.scopes });
+    const enabled = h("input", { type: "checkbox", id: "oidc-enabled", checked: cur.enabled });
+    const ok = await dialog(isNew ? "Add a custom provider" : `Sign in with ${cur.label || cur.id}`, () => h("div", { class: "stack" },
+      h("p", { class: "muted" }, "Any provider that supports OpenID Connect: Okta, Auth0, Keycloak, Microsoft Entra, your own. Baas reads its settings from <issuer>/.well-known/openid-configuration and checks every sign-in's ID token."),
+      formRow("Callback URL", h("div", { class: "kv" }, ...copyable(state.callback_url)), "Add this as the redirect URI when you register baas with the provider."),
+      formRow("Name", slug, isNew ? "Lowercase letters, digits and dashes. Used in the sign-in URL (?provider=name)." : "Fixed once created, because it is saved with each person's identity."),
+      formRow("Label", label, "Shown on the sign-in button."),
+      formRow("Issuer", issuer, "The provider's address, exactly as it names itself. It must use https and be reachable from this server."),
+      formRow("Client ID", clientId), formRow("Client secret", secret, "Stored encrypted and never shown again."),
+      formRow("Scopes", scopes, "Space separated; must include openid."),
+      formRow("Enabled", h("label", { class: "check" }, enabled, "Let people sign in with it")),
+      h("p", { class: "muted" }, "An existing account is linked only when the provider says the email address is verified.")), {
+      sheet: true, confirmLabel: "Save",
+      onSubmit: async () => {
+        const entry = { enabled: enabled.checked, label: label.value.trim() || slug.value.trim(), issuer: issuer.value.trim(), client_id: clientId.value.trim(), scopes: scopes.value.trim() || "openid email profile" };
+        if (secret.value) entry.secret = secret.value;
+        await saveAuthSettings(p, { oidc_providers: { [cur.id || slug.value.trim()]: entry } });
+        return true;
+      },
+    });
+    if (ok) { toast("Provider saved", "ok"); state = await api("GET", `/v1/projects/${p.ref}/auth-config`); draw(); }
+  };
   const draw = () => {
     clear(slot);
     slot.append(h("div", { class: "tablewrap" }, h("table", { class: "data", id: "provider-table" },
@@ -2425,7 +2456,16 @@ async function authProviders(body, p, cfg, canEdit) {
           h("td", null, h("button", { class: "linkish", "data-action": "configure", disabled: !canEdit, onclick: () => sheet(pr) }, pr.label)),
           h("td", null, h("span", { class: `chip ${pr.enabled ? "healthy" : "paused"}`, "data-status": pr.enabled ? "enabled" : "disabled" }, pr.enabled ? "Enabled" : pr.secret_set ? "Disabled" : "Not set up")),
           h("td", { class: "mono-cell" }, pr.client_id || "—"),
-          h("td", { class: "actions-cell" }, canEdit ? h("button", { class: "small", onclick: () => sheet(pr) }, "Configure") : null)))))));
+          h("td", { class: "actions-cell" }, canEdit ? h("button", { class: "small", onclick: () => sheet(pr) }, "Configure") : null))),
+        (state.custom_providers || []).map((pr) => h("tr", { "data-row": pr.id, "data-custom": "true" },
+          h("td", null, h("button", { class: "linkish", "data-action": "configure", disabled: !canEdit, onclick: () => customSheet(pr) }, pr.label), h("span", { class: "chip" }, "OIDC")),
+          h("td", null, h("span", { class: `chip ${pr.enabled ? "healthy" : "paused"}`, "data-status": pr.enabled ? "enabled" : "disabled" }, pr.enabled ? "Enabled" : "Disabled")),
+          h("td", { class: "mono-cell" }, pr.client_id || "—"),
+          h("td", { class: "actions-cell" }, canEdit ? [h("button", { class: "small", onclick: () => customSheet(pr) }, "Configure"), " ", h("button", { class: "small", "data-action": "remove-provider", onclick: async () => {
+            if (!(await confirmBox("Remove provider", `People who signed in with ${pr.label} keep their accounts but cannot use it to sign in until you add it again.`, { confirmLabel: "Remove" }))) return;
+            try { await saveAuthSettings(p, { oidc_providers: { [pr.id]: null } }); toast("Provider removed", "ok"); state = await api("GET", `/v1/projects/${p.ref}/auth-config`); draw(); } catch (ex) { toast(ex.message, "bad"); }
+          } }, "Remove")] : null)))))),
+      canEdit && h("div", { class: "row mt" }, h("button", { id: "add-oidc", onclick: () => customSheet(null) }, "Add custom provider (OpenID Connect)")));
   };
   clear(body);
   body.append(h("div", null, h("div", { class: "page-head" }, h("h1", null, "Sign-in providers")),

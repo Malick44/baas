@@ -46,7 +46,7 @@ export type PlatformConfig = {
   functions?: { egress?: "public" | "open"; egressAllow?: string[] };
   /** Outgoing email for confirmation, password reset and magic links. Leave out to switch those flows off. Give `mailer` to supply your own (tests do). */
   mail?: { smtpUrl?: string; from?: string; mailer?: Mailer };
-  auth?: Pick<AuthOptions, "providerOverrides" | "emailCooldownMs" | "maxEmailsPerHour" | "fetch">;
+  auth?: Pick<AuthOptions, "providerOverrides" | "emailCooldownMs" | "maxEmailsPerHour" | "fetch" | "oidcAllowPrivate">;
   /** Webhook pipelines. `tickMs` is how often pending changes are delivered (default 5 s). */
   pipelines?: PipelineOptions & { tickMs?: number };
   /** Server-side cap on any single data-plane query (default 20 s). Users cannot raise it with SET statement_timeout. */

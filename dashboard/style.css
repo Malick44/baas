@@ -364,3 +364,4 @@ a.integ-card:hover { border-color: var(--line-strong); text-decoration: none; }
 .cond-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.2fr) 30px; gap: 8px; align-items: center; }
 @media (max-width: 640px) { .cond-row { grid-template-columns: minmax(0, 1fr) 30px; } }
 .form-row input[type=checkbox], .form-row input[type=radio] { width: auto; }
+.row.mt { margin-top: 12px; }

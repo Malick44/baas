@@ -282,7 +282,7 @@ export function buildGateway(pm: PoolManager, services: GatewayServices, opts: G
   app.get("/auth/v1/authorize", (req, reply) =>
     withCtx(req, reply, async (ctx) => {
       const q = req.query as Record<string, string>;
-      const { url, nonce } = A.authorize(ctx.ref, ctx.project, q.provider, q.redirect_to);
+      const { url, nonce } = await A.authorize(ctx.ref, ctx.project, q.provider, q.redirect_to);
       return reply.header("set-cookie", `baas_oauth=${nonce}; HttpOnly; SameSite=Lax; Path=/auth/v1; Max-Age=600${A.secureCookies ? "; Secure" : ""}`).code(302).header("location", url).send("");
     }, { anonymous: true }));
   app.get("/auth/v1/callback", (req, reply) =>

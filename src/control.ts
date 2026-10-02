@@ -35,6 +35,10 @@ export type ProjectSecrets = { jwtSecret: string; serviceKey: string; anonKey: s
 const TEMPLATE_KINDS = ["confirmation", "recovery", "magic_link"];
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 
+const isIssuer = (s: string) => {
+  try { const u = new URL(s); return (u.protocol === "https:" || u.protocol === "http:") && !u.username && !u.password && !u.search && !u.hash; } catch { return false; }
+};
+
 const SETTINGS_KEYS = {
   email_confirm: (v: unknown) => typeof v === "boolean",
   mailer_from_name: (v: unknown) => typeof v === "string" && v.length <= 60 && !/[\r\n<>"]/.test(v),
@@ -45,6 +49,11 @@ const SETTINGS_KEYS = {
   auth_providers: (v: unknown) =>
     isObj(v) && Object.entries(v).every(([k, x]) => isProvider(k) && isObj(x) && Object.entries(x).every(([f, t]) =>
       (f === "enabled" && typeof t === "boolean") || (f === "client_id" && typeof t === "string" && t.length <= 300) || (f === "secret" && typeof t === "string" && t.length <= 2000))),
+  oidc_providers: (v: unknown) =>
+    isObj(v) && Object.keys(v).length <= 5 && Object.entries(v).every(([k, x]) => /^[a-z][a-z0-9-]{1,30}$/.test(k) && !isProvider(k) && (x === null || (isObj(x) && Object.entries(x).every(([f, t]) =>
+      (f === "enabled" && typeof t === "boolean") || (f === "label" && typeof t === "string" && t.length <= 60 && !/[\r\n<>]/.test(t)) ||
+      (f === "issuer" && typeof t === "string" && t.length <= 300 && isIssuer(t)) || (f === "client_id" && typeof t === "string" && t.length <= 300) ||
+      (f === "secret" && typeof t === "string" && t.length <= 2000) || (f === "scopes" && typeof t === "string" && t.length <= 300 && /^[\x21\x23-\x5b\x5d-\x7e]+( [\x21\x23-\x5b\x5d-\x7e]+)*$/.test(t) && t.split(" ").includes("openid")))))),
   site_url: (v: unknown) => typeof v === "string" && /^https?:\/\//.test(v),
   redirect_urls: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string"),
   cors_origins: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string"),
@@ -268,6 +277,12 @@ export class ControlPlane {
         const { secret_enc, ...rest } = (v ?? {}) as Record<string, unknown>;
         return [k, { ...rest, secret_set: typeof secret_enc === "string" && secret_enc.length > 0 }];
       }));
+    const oidc = out.oidc_providers;
+    if (isObj(oidc))
+      out.oidc_providers = Object.fromEntries(Object.entries(oidc).map(([k, v]) => {
+        const { secret_enc, ...rest } = (v ?? {}) as Record<string, unknown>;
+        return [k, { ...rest, secret_set: typeof secret_enc === "string" && secret_enc.length > 0 }];
+      }));
     return out;
   }
 
@@ -305,6 +320,22 @@ export class ControlPlane {
         merged[name] = entry;
       }
       next.auth_providers = merged;
+    }
+    if (isObj(patch.oidc_providers)) {
+      const merged: Record<string, Record<string, unknown>> = { ...(isObj(cur.oidc_providers) ? (cur.oidc_providers as Record<string, Record<string, unknown>>) : {}) };
+      for (const [name, v] of Object.entries(patch.oidc_providers as Record<string, Record<string, unknown> | null>)) {
+        if (v === null) { delete merged[name]; continue; }
+        const { secret, ...rest } = v;
+        const entry: Record<string, unknown> = { ...(merged[name] ?? {}), ...rest };
+        if (typeof secret === "string") {
+          if (secret) entry.secret_enc = this.vault.seal(secret, `${ref}:oauth:${name}`);
+          else delete entry.secret_enc;
+        }
+        if (entry.enabled === true && (!entry.issuer || !entry.client_id || !entry.secret_enc)) throw new HttpError(400, `${name} needs an issuer, a client id and a client secret before it can be enabled`);
+        merged[name] = entry;
+      }
+      if (Object.keys(merged).length > 5) throw new HttpError(400, "at most 5 custom providers per project");
+      next.oidc_providers = merged;
     }
     const r = await this.pool.query(`UPDATE project_settings SET settings = settings || $2::jsonb WHERE ref = $1 RETURNING settings`, [ref, JSON.stringify(next)]);
     await this.audit(p.tokenId, p.orgId, "project.settings", ref, { keys: Object.keys(patch) });
