@@ -70,4 +70,4 @@ A signed-in user could set their own `app_metadata`, which policies may trust (n
 - **CI.** Nothing runs the 250 unit tests or the browser suite automatically, and `docker compose up` has not been exercised end to end by a test. A workflow plus a compose smoke test (start, create an org and project, make a request) is the next step.
 - **Auth gaps.** Numeric one-time codes (links only today), phone sign-in, custom OIDC providers, multi-factor.
 - **Dashboard gaps.** Roles and Publications are read-only; the Schema Visualizer shows relationships but does not edit them; editors are plain textareas without syntax highlighting.
-- **Platform.** A function runner that is a real network boundary (the in-process egress guard is defence in depth); PITR; multi-node (shard project databases across clusters, move request logs and rate-limit state to shared storage); per-user dashboard accounts.
+- **Platform.** A function runner that is a real network boundary (the in-process egress guard is defence in depth); PITR; multi-node (shard project databases across clusters, move request logs and rate-limit state to shared storage). Member accounts: email password reset, MFA, SSO.

@@ -1387,38 +1387,38 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
   });
 
   step("saves settings that the API enforces, and changes the plan", async () => {
+    /** Click save and wait for the server to answer, so a toast left over from an earlier save cannot satisfy the wait. */
+    const saveSettings = async (status = 200) => {
+      const [res] = await Promise.all([page.waitForResponse((r) => /\/settings$/.test(r.url()) && r.request().method() === "PATCH"), page.click("#save-settings")]);
+      assert.equal(res.status(), status);
+    };
     await tab("auth", "sessions");
     await page.fill("#set-expiry", "900");
     await page.check("#set-disable");
-    await page.click("#save-settings");
-    await toast("Settings saved");
+    await saveSettings();
     t.platform.dir.forget(ref);
     const su = await rest("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email: "late@example.com", password: "secret123" }) });
     assert.equal(su.status, 422);
     await page.uncheck("#set-disable");
-    await page.click("#save-settings");
-    await toast("Settings saved");
+    await saveSettings();
     t.platform.dir.forget(ref);
     const ok = await rest("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email: "late@example.com", password: "secret123" }) });
     assert.equal((await ok.json()).expires_in, 900);
     await page.fill("#set-minpw", "3");
-    await page.click("#save-settings");
+    await saveSettings(400);
     await toast("invalid value for password_min_length");
     await page.fill("#set-minpw", "8");
-    await page.click("#save-settings");
-    await toast("Settings saved");
+    await saveSettings();
     t.platform.dir.forget(ref);
     const short = await rest("/auth/v1/signup", { method: "POST", body: JSON.stringify({ email: "short@example.com", password: "secret1" }) });
     assert.equal(short.status, 422);
     await page.fill("#set-minpw", "6");
-    await page.click("#save-settings");
-    await toast("Settings saved");
+    await saveSettings();
     t.platform.dir.forget(ref);
 
     await tab("settings");
     await page.fill("#set-env", "GREETING=hola");
-    await page.click("#save-settings");
-    await toast("Settings saved");
+    await saveSettings();
     await page.selectOption("#set-plan", "pro");
     await page.click("#save-plan");
     await toast("Plan updated");
@@ -1470,6 +1470,94 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await p2.waitForSelector("#sql-error");
     assert.match((await p2.textContent("#sql-error"))!, /requires admin/);
     await p2.close();
+  });
+
+  step("invites a teammate who signs in with a password, and manages the team", async () => {
+    const base = `http://127.0.0.1:${apiPort}`;
+    await page.goto(`${base}/#/team`);
+    await page.waitForSelector("#team");
+    assert.match((await page.textContent("#no-members"))!, /Nobody has a member account/);
+    await page.click("#invite-member");
+    await page.fill("#invite-email", "newbie@example.com");
+    await page.selectOption("#invite-role", "developer");
+    await page.click("dialog button[type=submit]");
+    await page.waitForSelector("#invite-link code");
+    const link = (await page.textContent("#invite-link code"))!;
+    assert.match(link, /#\/invite\/baasinv_/);
+    await page.click("dialog button[type=submit]");
+    await page.waitForSelector("tr[data-invite='newbie@example.com']");
+    await shot("team-invited");
+
+    // The invited person, in a fresh browser profile.
+    const fresh = await browser.newContext();
+    const np = await fresh.newPage();
+    np.on("pageerror", (e) => problems.push(`member pageerror: ${e.message}`));
+    await np.goto(link);
+    await np.waitForSelector("#invite-form");
+    await np.fill("#invite-password", "newbie-password-1");
+    await np.fill("#invite-confirm", "different-password");
+    await np.click("#accept-invite");
+    await np.locator("#invite-error:not([hidden])").waitFor();
+    assert.match((await np.textContent("#invite-error"))!, /do not match/);
+    await np.fill("#invite-name", "Newbie");
+    await np.fill("#invite-confirm", "newbie-password-1");
+    await np.click("#accept-invite");
+    await np.waitForSelector("#project-grid");
+    await np.click("#avatar");
+    assert.match((await np.textContent("#who"))!, /newbie@example\.com\s*e2e-org\s*developer/);
+    assert.equal(await np.locator("#menu-team").count(), 0, "a developer has no team page");
+    await np.goto(`${base}/#/team`);
+    await np.waitForSelector(".empty");
+    assert.match((await np.textContent("main"))!, /requires the admin role/);
+
+    // Changing the password signs out other devices; the new one works on the sign-in page.
+    await np.reload();
+    await np.click("#avatar");
+    await np.click("#menu-password");
+    await np.fill("#pw-current", "wrong-password");
+    await np.fill("#pw-new", "newbie-password-2");
+    await np.fill("#pw-again", "newbie-password-2");
+    await np.click("dialog button[type=submit]");
+    await np.locator("dialog .notice.bad:not([hidden])").waitFor();
+    await np.fill("#pw-current", "newbie-password-1");
+    await np.click("dialog button[type=submit]");
+    await np.locator("#toasts .toast.ok", { hasText: "Password changed" }).waitFor();
+    await np.click("#avatar");
+    await np.click("#signout");
+    await np.waitForSelector("#member-form");
+    await np.fill("#login-email", "newbie@example.com");
+    await np.fill("#login-password", "newbie-password-1");
+    await np.click("#signin-member");
+    await np.locator("#member-error:not([hidden])").waitFor();
+    assert.match((await np.textContent("#member-error"))!, /invalid email or password/);
+    await np.fill("#login-password", "newbie-password-2");
+    await np.click("#signin-member");
+    await np.waitForSelector("#project-grid");
+
+    // The owner sees the member, changes the role, then removes them: their session ends at once.
+    await page.reload();
+    await page.waitForSelector("tr[data-member='newbie@example.com']");
+    assert.equal(await page.locator("tr[data-invite]").count(), 0, "the invitation is used up");
+    await page.locator("tr[data-member='newbie@example.com'] button[aria-label='Row actions']").click();
+    await page.click("[data-action=member-role]");
+    await page.selectOption("#role-select", "admin");
+    await page.click("dialog button[type=submit]");
+    await page.locator("tr[data-member='newbie@example.com']", { hasText: "admin" }).waitFor();
+    await np.reload();
+    await np.waitForSelector("#project-grid");
+    await np.click("#avatar");
+    await np.waitForSelector("#menu-team");
+    await shot("team");
+    await page.locator("tr[data-member='newbie@example.com'] button[aria-label='Row actions']").click();
+    await page.click("[data-action=member-remove]");
+    await page.click("dialog button[type=submit]");
+    await page.locator("tr[data-member='newbie@example.com']").waitFor({ state: "detached" });
+    await np.goto(`${base}/#/projects`);
+    await np.reload();
+    await np.waitForSelector("#member-form");
+    await fresh.close();
+    await page.goto(`${base}/#/projects`);
+    await page.waitForSelector("#project-grid");
   });
 
   step("is usable on a phone-sized screen", async () => {

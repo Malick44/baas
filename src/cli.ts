@@ -17,6 +17,7 @@ class CliError extends Error {}
 const USAGE = `baas <command>
 
   login --url <api-url> --token <token>   save credentials
+  login --url <api-url> --email <e> [--password <p>]   sign in as a member (password may come from BAAS_PASSWORD)
   logout | whoami
   projects list | create <name> | pause|resume|delete <ref>
   link <ref>                              remember a project for this directory
@@ -127,8 +128,17 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
     switch (cmd) {
       case "login": {
         const url = String(flags.url ?? "").replace(/\/+$/, "");
-        const token = String(flags.token ?? "");
-        if (!/^https?:\/\//.test(url) || !token) throw new CliError("usage: baas login --url <api-url> --token <token>");
+        let token = String(flags.token ?? "");
+        if (!/^https?:\/\//.test(url)) throw new CliError("usage: baas login --url <api-url> (--token <token> | --email <email> [--password <password>])");
+        if (!token && flags.email) {
+          const password = String(flags.password ?? io.env.BAAS_PASSWORD ?? "");
+          if (!password) throw new CliError("a password is needed: pass --password or set BAAS_PASSWORD");
+          const res = await f(`${url}/v1/auth/login`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: String(flags.email), password }) });
+          const data = (await res.json().catch(() => ({}))) as { token?: string; error?: string };
+          if (!res.ok || !data.token) throw new CliError(data.error ?? `sign-in failed (${res.status})`);
+          token = data.token;
+        }
+        if (!token) throw new CliError("usage: baas login --url <api-url> (--token <token> | --email <email> [--password <password>])");
         await mkdir(configDir, { recursive: true, mode: 0o700 });
         await writeFile(configFile, JSON.stringify({ url, token }), { mode: 0o600 });
         await chmod(configFile, 0o600);

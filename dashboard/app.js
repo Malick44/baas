@@ -196,6 +196,7 @@ async function gw(path, { method = "GET", body, headers = {}, rawBody, key } = {
 }
 
 function logout() {
+  if (S.token && S.me?.member) fetch("/v1/auth/logout", { method: "POST", headers: { authorization: `Bearer ${S.token}` } }).catch(() => {});
   localStorage.removeItem("baas.token");
   sessionStorage.removeItem("baas.token");
   S.token = S.me = S.project = S.keys = null;
@@ -247,8 +248,10 @@ function appbar(project) {
     e.stopPropagation();
     if (document.querySelector(".menu")) return closeMenus();
     document.body.append(h("div", { class: "menu", role: "menu" },
-      h("div", { class: "who", id: "who" }, h("div", null, S.me.organization.name), h("div", { class: "muted" }, `${S.me.role} · ${S.me.organization.slug}`)),
+      h("div", { class: "who", id: "who" }, S.me.member && h("div", { id: "who-email" }, S.me.member.email), h("div", null, S.me.organization.name), h("div", { class: "muted" }, `${S.me.role} · ${S.me.organization.slug}`)),
       h("button", { role: "menuitem", onclick: () => { closeMenus(); location.hash = "#/projects"; } }, "All projects"),
+      S.me.role !== "developer" && h("button", { role: "menuitem", id: "menu-team", onclick: () => { closeMenus(); location.hash = "#/team"; } }, "Team"),
+      S.me.member && h("button", { role: "menuitem", id: "menu-password", onclick: () => { closeMenus(); passwordDialog(); } }, "Change password"),
       h("button", { role: "menuitem", id: "signout", onclick: logout }, "Sign out")));
   } }, initials);
   const search = h("button", { class: "searchbox", id: "open-palette", title: "Search pages (Ctrl/⌘+K)", onclick: openPalette }, icon("search", 15), h("span", null, "Search…"), h("kbd", null, "⌘K"));
@@ -342,6 +345,7 @@ async function connectDialog(p) {
 // ---------- command palette ----------
 function pageIndex(ref) {
   const out = [["Projects", "#/projects"]];
+  if (S.me?.role !== "developer") out.push(["Team", "#/team"]);
   for (const n of NAV) if (n.id && n.id !== "database") out.push([n.label, `#/p/${ref}/${n.id}`]);
   for (const g of DB_MENU) for (const [id, label, tabId] of g.items) if (!tabId) out.push([`Database › ${label}`, `#/p/${ref}/database/${id}`]);
   for (const g of AUTH_MENU) for (const [id, label] of g.items) out.push([`Authentication › ${label}`, `#/p/${ref}/auth/${id}`]);
@@ -349,7 +353,7 @@ function pageIndex(ref) {
 }
 function openPalette() {
   const ref = S.project?.ref;
-  const entries = ref ? pageIndex(ref) : [["Projects", "#/projects"]];
+  const entries = ref ? pageIndex(ref) : [["Projects", "#/projects"], ...(S.me?.role !== "developer" ? [["Team", "#/team"]] : [])];
   const input = h("input", { placeholder: "Jump to a page…", "aria-label": "Search pages", id: "palette-input", autocomplete: "off" });
   const list = h("ul", { id: "palette-list" });
   let shown = entries, at = 0;
@@ -378,17 +382,51 @@ document.addEventListener("keydown", (e) => {
 });
 
 // ---------- login ----------
+function startSession(token, remember) {
+  S.token = token;
+  S.me = null;
+  localStorage.removeItem("baas.token");
+  sessionStorage.removeItem("baas.token");
+  (remember ? localStorage : sessionStorage).setItem("baas.token", token);
+}
+
 function renderLogin() {
+  const memberErr = h("div", { class: "notice bad", hidden: true, id: "member-error" });
+  const email = h("input", { id: "login-email", name: "email", type: "email", autocomplete: "username", placeholder: "you@example.com", required: true });
+  const password = h("input", { id: "login-password", name: "password", type: "password", autocomplete: "current-password", required: true });
+  const rememberMember = h("input", { type: "checkbox", id: "remember-member" });
+  const memberForm = h("form", { class: "stack", id: "member-form" },
+    h("h1", null, "Sign in"),
+    h("label", { class: "field" }, "Email", email),
+    h("label", { class: "field" }, "Password", password),
+    h("label", { class: "check" }, rememberMember, "Remember on this device"),
+    memberErr,
+    h("button", { class: "primary", type: "submit", id: "signin-member" }, "Sign in"));
+  memberForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      const res = await fetch("/v1/auth/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: email.value, password: password.value }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+      startSession(data.token, rememberMember.checked);
+      location.hash = "#/projects";
+      route();
+    } catch (ex) {
+      memberErr.hidden = false;
+      memberErr.textContent = ex.message;
+    }
+  });
+
   const err = h("div", { class: "notice bad", hidden: true, id: "login-error" });
   const token = h("input", { id: "token", name: "token", type: "password", autocomplete: "off", placeholder: "baas_…", required: true });
   const remember = h("input", { type: "checkbox", id: "remember" });
   const form = h("form", { class: "stack" },
-    h("h1", null, "Sign in"),
-    h("p", { class: "muted" }, "Paste an API token for your organisation. Tokens are created with the bootstrap secret or by an owner."),
+    h("h3", null, "Or use an API token"),
+    h("p", { class: "muted" }, "Tokens are for scripts and for organisations that have no member accounts yet. They are created with the bootstrap secret or by an owner."),
     h("label", { class: "field" }, "API token", token),
     h("label", { class: "check" }, remember, "Remember on this device"),
     err,
-    h("button", { class: "primary", type: "submit", id: "signin" }, "Sign in"));
+    h("button", { type: "submit", id: "signin" }, "Sign in with token"));
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     S.token = token.value.trim();
@@ -403,7 +441,133 @@ function renderLogin() {
       err.textContent = ex.message;
     }
   });
+  mount(h("div", { class: "login" }, h("div", { class: "card stack" }, memberForm, h("hr"), form)));
+}
+
+/** The page an invitation link opens: choose a password and join. The token stays in the URL fragment, which is never sent to a server. */
+function renderInvite(token) {
+  const err = h("div", { class: "notice bad", hidden: true, id: "invite-error" });
+  const name = h("input", { id: "invite-name", name: "name", autocomplete: "name", placeholder: "Your name (optional)" });
+  const pw = h("input", { id: "invite-password", name: "password", type: "password", autocomplete: "new-password", required: true, minlength: 8 });
+  const again = h("input", { id: "invite-confirm", name: "confirm", type: "password", autocomplete: "new-password", required: true });
+  const form = h("form", { class: "stack", id: "invite-form" },
+    h("h1", null, "Join your team"),
+    h("p", { class: "muted" }, "Choose a password to finish creating your account."),
+    h("label", { class: "field" }, "Name", name),
+    h("label", { class: "field" }, "Password", pw, h("span", { class: "muted hint" }, "At least 8 characters.")),
+    h("label", { class: "field" }, "Repeat password", again),
+    err,
+    h("button", { class: "primary", type: "submit", id: "accept-invite" }, "Create account"));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      if (pw.value !== again.value) throw new Error("The passwords do not match.");
+      const res = await fetch("/v1/auth/accept-invite", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token, password: pw.value, name: name.value }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+      startSession(data.token, false);
+      location.hash = "#/projects";
+      route();
+    } catch (ex) {
+      err.hidden = false;
+      err.textContent = ex.message;
+    }
+  });
   mount(h("div", { class: "login" }, h("div", { class: "card" }, form)));
+}
+
+function passwordDialog() {
+  return dialog("Change password", () => h("div", { class: "stack" },
+    h("label", { class: "field" }, "Current password", h("input", { name: "current", id: "pw-current", type: "password", autocomplete: "current-password", required: true })),
+    h("label", { class: "field" }, "New password", h("input", { name: "next", id: "pw-new", type: "password", autocomplete: "new-password", required: true, minlength: 8 })),
+    h("label", { class: "field" }, "Repeat new password", h("input", { name: "again", id: "pw-again", type: "password", autocomplete: "new-password", required: true })),
+    h("p", { class: "muted" }, "Your other signed-in devices are signed out.")), {
+    confirmLabel: "Change password",
+    onSubmit: async (fd) => {
+      if (fd.get("next") !== fd.get("again")) throw new Error("The new passwords do not match.");
+      await api("POST", "/v1/me/password", { current_password: fd.get("current"), new_password: fd.get("next") });
+      toast("Password changed", "ok");
+      return true;
+    },
+  });
+}
+
+// ---------- team ----------
+async function renderTeam() {
+  const box = h("div", { class: "stack", id: "team" }, h("p", { class: "muted" }, "Loading…"));
+  const canInvite = S.me.role !== "developer";
+  mount(shell(
+    h("div", { class: "row between" }, h("h1", null, "Team"),
+      h("button", { class: "primary", id: "invite-member", disabled: !canInvite, onclick: () => inviteDialog(draw) }, "Invite member")),
+    box));
+  if (!canInvite) { clear(box); box.append(h("div", { class: "empty card" }, "Managing the team requires the admin role.")); return; }
+  const ranks = ["developer", "admin", "owner"];
+  const mine = ranks.indexOf(S.me.role);
+  async function draw() {
+    const { members, invites } = await api("GET", "/v1/members");
+    clear(box);
+    if (!members.length) box.append(h("div", { class: "notice", id: "no-members" }, "Nobody has a member account yet. Invite people by email, and they sign in with a password instead of sharing an API token."));
+    box.append(h("div", { class: "card" }, h("table", { class: "data", id: "members-table" },
+      h("thead", null, h("tr", null, ["Member", "Role", "Joined", ""].map((x) => h("th", null, x)))),
+      h("tbody", null, members.map((m) => {
+        const you = m.id === S.me.member?.id;
+        const above = ranks.indexOf(m.role) > mine;
+        return h("tr", { "data-member": m.email }, h("td", null, m.name ? [h("div", null, m.name), h("div", { class: "muted" }, m.email)] : m.email, you && h("span", { class: "chip" }, "you")),
+          h("td", null, m.role), h("td", { class: "muted" }, new Date(m.created_at).toLocaleDateString()),
+          h("td", { class: "right" }, rowMenu([
+            ["Change role", () => roleDialog(m, draw), { action: "member-role", disabled: above, why: above ? "You cannot change someone with a higher role" : "" }],
+            ["Set new password", () => resetDialog(m), { action: "member-password", disabled: S.me.role !== "owner" || you, why: S.me.role !== "owner" ? "Only owners can set another member's password" : "" }],
+            [you ? "Leave organisation" : "Remove from organisation", async () => {
+              if (!(await confirmBox(you ? "Leave organisation" : "Remove member", you ? "You will be signed out." : `Remove ${m.email}? They are signed out everywhere and can only return by invitation.`, { confirmLabel: you ? "Leave" : "Remove" }))) return;
+              try { await api("DELETE", `/v1/members/${m.id}`); toast(you ? "You left" : "Member removed", "ok"); if (you) logout(); else draw(); } catch (ex) { toast(ex.message, "bad"); }
+            }, { danger: true, action: "member-remove", disabled: above }]]))); })))));
+    if (invites.length) box.append(h("div", { class: "card stack" }, h("h3", null, "Pending invitations"),
+      h("table", { class: "data", id: "invites-table" }, h("tbody", null, invites.map((i) =>
+        h("tr", { "data-invite": i.email }, h("td", null, i.email), h("td", null, i.role),
+          h("td", { class: "muted" }, i.expired ? "expired" : `expires ${new Date(i.expires_at).toLocaleDateString()}`),
+          h("td", { class: "right" }, h("button", { class: "small", "data-action": "revoke-invite", onclick: async () => { try { await api("DELETE", `/v1/members/invites/${i.id}`); toast("Invitation revoked", "ok"); draw(); } catch (ex) { toast(ex.message, "bad"); } } }, "Revoke"))))))));
+    box.append(h("p", { class: "muted" }, "Invitation links are shown once, when you create them. API tokens for scripts are separate and still work."));
+  }
+  await draw();
+}
+
+async function inviteDialog(done) {
+  const roles = ["developer", "admin", "owner"].filter((r) => ["developer", "admin", "owner"].indexOf(r) <= ["developer", "admin", "owner"].indexOf(S.me.role));
+  let made = null;
+  await dialog("Invite a member", () => h("div", { class: "stack" },
+    h("label", { class: "field" }, "Email", h("input", { name: "email", id: "invite-email", type: "email", required: true, placeholder: "teammate@example.com" })),
+    h("label", { class: "field" }, "Role", h("select", { name: "role", id: "invite-role" }, roles.map((r) => h("option", { value: r }, r)))),
+    h("p", { class: "muted" }, "Developers can use projects; admins can also create projects and invite people; owners manage everything. You get a link to send them.")), {
+    confirmLabel: "Create invitation",
+    onSubmit: async (fd) => { made = await api("POST", "/v1/members/invites", { email: fd.get("email"), role: fd.get("role") }); return true; },
+  });
+  if (!made) return;
+  const link = `${location.origin}/#/invite/${made.token}`;
+  await dialog("Invitation ready", () => h("div", { class: "stack" },
+    h("p", null, `Send this link to ${made.invite.email}. It works once and expires in 7 days.`),
+    h("div", { class: "kv", id: "invite-link" }, h("span", { class: "k" }, "Link"), ...copyable(link))), { confirmLabel: "Done" });
+  done();
+}
+
+async function roleDialog(m, done) {
+  const ranks = ["developer", "admin", "owner"];
+  const roles = ranks.filter((r) => ranks.indexOf(r) <= ranks.indexOf(S.me.role));
+  await dialog("Change role", () => h("div", { class: "stack" },
+    h("p", null, m.email),
+    h("select", { name: "role", id: "role-select" }, roles.map((r) => h("option", { value: r, selected: r === m.role }, r)))), {
+    confirmLabel: "Save",
+    onSubmit: async (fd) => { await api("PATCH", `/v1/members/${m.id}`, { role: fd.get("role") }); toast("Role updated", "ok"); return true; },
+  });
+  done();
+}
+
+function resetDialog(m) {
+  return dialog("Set a new password", () => h("div", { class: "stack" },
+    h("p", null, `Choose a temporary password for ${m.email} and tell them. They are signed out everywhere, and can change it from their account menu.`),
+    h("input", { name: "password", id: "reset-password", type: "password", autocomplete: "new-password", required: true, minlength: 8 })), {
+    confirmLabel: "Set password",
+    onSubmit: async (fd) => { await api("POST", `/v1/members/${m.id}/password`, { password: fd.get("password") }); toast("Password set", "ok"); return true; },
+  });
 }
 
 // ---------- projects ----------
@@ -2586,6 +2750,8 @@ async function settings(body, p) {
 // ---------- router ----------
 async function route() {
   if (RT) { RT.close(); RT = null; }
+  const inv = /^#\/invite\/(baasinv_[A-Za-z0-9_-]+)$/.exec(location.hash);
+  if (inv) return renderInvite(inv[1]);
   if (!S.token) {
     S.token = localStorage.getItem("baas.token") || sessionStorage.getItem("baas.token");
     if (S.token) { try { S.me = await api("GET", "/v1/me"); } catch { S.token = null; } }
@@ -2595,7 +2761,8 @@ async function route() {
   if (!S.me) S.me = await api("GET", "/v1/me");
   const m = /^#\/p\/([a-z0-9]{20})\/([a-z]+)(?:\/([a-z]+))?/.exec(location.hash);
   try {
-    if (m) await renderProject(m[1], m[2], m[3]);
+    if (location.hash === "#/team") { S.project = null; await renderTeam(); }
+    else if (m) await renderProject(m[1], m[2], m[3]);
     else { S.project = null; await renderProjects(); }
   } catch (ex) {
     mount(shell(h("div", { class: "notice bad", id: "route-error" }, ex.message), h("p", null, h("a", { href: "#/projects" }, "Back to projects"))));

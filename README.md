@@ -12,12 +12,15 @@ docker compose up -d --build
 open http://localhost:8080      # dashboard
 ```
 
-Create the first organisation with the bootstrap secret, then sign in to the dashboard with the token it returns:
+Create the first organisation with the bootstrap secret. Include an owner email and password to get a dashboard account, or omit them and use the API token it returns:
 
 ```bash
 curl -XPOST localhost:8080/v1/organizations -H "x-bootstrap-token: $BAAS_BOOTSTRAP_TOKEN" \
-  -H 'content-type: application/json' -d '{"name":"Acme","slug":"acme"}'      # → {"owner_token":"baas_…"}
+  -H 'content-type: application/json' \
+  -d '{"name":"Acme","slug":"acme","owner_email":"you@example.com","owner_password":"a-long-passphrase"}'   # → {"owner_token":"baas_…","owner":{…}}
 ```
+
+**People and tokens.** Each person signs in to the dashboard with their own email and password, under **Team** (invite by link; roles developer < admin < owner; sessions last 7 days; changing a role or removing someone takes effect immediately; there is always at least one owner member). API tokens remain for scripts and CI, and the CLI accepts either: `baas login --url … --email you@example.com` (password from `--password` or `BAAS_PASSWORD`). An account belongs to one organisation, and an owner can set a new password for someone who lost theirs; there is no self-service reset by email.
 
 Projects are served at `http://<ref>.localhost:8081` (browsers resolve `*.localhost` themselves; for a real domain see [Production](#production)).
 
@@ -146,9 +149,8 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 - **Bulk inserts** fill keys missing from some rows with `NULL` rather than defaults (PostgREST does the same without `missing=default`).
 - **Realtime** DELETE events carry only the primary key and go to `service_role`, or to other roles only on tables without RLS; filtered subscriptions receive no deletes. One extra query per subscriber per event.
 - **Single node.** One Postgres cluster, one process; request logs and rate-limit state are in memory. No sharding across clusters.
-- **Settings `site_url`, `redirect_urls`, `cors_origins`** are accepted but not enforced yet (the data plane answers CORS `*`).
 - Project and role **names are visible** to SQL run inside a project (`pg_database`, `pg_roles`); secrets are not.
-- API tokens stand in for user accounts; there is no per-user login to the dashboard.
+- Dashboard accounts have no email-based password reset, MFA or single sign-on; an owner resets passwords by hand.
 
 ## Development and tests
 

@@ -142,6 +142,7 @@ dialog .actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 .login { max-width: 420px; margin: 12vh auto; padding: 0 16px; }
 .login .card { padding: 26px; }
+.login hr { border: 0; border-top: 1px solid var(--line); width: 100%; margin: 6px 0; }
 .editor { min-height: 180px; }
 .events { max-height: 340px; overflow: auto; }
 .bar { height: 6px; border-radius: 4px; background: var(--panel-2); overflow: hidden; margin-top: 4px; }

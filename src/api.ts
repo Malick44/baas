@@ -10,6 +10,7 @@ import type { ExtensionService } from "./extensions.js";
 import type { FunctionService } from "./functions.js";
 import type { PipelineService } from "./pipelines.js";
 import { DEFAULT_TEMPLATES } from "./mailer.js";
+import { Members } from "./members.js";
 import { PROVIDERS } from "./oauth.js";
 import { PLANS, planOf } from "./plans.js";
 import type { UsageService } from "./usage.js";
@@ -61,6 +62,8 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     return reply.code(500).send({ error: "internal error" });
   });
 
+  const members = new Members(control);
+
   const bearer = (req: FastifyRequest) => /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
 
   async function principal(req: FastifyRequest): Promise<Principal> {
@@ -76,7 +79,50 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     if (given.length !== want.length || !timingSafeEqual(given, want)) throw new HttpError(401, "invalid bootstrap token");
     const b = body(req);
     const { org, ownerToken } = await control.createOrg(text(b.name, "name"), text(b.slug, "slug", 40));
-    return reply.code(201).send({ organization: org, owner_token: ownerToken });
+    // Optionally create the first owner's dashboard account in the same call.
+    const owner = b.owner_email !== undefined ? await members.bootstrapOwner(org.id, b.owner_email, b.owner_password, b.owner_name) : undefined;
+    return reply.code(201).send({ organization: org, owner_token: ownerToken, ...(owner ? { owner } : {}) });
+  });
+
+  // ---- dashboard accounts ----
+
+  app.post("/v1/auth/login", async (req) => {
+    const b = body(req);
+    return members.login(b.email, b.password);
+  });
+  app.post("/v1/auth/logout", async (req, reply) => {
+    await members.logout(await principal(req));
+    return reply.code(204).send();
+  });
+  app.post("/v1/auth/accept-invite", async (req, reply) => {
+    const b = body(req);
+    return reply.code(201).send(await members.acceptInvite(b.token, b.password, b.name));
+  });
+  app.post("/v1/me/password", async (req, reply) => {
+    const b = body(req);
+    await members.changePassword(await principal(req), b.current_password, b.new_password);
+    return reply.code(204).send();
+  });
+  app.get("/v1/members", async (req) => members.list(await principal(req)));
+  app.post("/v1/members/invites", async (req, reply) => {
+    const b = body(req);
+    return reply.code(201).send(await members.invite(await principal(req), b.email, b.role));
+  });
+  app.delete<{ Params: { id: string } }>("/v1/members/invites/:id", async (req, reply) => {
+    await members.revokeInvite(await principal(req), req.params.id);
+    return reply.code(204).send();
+  });
+  app.patch<{ Params: { id: string } }>("/v1/members/:id", async (req, reply) => {
+    await members.setRole(await principal(req), req.params.id, body(req).role);
+    return reply.code(204).send();
+  });
+  app.delete<{ Params: { id: string } }>("/v1/members/:id", async (req, reply) => {
+    await members.remove(await principal(req), req.params.id);
+    return reply.code(204).send();
+  });
+  app.post<{ Params: { id: string } }>("/v1/members/:id/password", async (req, reply) => {
+    await members.resetPassword(await principal(req), req.params.id, body(req).password);
+    return reply.code(204).send();
   });
 
   app.post("/v1/tokens", async (req, reply) => {
@@ -160,7 +206,10 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     return { p, project, ref: project.ref };
   };
 
-  app.get("/v1/me", async (req) => control.whoami(await principal(req)));
+  app.get("/v1/me", async (req) => {
+    const p = await principal(req);
+    return { ...(await control.whoami(p)), member: await members.me(p) };
+  });
   app.get("/v1/plans", async () => Object.fromEntries(Object.entries(PLANS)));
 
   app.patch<{ Params: { ref: string } }>("/v1/projects/:ref", async (req) => {

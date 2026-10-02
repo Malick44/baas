@@ -15,7 +15,8 @@ export class HttpError extends Error {
 export type Role = "developer" | "admin" | "owner";
 const RANK: Record<Role, number> = { developer: 1, admin: 2, owner: 3 };
 
-export type Principal = { tokenId: string; orgId: string; role: Role };
+export type Principal = { tokenId: string; orgId: string; role: Role; /** Set when the token is a signed-in member's session. */ memberId?: string };
+export const RANKS = RANK;
 
 export type ProjectRow = {
   ref: string;
@@ -123,12 +124,15 @@ export class ControlPlane {
   }
 
   async authenticate(token: string): Promise<Principal | null> {
-    const r = await this.pool.query<{ id: string; org_id: string; role: Role }>(
-      `SELECT id, org_id, role FROM api_tokens WHERE token_hash = $1 AND revoked_at IS NULL`,
+    // A member's session carries the member's current role, so changing or removing someone takes effect at once.
+    const r = await this.pool.query<{ id: string; org_id: string; role: Role; member_id: string | null }>(
+      `SELECT t.id, t.org_id, COALESCE(m.role, t.role) AS role, t.member_id
+         FROM api_tokens t LEFT JOIN members m ON m.id = t.member_id
+        WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > now())`,
       [hashToken(token)],
     );
     const row = r.rows[0];
-    return row ? { tokenId: row.id, orgId: row.org_id, role: row.role } : null;
+    return row ? { tokenId: row.id, orgId: row.org_id, role: row.role, ...(row.member_id ? { memberId: row.member_id } : {}) } : null;
   }
 
   async whoami(p: Principal) {

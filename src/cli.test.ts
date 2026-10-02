@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { runCli } from "./cli.js";
 import { Scripted, propose, query, text } from "./ai-testkit.js";
-import { makePlatform, PG_BIN } from "./platform-testkit.js";
+import { BOOT, makePlatform, PG_BIN } from "./platform-testkit.js";
 
 const ADMIN = process.env.BAAS_TEST_PG_URL;
 
@@ -51,6 +51,18 @@ describe("cli", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     const mode = (await stat(join(cfg, "config.json"))).mode & 0o777;
     assert.equal(mode, 0o600);
     assert.match((await run("whoami")).out, /0 projects/);
+  });
+
+  it("signs in as a member with email and password", async () => {
+    const org = await t.api("POST", "/v1/organizations", { headers: { "x-bootstrap-token": BOOT }, body: { name: "M", slug: `m-${Date.now() % 100000}`, owner_email: "cli-member@example.com", owner_password: "cli-password-1" } });
+    assert.equal(org.status, 201, org.text);
+    assert.equal((await run("login", "--url", apiUrl, "--email", "cli-member@example.com")).code, 1, "needs a password");
+    assert.equal((await run("login", "--url", apiUrl, "--email", "cli-member@example.com", "--password", "wrong-password")).code, 1);
+    const r = await run("login", "--url", apiUrl, "--email", "cli-member@example.com", "--password", "cli-password-1");
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /Logged in/);
+    assert.equal((await readFile(join(cfg, "config.json"), "utf8")).includes("cli-password-1"), false, "the password is not stored");
+    assert.equal((await run("login", "--url", apiUrl, "--token", owner)).code, 0, "switch back");
   });
 
   let ref: string;
