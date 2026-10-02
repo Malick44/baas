@@ -1,4 +1,5 @@
 import pg from "pg";
+import { guard } from "./pgguard.js";
 import { HttpError, type ControlPlane, type Resolved } from "./control.js";
 import { urlFor } from "./provision.js";
 
@@ -111,6 +112,7 @@ export class PoolManager {
     }
     let timer: NodeJS.Timeout | undefined;
     let broken = false;
+    const unguard = guard(c, () => { broken = true; });
     try {
       await c.query(ctx.readOnly ? "BEGIN READ ONLY" : "BEGIN");
       // Publish the caller's claims while still the project's login role, then drop to their role. The order matters:
@@ -131,6 +133,7 @@ export class PoolManager {
       throw err;
     } finally {
       if (timer) clearTimeout(timer);
+      unguard();
       c.release(broken);
     }
   }

@@ -1,4 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
+import { guard } from "./pgguard.js";
 import { fileURLToPath } from "node:url";
 import type pg from "pg";
 
@@ -7,6 +8,7 @@ const DIR = fileURLToPath(new URL("../migrations/", import.meta.url));
 /** Apply pending migrations in filename order, each in its own transaction. Returns the names applied. */
 export async function migrate(pool: pg.Pool): Promise<string[]> {
   const c = await pool.connect();
+  const unguard = guard(c);
   const applied: string[] = [];
   try {
     await c.query("SELECT pg_advisory_lock(727001)"); // one migrator at a time
@@ -28,6 +30,7 @@ export async function migrate(pool: pg.Pool): Promise<string[]> {
     }
   } finally {
     await c.query("SELECT pg_advisory_unlock(727001)").catch(() => {});
+    unguard();
     c.release();
   }
   return applied;

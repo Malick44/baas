@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type pg from "pg";
+import { guard } from "./pgguard.js";
 import { HttpError } from "./control.js";
 import { S3, S3Error, type S3Config } from "./s3.js";
 
@@ -197,6 +198,8 @@ export class PgStore implements BlobStore {
 
   private async write(key: string, fill: (add: (b: Buffer) => Promise<void>) => Promise<void>): Promise<void> {
     const c = await this.pool.connect();
+    let broken = false;
+    const unguard = guard(c, () => { broken = true; });
     try {
       await c.query("BEGIN");
       await c.query(`DELETE FROM blob_objects WHERE key = $1`, [key]);
@@ -209,7 +212,8 @@ export class PgStore implements BlobStore {
       await c.query("ROLLBACK").catch(() => {});
       throw e;
     } finally {
-      c.release();
+      unguard();
+      c.release(broken);
     }
   }
 
@@ -241,6 +245,8 @@ export class PgStore implements BlobStore {
 
   async copy(from: string, to: string) {
     const c = await this.pool.connect();
+    let broken = false;
+    const unguard = guard(c, () => { broken = true; });
     try {
       await c.query("BEGIN");
       const src = (await c.query<{ size: string }>(`SELECT size FROM blob_objects WHERE key = $1`, [from])).rows[0];
@@ -253,7 +259,8 @@ export class PgStore implements BlobStore {
       await c.query("ROLLBACK").catch(() => {});
       throw e;
     } finally {
-      c.release();
+      unguard();
+      c.release(broken);
     }
   }
 

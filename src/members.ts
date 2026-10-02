@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { guard } from "./pgguard.js";
 import { hashPassword, verifyPassword } from "./authsvc.js";
 import { MemoryLimits, type Limits } from "./limits.js";
 import { NoMailer, type Mailer } from "./mailer.js";
@@ -197,6 +198,7 @@ export class Members {
     const pw = checkPassword(password);
     const hashed = await hashPassword(pw);
     const c = await this.pool.connect();
+    const unguard = guard(c);
     try {
       await c.query("BEGIN");
       // Claim it first so two people racing on one invite cannot both get in.
@@ -219,6 +221,7 @@ export class Members {
       await c.query("ROLLBACK").catch(() => {});
       throw err;
     } finally {
+      unguard();
       c.release();
     }
   }
