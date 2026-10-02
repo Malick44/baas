@@ -491,6 +491,72 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await t.sql(owner, ref, "drop table public.todos; drop function public.shout(); delete from auth.users where email like 'editor-%'");
   });
 
+  step("creates and edits publications, and changes table privileges for the API roles", async () => {
+    await t.sql(owner, ref, "create table public.pubone (id serial primary key); create table public.pubtwo (id serial primary key)");
+    await tab("database", "publications");
+    await page.click("#new-publication");
+    await page.waitForSelector("dialog.sheet #pub-name");
+    await page.fill("#pub-name", "1 bad");
+    await page.click("dialog button[type=submit]");
+    assert.match((await page.textContent("dialog .notice.bad"))!, /name/);
+    await page.fill("#pub-name", "my_pub");
+    await page.check("#pub-tables input[data-table=pubone]");
+    await page.uncheck("#pub-events input[data-event=truncate]");
+    assert.match((await page.textContent("#sql-preview"))!, /create publication "my_pub"\n  for table "public"\."pubone"\n  with \(publish = 'insert, update, delete'\);/);
+    await page.click("dialog button[type=submit]");
+    await toast("Publication created");
+    await page.waitForSelector("tr[data-row=my_pub]");
+    assert.match((await page.textContent("tr[data-row=my_pub]"))!, /1 table/);
+
+    await page.locator("tr[data-row=my_pub] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=edit-publication]");
+    await page.waitForSelector("#pub-tables");
+    assert.equal(await page.isChecked("#pub-tables input[data-table=pubone]"), true, "shows the current tables");
+    await page.check("#pub-tables input[data-table=pubtwo]");
+    await page.uncheck("#pub-events input[data-event=delete]");
+    await page.fill("#pub-name", "renamed_pub");
+    await page.click("dialog button[type=submit]");
+    await toast("Publication saved");
+    await page.waitForSelector("tr[data-row=renamed_pub]");
+    assert.match((await page.textContent("tr[data-row=renamed_pub]"))!, /2 tables/);
+    const row = (await t.sql(owner, ref, "select pubinsert, pubupdate, pubdelete, pubtruncate from pg_publication where pubname = 'renamed_pub'")).json.results[0].rows[0];
+    assert.deepEqual(row, [true, true, false, false]);
+    await page.locator("tr[data-row=renamed_pub] button[aria-label='Row actions']").click();
+    await page.click(".menu [data-action=drop-publication]");
+    await page.fill("dialog input[name=typed]", "renamed_pub");
+    await page.click("dialog button[type=submit]");
+    await toast("Publication deleted");
+    await page.waitForFunction(() => !document.querySelector("tr[data-row=renamed_pub]"));
+
+    // ---- privileges ----
+    await tab("database", "roles");
+    await page.click("#edit-privileges");
+    await page.waitForSelector("#priv-table");
+    const cell = (tbl: string, role: string, k: string) => `#priv-table input[data-cell='${tbl}|${role}|${k}']`;
+    assert.equal(await page.isChecked(cell("pubone", "anon", "select")), false, "new tables have no grants");
+    await page.click("dialog button[type=submit]");
+    assert.match((await page.textContent("dialog .notice.bad"))!, /Nothing has changed/);
+    await page.check(cell("pubone", "anon", "select"));
+    await page.check(cell("pubone", "authenticated", "select"));
+    await page.check(cell("pubone", "authenticated", "insert"));
+    assert.match((await page.textContent("#sql-preview"))!, /grant SELECT on "public"\."pubone" to anon;\ngrant SELECT, INSERT on "public"\."pubone" to authenticated;/);
+    await shot("06l-privileges");
+    await page.click("dialog button[type=submit]");
+    await toast("Privileges updated");
+    const has = async (role: string, priv: string) => (await t.sql(owner, ref, `select has_table_privilege('${role}', 'public.pubone', '${priv}')`)).json.results[0].rows[0][0];
+    assert.deepEqual([await has("anon", "select"), await has("authenticated", "insert"), await has("anon", "insert")], [true, true, false]);
+    await page.click("#edit-privileges");
+    await page.waitForSelector("#priv-table");
+    assert.equal(await page.isChecked(cell("pubone", "authenticated", "insert")), true, "the matrix shows what is granted");
+    await page.uncheck(cell("pubone", "authenticated", "insert"));
+    await page.uncheck(cell("pubone", "anon", "select"));
+    assert.match((await page.textContent("#sql-preview"))!, /revoke SELECT on "public"\."pubone" from anon;\nrevoke INSERT on "public"\."pubone" from authenticated;/);
+    await page.click("dialog button[type=submit]");
+    await toast("Privileges updated");
+    assert.deepEqual([await has("anon", "select"), await has("authenticated", "insert"), await has("authenticated", "select")], [false, false, true]);
+    await t.sql(owner, ref, "drop table public.pubone, public.pubtwo");
+  });
+
   step("creates, edits, calls and deletes a database function", async () => {
     await tab("database", "functions");
     await page.waitForSelector("#catalog-table .empty");
@@ -1392,7 +1458,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     const overflow = () => p.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     assert.ok((await overflow()) <= 1, `project list scrolls horizontally by ${await overflow()}px`);
     await p.screenshot({ path: join(SHOTS, "15-mobile.png"), fullPage: true });
-    for (const tabName of ["overview", "tables", "sql", "settings", "database/pipelines", "integrations", "advisors", "auth/providers", "auth/email", "auth/urls", "auth/sessions"]) {
+    for (const tabName of ["overview", "tables", "sql", "settings", "database/pipelines", "integrations", "advisors", "auth/providers", "auth/email", "auth/urls", "auth/sessions", "database/roles", "database/publications"]) {
       await p.goto(`http://127.0.0.1:${apiPort}/#/p/${ref}/${tabName}`);
       await p.waitForFunction((n) => document.querySelector(`nav.rail a[data-tab=${n.split("/")[0]}]`)?.classList.contains("on") && !document.querySelector("#tab-body")?.textContent?.startsWith("Loading"), tabName);
       assert.ok((await overflow()) <= 1, `${tabName} scrolls horizontally by ${await overflow()}px`);

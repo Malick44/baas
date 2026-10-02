@@ -1368,6 +1368,86 @@ async function enumValueDialog(en, reload, ctx) {
   if (ok) { toast("Value added", "ok"); reload(); }
 }
 
+// ---------- publications ----------
+async function publicationSheet(pub, reload) {
+  const tables = await tablesIn("public");
+  const have = pub ? new Set((await catalog(`select tablename from pg_publication_tables where pubname = ${pgLit(pub.name)} and schemaname = 'public'`)).map((r) => r.tablename)) : new Set();
+  const prev = sqlPreview();
+  const name = h("input", { id: "pub-name", placeholder: "e.g. my_publication", autocomplete: "off", value: pub ? pub.name : "" });
+  const boxes = tables.map((t) => h("label", { class: "check" }, h("input", { type: "checkbox", "data-table": t.name, checked: have.has(t.name), disabled: !!pub?.all_tables }), h("span", { class: "mono" }, t.name)));
+  const evs = [["insert", "ins"], ["update", "upd"], ["delete", "del"], ["truncate", "trunc"]].map(([e, k]) => h("label", { class: "check" }, h("input", { type: "checkbox", "data-event": e, checked: pub ? !!pub[k] : e !== "truncate" }), e.charAt(0).toUpperCase() + e.slice(1)));
+  const chosenTables = () => boxes.map((l) => l.querySelector("input")).filter((i) => i.checked).map((i) => i.dataset.table);
+  const chosenEvents = () => evs.map((l) => l.querySelector("input")).filter((i) => i.checked).map((i) => i.dataset.event);
+  const sqlText = () => {
+    const opt = `publish = ${qlit(chosenEvents().join(", "))}`;
+    if (!pub) return `create publication ${qid(name.value || "publication_name")}${chosenTables().length ? `\n  for table ${chosenTables().map((t) => `${qid("public")}.${qid(t)}`).join(", ")}` : ""}\n  with (${opt});`;
+    const out = [`alter publication ${qid(pub.name)} set (${opt});`];
+    if (!pub.all_tables) out.push(chosenTables().length ? `alter publication ${qid(pub.name)} set table ${chosenTables().map((t) => `${qid("public")}.${qid(t)}`).join(", ")};` : `-- no tables: every table is removed from the publication`);
+    if (name.value.trim() && name.value.trim() !== pub.name) out.push(`alter publication ${qid(pub.name)} rename to ${qid(name.value.trim())};`);
+    return out.join("\n");
+  };
+  const refresh = () => prev.set(sqlText());
+  for (const el of [name, ...boxes.map((l) => l.querySelector("input")), ...evs.map((l) => l.querySelector("input"))]) { el.addEventListener("input", refresh); el.addEventListener("change", refresh); }
+  refresh();
+  const ok = await dialog(pub ? `Edit ${pub.name}` : "Create a publication", () => h("div", { class: "stack" },
+    formRow("Name", name),
+    formRow("Events", h("div", { class: "checks", id: "pub-events" }, evs), "Which kinds of change are sent to subscribers."),
+    pub?.all_tables ? h("p", { class: "muted" }, "This publication covers all tables. Its tables cannot be changed here.")
+      : formRow("Tables", tables.length ? h("div", { class: "checks", id: "pub-tables" }, boxes) : h("p", { class: "muted" }, "No tables in the public schema yet."), "Only the public schema is listed. “All tables” needs a superuser, so it is not offered."),
+    h("div", { class: "form-section" }, h("h3", null, "SQL that will run"), prev.el)), {
+    sheet: true, confirmLabel: pub ? "Save publication" : "Create publication",
+    onSubmit: async () => {
+      if (!/^[A-Za-z_][A-Za-z0-9_$]*$/.test(name.value.trim())) throw new Error("Give the publication a name: letters, digits and underscores, not starting with a digit.");
+      if (!chosenEvents().length) throw new Error("Choose at least one event.");
+      await sqlRun(sqlText().split("\n").filter((l) => !l.startsWith("--")).join("\n"));
+      return true;
+    },
+  });
+  if (ok) { toast(pub ? "Publication saved" : "Publication created", "ok"); reload(); }
+}
+
+// ---------- role privileges ----------
+const PRIVS = [["select", "SELECT"], ["insert", "INSERT"], ["update", "UPDATE"], ["delete", "DELETE"]];
+const PRIV_ROLES = ["anon", "authenticated"];
+
+/** A matrix of what the API's two public roles may do to each table. Saving issues GRANT and REVOKE for what changed. */
+async function privilegesSheet(reload) {
+  const rows = await catalog(`select c.relname as name, c.relrowsecurity as rls,
+      ${PRIV_ROLES.flatMap((r) => PRIVS.map(([k, K]) => `has_table_privilege(${pgLit(r)}, c.oid, ${pgLit(K)}) as "${r}_${k}"`)).join(", ")}
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind in ('r', 'p') order by c.relname`);
+  if (!rows.length) { toast("There are no tables in the public schema yet.", "bad"); return; }
+  const prev = sqlPreview();
+  const key = (t, r, k) => `${t}|${r}|${k}`;
+  const was = new Map(); const now = new Map();
+  for (const t of rows) for (const r of PRIV_ROLES) for (const [k] of PRIVS) { const v = !!t[`${r}_${k}`]; was.set(key(t.name, r, k), v); now.set(key(t.name, r, k), v); }
+  const changes = () => {
+    const out = [];
+    for (const t of rows) for (const r of PRIV_ROLES) {
+      const add = PRIVS.filter(([k]) => now.get(key(t.name, r, k)) && !was.get(key(t.name, r, k))).map(([, K]) => K);
+      const drop = PRIVS.filter(([k]) => !now.get(key(t.name, r, k)) && was.get(key(t.name, r, k))).map(([, K]) => K);
+      if (add.length) out.push(`grant ${add.join(", ")} on ${qid("public")}.${qid(t.name)} to ${r};`);
+      if (drop.length) out.push(`revoke ${drop.join(", ")} on ${qid("public")}.${qid(t.name)} from ${r};`);
+    }
+    return out;
+  };
+  const refresh = () => prev.set(changes().join("\n") || "-- nothing changed yet");
+  const grid = h("div", { class: "tablewrap" }, h("table", { class: "data", id: "priv-table" },
+    h("thead", null, h("tr", null, h("th", null, "Table"), h("th", null, "Row security"), PRIV_ROLES.map((r) => h("th", { colspan: 4 }, r)))),
+    h("thead", null, h("tr", { class: "subhead" }, h("th"), h("th"), PRIV_ROLES.flatMap(() => PRIVS.map(([, K]) => h("th", null, K.slice(0, 3)))))),
+    h("tbody", null, rows.map((t) => h("tr", { "data-row": t.name },
+      h("td", null, t.name), h("td", null, t.rls ? "on" : h("span", { class: "warn", title: "Anyone with a grant can read or change every row" }, "off")),
+      PRIV_ROLES.flatMap((r) => PRIVS.map(([k, K]) => h("td", null, h("input", { type: "checkbox", "aria-label": `${r} ${K} on ${t.name}`, "data-cell": key(t.name, r, k), checked: now.get(key(t.name, r, k)),
+        onchange: (e) => { now.set(key(t.name, r, k), e.target.checked); refresh(); } })))))))));
+  refresh();
+  const ok = await dialog("Table privileges", () => h("div", { class: "stack" },
+    h("p", { class: "muted" }, "What the anon (not signed in) and authenticated (signed in) roles may do to each table. A grant lets the role try; row-level security decides which rows it may touch. Tables with security off expose every row to anyone with a grant."),
+    grid, h("div", { class: "form-section" }, h("h3", null, "SQL that will run"), prev.el)), {
+    sheet: true, confirmLabel: "Apply changes",
+    onSubmit: async () => { const c = changes(); if (!c.length) throw new Error("Nothing has changed."); await sqlRun(c.join("\n")); return true; },
+  });
+  if (ok) { toast("Privileges updated", "ok"); reload(); }
+}
+
 const DB_PAGES = {
   tables: {
     title: "Tables", hint: "Tables, views and other relations in the schema. Use the Table editor to browse and edit rows.", searchPlaceholder: "Search for a table", empty: "No tables in this schema.",
@@ -1463,6 +1543,7 @@ const DB_PAGES = {
   },
   roles: {
     schemas: false, title: "Roles", hint: "The database roles your API uses. Their privileges are granted per table; row-level security narrows them further.", searchPlaceholder: "Search for a role", empty: "No roles.",
+    toolbarAction: (reload) => h("button", { id: "edit-privileges", onclick: () => privilegesSheet(reload) }, "Table privileges"),
     query: (_s, p) => `select r.rolname as name, r.rolcanlogin as can_login, r.rolbypassrls as bypass_rls, r.rolconnlimit as connection_limit from pg_roles r
       where r.rolname in ('anon', 'authenticated', 'service_role', 'baas_ai_reader') or r.rolname = ${pgLit(`authenticator_${p.ref}`)} order by r.rolname`,
     cols: [{ key: "name", label: "Name" }, { label: "Used for", cell: (r) => ROLE_NOTES[r.name] || (r.name.startsWith("authenticator_") ? "This project's login role; switches to the roles above per request" : ""), max: 90 },
@@ -1505,10 +1586,18 @@ const DB_PAGES = {
   },
   publications: {
     schemas: false, title: "Publications", hint: "Publications choose which tables stream their changes to subscribers, such as logical replication clients.", searchPlaceholder: "Search for a publication", empty: "No publications.",
+    toolbarAction: (reload) => h("button", { class: "primary", id: "new-publication", onclick: () => publicationSheet(null, reload) }, icon("plus", 15), " New publication"),
     query: () => `select p.pubname as name, p.puballtables as all_tables, p.pubinsert as ins, p.pubupdate as upd, p.pubdelete as del, p.pubtruncate as trunc,
       (select count(*) from pg_publication_tables t where t.pubname = p.pubname) as tables from pg_publication p order by p.pubname`,
     cols: [{ key: "name", label: "Name" }, { label: "Insert", cell: (r) => (r.ins ? "yes" : "no") }, { label: "Update", cell: (r) => (r.upd ? "yes" : "no") }, { label: "Delete", cell: (r) => (r.del ? "yes" : "no") },
       { label: "Truncate", cell: (r) => (r.trunc ? "yes" : "no") }, { label: "Source", cell: (r) => (r.all_tables ? "All tables" : `${r.tables} table${Number(r.tables) === 1 ? "" : "s"}`) }],
+    actions: (r, reload) => [rowMenu([
+      ["Edit publication", () => publicationSheet(r, reload), { action: "edit-publication" }],
+      ["Delete publication", async () => {
+        if (!(await confirmBox("Delete publication", `Delete “${r.name}”? Subscribers using it stop receiving changes.`, { typed: r.name, confirmLabel: "Delete publication" }))) return;
+        try { await sqlRun(`drop publication ${qid(r.name)}`); toast("Publication deleted", "ok"); reload(); } catch (ex) { toast(ex.message, "bad"); }
+      }, { danger: true, action: "drop-publication" }],
+    ])],
   },
 };
 
