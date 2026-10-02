@@ -18,6 +18,8 @@ export type LlmResponse = {
 };
 export interface LlmClient {
   readonly model: string;
+  /** Who receives the data, for the notice shown to users ("Anthropic" when omitted). */
+  readonly provider?: string;
   complete(req: LlmRequest, signal?: AbortSignal): Promise<LlmResponse>;
 }
 

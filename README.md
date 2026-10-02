@@ -55,7 +55,7 @@ Without Docker: `npm ci && npm run build`, set the variables in `.env.example`, 
 
 ## Ask AI: questions in plain language
 
-Set `ANTHROPIC_API_KEY` on the server and an admin can turn the assistant on per project (dashboard → **Ask AI**, or `baas ai enable`). Then:
+Set `ANTHROPIC_API_KEY` on the server (or use an OpenAI-style provider, below) and an admin can turn the assistant on per project (dashboard → **Ask AI**, or `baas ai enable`). Then:
 
 - "Which customers spent the most this month?" → the assistant writes SQL, runs it read-only, and answers from the results. The queries it ran are shown so you can check them.
 - "Cancel all pending orders" → it checks what would be affected, then **proposes** the SQL. Nothing runs until you click *Run* (destructive statements also ask you to type `run`).
@@ -75,6 +75,8 @@ How it stays safe — none of this depends on the model behaving:
 - **Instructions hidden in your data cannot make it act.** Rows are passed to the model as data and marked untrusted; and even a model that obeyed them could only propose.
 - **Opt-in, with a notice.** Off by default per project. When on, your question, the structure of the tables the identity can read, and the rows its queries return (at most 50 rows, long values shortened) are sent to Anthropic. Use it only where that is acceptable for your data.
 - **Bounded:** 8 steps and 90 s per question, 2 concurrent per project, a daily question limit by plan (20 free / 500 pro), token use recorded per day. The audit log records who asked what and as whom, never the results.
+
+**OpenAI-style providers.** Set `OPENAI_API_KEY` and/or `BAAS_AI_BASE_URL` (or `BAAS_AI_PROVIDER=openai`) and `BAAS_AI_MODEL` to run the assistant on any model behind a Chat Completions API: OpenAI (`https://api.openai.com/v1`, the default), Azure OpenAI, OpenRouter, Ollama (`http://localhost:11434/v1`), vLLM, LM Studio, LiteLLM. The key is optional for local servers. `BAAS_AI_EFFORT=low|medium|high` is sent as `reasoning_effort` only when set (reasoning models; other models reject it), and `BAAS_AI_MAX_TOKENS_FIELD=max_completion_tokens` is for models that insist on that field. The model needs tool (function) calling; the safety properties do not depend on the provider, since the database and server enforce them. The notice shown in the dashboard names the host the questions go to. Anthropic wins if both keys are set, unless `BAAS_AI_PROVIDER=openai`. Tested against a stand-in server that speaks the protocol, not against a live OpenAI account.
 
 Configuration: `BAAS_AI_MODEL` (default `claude-opus-5-5`; a smaller model such as `claude-sonnet-5-5` is cheaper), `BAAS_AI_EFFORT` (`low`…`max`, default `medium`), and `BAAS_AI_FALLBACKS=off` if you run on a platform without the server-side refusal-fallback beta (it is on by default). In "everyone" mode, tables created outside the SQL editor by another owner need `GRANT SELECT … TO baas_ai_reader` before the assistant can see them.
 
@@ -127,6 +129,7 @@ Editing a migration after it was applied is refused, and a failing migration rol
 | `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` (+ `S3_ENDPOINT`, `S3_REGION`, `S3_PATH_STYLE`, `S3_PREFIX`, `S3_CREATE_BUCKET`) | Keep object files in an S3-compatible store (AWS S3, R2, B2, MinIO, Ceph, SeaweedFS) instead of `BAAS_STORAGE_DIR`; nodes then need no shared filesystem |
 | `BAAS_PG_BIN_DIR` | Directory with `pg_dump`/`pg_restore` (must match the server's major version) |
 | `ANTHROPIC_API_KEY` | Optional. Turns the Ask AI assistant on for the server (projects still opt in) |
+| `OPENAI_API_KEY` / `BAAS_AI_BASE_URL` / `BAAS_AI_PROVIDER` | Run Ask AI on an OpenAI-style provider instead (see Ask AI) |
 | `BAAS_AI_MODEL` / `BAAS_AI_EFFORT` / `BAAS_AI_FALLBACKS` | Model (default `claude-opus-5-5`), reasoning effort (default `medium`), and `off` to disable server-side refusal fallbacks |
 | `BAAS_PURGE_RETENTION_DAYS` | Days a deleted project's data is kept before purge (default 7) |
 

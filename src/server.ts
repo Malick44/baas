@@ -40,8 +40,17 @@ const platform = await createPlatform({
   publicScheme: process.env.BAAS_PUBLIC_SCHEME ?? "http",
   publicPort: process.env.BAAS_PUBLIC_PORT ? Number(process.env.BAAS_PUBLIC_PORT) : gatewayPort,
   // The assistant is offered only when the operator has given the server Anthropic credentials.
-  ai: process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN
-    ? { model: process.env.BAAS_AI_MODEL ?? "claude-opus-5-5", effort: (process.env.BAAS_AI_EFFORT as "low" | "medium" | "high" | "xhigh" | "max" | undefined) ?? "medium", serverFallbacks: process.env.BAAS_AI_FALLBACKS !== "off" }
+  // Or a model behind an OpenAI-style API: BAAS_AI_PROVIDER=openai (or just OPENAI_API_KEY / BAAS_AI_BASE_URL), with BAAS_AI_MODEL.
+  ai: process.env.BAAS_AI_PROVIDER === "openai" || (!process.env.BAAS_AI_PROVIDER && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN && (process.env.OPENAI_API_KEY || process.env.BAAS_AI_BASE_URL))
+    ? { openai: {
+        model: process.env.BAAS_AI_MODEL || "gpt-4.1",
+        baseUrl: process.env.BAAS_AI_BASE_URL || process.env.OPENAI_BASE_URL || undefined,
+        apiKey: process.env.OPENAI_API_KEY || undefined,
+        reasoningEffort: process.env.BAAS_AI_EFFORT === "low" || process.env.BAAS_AI_EFFORT === "medium" || process.env.BAAS_AI_EFFORT === "high" ? process.env.BAAS_AI_EFFORT : undefined,
+        maxTokensField: process.env.BAAS_AI_MAX_TOKENS_FIELD === "max_completion_tokens" ? "max_completion_tokens" : undefined,
+      } }
+    : process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN
+    ? { model: process.env.BAAS_AI_MODEL || "claude-opus-5-5", effort: (process.env.BAAS_AI_EFFORT as "low" | "medium" | "high" | "xhigh" | "max" | undefined) || "medium", serverFallbacks: process.env.BAAS_AI_FALLBACKS !== "off" }
     : undefined,
   // Email for confirmation, password reset and magic links is offered only when the operator provides an SMTP server.
   mail: process.env.SMTP_URL ? { smtpUrl: process.env.SMTP_URL, from: process.env.MAIL_FROM } : undefined,
@@ -61,7 +70,7 @@ platform.start().catch((e) => { console.error("could not start background work:"
 // shared store the database uploads that WAL to this very server.
 const ports = await platform.listen({ api: Number(process.env.PORT ?? 8080), gateway: gatewayPort });
 void platform.housekeep().then((r) => console.log("housekeeping:", JSON.stringify(r))).catch((e) => console.error("housekeeping failed:", e));
-console.log(platform.ai.available ? `AI assistant on (${process.env.BAAS_AI_MODEL ?? "claude-opus-5-5"})` : "AI assistant off (set ANTHROPIC_API_KEY to enable)");
+console.log(platform.ai.available ? `AI assistant on (${platform.ai.model})` : "AI assistant off (set ANTHROPIC_API_KEY, or OPENAI_API_KEY / BAAS_AI_BASE_URL for an OpenAI-style provider)");
 console.log(`management API + dashboard on :${ports.api}, data plane on :${ports.gateway} (<ref>.${process.env.BAAS_GATEWAY_DOMAIN ?? "localhost"})`);
 
 for (const sig of ["SIGINT", "SIGTERM"] as const)

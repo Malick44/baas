@@ -1225,7 +1225,7 @@ async function ai(body, p) {
   const allow = h("input", { type: "checkbox", id: "ai-allow-bypass", checked: st.allowBypassRls, disabled: (st.allowBypassRls ? !canAdmin : !isOwner) });
   allow.addEventListener("change", async () => {
     const want = allow.checked;
-    if (want && !(await confirmBox("Let the assistant ignore row-level security?", "In “everyone” mode the assistant can read every row in your public tables, including rows your policies hide from users, and those rows can be sent to Anthropic. Only turn this on if that is acceptable for this project's data.", { danger: true, confirmLabel: "Allow" }))) { allow.checked = false; return; }
+    if (want && !(await confirmBox("Let the assistant ignore row-level security?", "In “everyone” mode the assistant can read every row in your public tables, including rows your policies hide from users, and those rows can be sent to the AI provider. Only turn this on if that is acceptable for this project's data.", { danger: true, confirmLabel: "Allow" }))) { allow.checked = false; return; }
     try { await api("PUT", `/v1/projects/${p.ref}/ai/config`, { allowBypassRls: want }); toast(want ? "Everyone mode allowed" : "Everyone mode turned off", "ok"); ai(body, p); } catch (ex) { allow.checked = !want; toast(ex.message, "bad"); }
   });
   const settings = h("details", { id: "ai-settings" }, h("summary", null, "Assistant settings"),
@@ -1267,7 +1267,7 @@ async function ai(body, p) {
       h("button", { class: "small", onclick: () => { AI.entries = []; draw(); } }, "Clear chat"),
       h("button", { class: "small", id: "ai-disable", disabled: !canAdmin, onclick: async () => { if (await confirmBox("Turn off the assistant?", "The assistant loses its read access to this database.", { danger: false, confirmLabel: "Turn off" })) { await api("POST", `/v1/projects/${p.ref}/ai/disable`); AI.entries = []; ai(body, p); } } }, "Turn off"))),
     identityBar, list,
-    h("div", { class: "stack" }, input, h("div", { class: "row between" }, h("span", { class: "muted" }, "Your question, the table structure and query results are sent to Anthropic. Ctrl/⌘+Enter to send."), send)),
+    h("div", { class: "stack" }, input, h("div", { class: "row between" }, h("span", { class: "muted" }, "Your question, the table structure and query results are sent to the AI provider. Ctrl/⌘+Enter to send."), send)),
     settings));
   drawIdentity();
   draw();

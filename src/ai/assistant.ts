@@ -6,8 +6,9 @@ import { inspectAiAccess, removeAiAccess, syncAiAccess } from "./setup.js";
 import { classifyRisk, splitStatements, type Risk } from "./risk.js";
 import { LlmError, type ChatMessage, type LlmClient, type ToolSpec } from "./llm.js";
 
-export const AI_DATA_NOTICE =
-  "When you ask a question, your question, the structure of your public tables and the rows returned by the queries the assistant runs are sent to Anthropic to generate the answer.";
+export const aiDataNotice = (provider = "Anthropic") =>
+  `When you ask a question, your question, the structure of your public tables and the rows returned by the queries the assistant runs are sent to ${provider} to generate the answer.`;
+export const AI_DATA_NOTICE = aiDataNotice();
 
 const MAX_TURNS = 8;
 const MAX_TOOL_CALLS_PER_TURN = 4;
@@ -137,6 +138,10 @@ export class AiAssistant {
     private opts: AssistantOptions = {},
   ) {}
 
+  get model(): string | null {
+    return this.llm?.model ?? null;
+  }
+
   get available() {
     return this.llm !== undefined;
   }
@@ -158,7 +163,7 @@ export class AiAssistant {
       model: this.llm?.model ?? null,
       questionsToday: await this.usageToday(ref),
       questionsPerDay: planOf(project.plan).aiQuestionsPerDay,
-      notice: AI_DATA_NOTICE,
+      notice: aiDataNotice(this.llm?.provider),
       allowBypassRls: bypass,
       defaultIdentity: bypass ? "service" : "anon",
     };

@@ -37,8 +37,11 @@ services:
       MAIL_FROM: ${MAIL_FROM:-}
       # Optional: offer the Ask AI assistant (projects opt in individually).
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      BAAS_AI_MODEL: ${BAAS_AI_MODEL:-claude-opus-5-5}
-      BAAS_AI_EFFORT: ${BAAS_AI_EFFORT:-medium}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      BAAS_AI_PROVIDER: ${BAAS_AI_PROVIDER:-}
+      BAAS_AI_BASE_URL: ${BAAS_AI_BASE_URL:-}
+      BAAS_AI_MODEL: ${BAAS_AI_MODEL:-}
+      BAAS_AI_EFFORT: ${BAAS_AI_EFFORT:-}
       BAAS_AI_FALLBACKS: ${BAAS_AI_FALLBACKS:-on}
       GATEWAY_PORT: "8081"
       PORT: "8080"

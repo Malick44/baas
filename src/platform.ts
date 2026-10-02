@@ -4,6 +4,7 @@ import pg from "pg";
 import { ProjectAdmin } from "./admin-sql.js";
 import { AiAssistant } from "./ai/assistant.js";
 import { AnthropicLlm, type LlmClient } from "./ai/llm.js";
+import { OpenAiLlm, type OpenAiLlmOptions } from "./ai/openai.js";
 import { buildApi } from "./api.js";
 import { AuthService, type AuthOptions } from "./authsvc.js";
 import { BackupService } from "./backup.js";
@@ -73,6 +74,8 @@ export type PlatformConfig = {
   /** Omit to leave the AI assistant unavailable. Give `llm` to supply your own model client (tests do), or `model` to use Anthropic. */
   ai?: {
     llm?: LlmClient;
+    /** Use a model behind an OpenAI-style Chat Completions API (OpenAI, Azure, OpenRouter, Ollama, vLLM...) instead of Anthropic. */
+    openai?: OpenAiLlmOptions;
     model?: string;
     effort?: "low" | "medium" | "high" | "xhigh" | "max";
     serverFallbacks?: boolean;
@@ -143,7 +146,7 @@ export async function createPlatform(cfg: PlatformConfig) {
   const admin = new ProjectAdmin(pm);
   const pipelines = new PipelineService(pool, control, pm, vault, cfg.pipelines);
   const extensions = new ExtensionService(control, pm);
-  const llm = cfg.ai?.llm ?? (cfg.ai?.model ? new AnthropicLlm({ model: cfg.ai.model, effort: cfg.ai.effort, serverFallbacks: cfg.ai.serverFallbacks }) : undefined);
+  const llm = cfg.ai?.llm ?? (cfg.ai?.openai ? new OpenAiLlm(cfg.ai.openai) : undefined) ?? (cfg.ai?.model ? new AnthropicLlm({ model: cfg.ai.model, effort: cfg.ai.effort, serverFallbacks: cfg.ai.serverFallbacks }) : undefined);
   const ai = new AiAssistant(control, pm, llm, { queryTimeoutMs: cfg.ai?.queryTimeoutMs, totalTimeoutMs: cfg.ai?.totalTimeoutMs });
 
   const gateway: FastifyInstance = buildGateway(pm, { auth, storage, functions, realtime }, {
