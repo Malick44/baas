@@ -123,6 +123,7 @@ Editing a migration after it was applied is refused, and a failing migration rol
 | `BAAS_GATEWAY_DOMAIN` / `BAAS_PUBLIC_SCHEME` / `BAAS_PUBLIC_PORT` | How projects are addressed: `<scheme>://<ref>.<domain>[:port]` |
 | `PORT` / `GATEWAY_PORT` | Management API + dashboard (8080), data plane (8081) |
 | `BAAS_STORAGE_DIR`, `BAAS_BACKUP_DIR` | Where object files and backups live |
+| `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` (+ `S3_ENDPOINT`, `S3_REGION`, `S3_PATH_STYLE`, `S3_PREFIX`, `S3_CREATE_BUCKET`) | Keep object files in an S3-compatible store (AWS S3, R2, B2, MinIO, Ceph, SeaweedFS) instead of `BAAS_STORAGE_DIR`; nodes then need no shared filesystem |
 | `BAAS_PG_BIN_DIR` | Directory with `pg_dump`/`pg_restore` (must match the server's major version) |
 | `ANTHROPIC_API_KEY` | Optional. Turns the Ask AI assistant on for the server (projects still opt in) |
 | `BAAS_AI_MODEL` / `BAAS_AI_EFFORT` / `BAAS_AI_FALLBACKS` | Model (default `claude-opus-5-5`), reasoning effort (default `medium`), and `off` to disable server-side refusal fallbacks |
@@ -153,6 +154,8 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 - Dashboard accounts have no single sign-on, and one account belongs to one organisation.
 
 ## Development and tests
+
+**S3 object storage.** Set the `S3_*` variables (or use `docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d`, which bundles SeaweedFS) and object files go to the bucket, keyed `<project>/<id>`; nothing is written to the local volume. Requests are signed with SigV4 by `src/s3.ts` (no SDK), verified in CI against a real independent S3 server. Unreachable or misconfigured buckets stop start-up with a clear error. To move files kept on disk, run `baas admin storage migrate` (or `POST /v1/admin/storage/migrate` with the bootstrap token) with `BAAS_STORAGE_DIR` still mounted: it is idempotent and reports copied / already there / missing. When combining the overlay with `docker-compose.nodes.yml`, give `baas2` the same `S3_*` environment (see `scripts/smoke.sh`).
 
 CI (`.github/workflows/ci.yml`) runs the typecheck, unit tests and browser tests against a Postgres service, and a second job runs `scripts/smoke.sh`: it builds the images, starts the real Compose stack, creates an organisation and a project, and exercises REST with row-level security, auth, storage, a function, metrics, a backup that it then restores, the certificate check and a restart. Run it yourself with `scripts/smoke.sh` (needs docker, curl and jq).
 

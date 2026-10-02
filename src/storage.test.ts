@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { signJwt } from "./keys.js";
+import { type BlobStore, DiskStore, S3Store } from "./blobs.js";
 import { StorageService, parseMultipart, validObjectName } from "./storage.js";
 import { makeHarness, type Harness, type TestProject } from "./testkit.js";
 
@@ -32,7 +33,20 @@ describe("object names", () => {
   });
 });
 
-describe("storage", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
+// The same suite runs against plain files and, when a server is given, against a real S3 implementation.
+const S3_ENDPOINT = process.env.BAAS_TEST_S3_ENDPOINT;
+if (process.env.CI && !S3_ENDPOINT) throw new Error("set BAAS_TEST_S3_ENDPOINT so the storage tests run against a real S3 server in CI");
+const backends: Array<{ name: string; make: (root: string) => Promise<BlobStore> }> = [
+  { name: "disk", make: async (root) => new DiskStore(root) },
+  ...(S3_ENDPOINT ? [{ name: "s3", make: async () => {
+    const store = new S3Store({ endpoint: S3_ENDPOINT, bucket: "baas-test", accessKeyId: process.env.BAAS_TEST_S3_KEY ?? "accessKey1", secretAccessKey: process.env.BAAS_TEST_S3_SECRET ?? "verySecretKey1", prefix: `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}/` });
+    await store.s3.createBucket();
+    return store;
+  } }] : []),
+];
+
+for (const be of backends) describe(`storage (${be.name})`, { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
+  let blobs: BlobStore;
   let h: Harness;
   let a: TestProject;
   let b: TestProject;
@@ -41,8 +55,9 @@ describe("storage", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
 
   before(async () => {
     root = await mkdtemp(join(tmpdir(), "baas-storage-"));
+    blobs = await be.make(root);
     h = await makeHarness(ADMIN!, (pm) => ({
-      services: { storage: new StorageService(pm, { root, limits: () => ({ fileSize: 1024, totalBytes: 4096 }) }) },
+      services: { storage: new StorageService(pm, { blobs, limits: () => ({ fileSize: 1024, totalBytes: 4096 }) }) },
     }));
     [a, b] = await Promise.all([h.project(), h.project()]);
     await h.sql(a, `
@@ -106,10 +121,10 @@ describe("storage", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     assert.equal((await up(a, "pub/..%2F..%2Fetc%2Fpasswd", "x", { key: a.service })).status, 400);
     assert.equal((await up(a, "pub/%2Fabs", "x", { key: a.service })).status, 400);
     await up(a, "pub/tricky name.html", "<script>1</script>", { key: a.service, type: "text/html" });
-    const before = (await walk(join(root, a.ref))).length;
+    const before = (await blobs.list(a.ref)).length;
     assert.equal((await up(a, "private/denied.txt", "nope", { token: u1.access_token })).status, 403);
-    assert.equal((await walk(join(root, a.ref))).length, before);
-    const files = await walk(join(root, a.ref));
+    assert.equal((await blobs.list(a.ref)).length, before);
+    const files = await blobs.list(a.ref);
     for (const f of files) assert.match(f, /[0-9a-f-]{36}$/);
     assert.ok(!files.some((f) => f.includes("tricky") || f.includes("passwd")));
   });
@@ -199,10 +214,10 @@ describe("storage", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     assert.equal((await h.call(a, "GET", "/storage/v1/object/public/pub/docs/a2.txt", {})).status, 404);
     assert.equal((await h.call(a, "GET", "/storage/v1/object/public/pub/moved.txt", {})).text, "docs/a.txt");
 
-    const filesBefore = (await walk(join(root, a.ref))).length;
+    const filesBefore = (await blobs.list(a.ref)).length;
     const del = await h.call(a, "DELETE", "/storage/v1/object/pub", { key: a.service, body: { prefixes: ["moved.txt", "top.txt", "ghost"] } });
     assert.deepEqual(del.json.map((x: any) => x.name).sort(), ["moved.txt", "top.txt"]);
-    assert.equal((await walk(join(root, a.ref))).length, filesBefore - 2);
+    assert.equal((await blobs.list(a.ref)).length, filesBefore - 2);
     assert.equal((await h.call(a, "DELETE", "/storage/v1/object/pub/docs/b.txt", { key: a.service })).status, 200);
     assert.equal((await h.call(a, "DELETE", "/storage/v1/object/pub/docs/b.txt", { key: a.service })).status, 404);
   });
@@ -217,9 +232,9 @@ describe("storage", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     const p = await h.project();
     await h.call(p, "POST", "/storage/v1/bucket", { key: p.service, body: { id: "z" } });
     await up(p, "z/f", "data", { key: p.service });
-    assert.ok((await walk(join(root, p.ref))).length > 0);
-    await new StorageService(h.pm, { root }).purgeProject(p.ref);
-    assert.equal((await walk(join(root, p.ref))).length, 0);
-    assert.equal(await readFile(join(root, "nope")).catch(() => "gone"), "gone");
+    assert.ok((await blobs.list(p.ref)).length > 0);
+    await new StorageService(h.pm, { blobs }).purgeProject(p.ref);
+    assert.equal((await blobs.list(p.ref)).length, 0);
+    if (be.name === "disk") assert.equal(await readFile(join(root, "nope")).catch(() => "gone"), "gone");
   });
 });

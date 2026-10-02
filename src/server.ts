@@ -14,6 +14,16 @@ const platform = await createPlatform({
   masterKey: need("BAAS_MASTER_KEY"),
   bootstrapToken: need("BAAS_BOOTSTRAP_TOKEN"),
   storageDir: resolve(process.env.BAAS_STORAGE_DIR ?? "./data/storage"),
+  s3: process.env.S3_BUCKET ? {
+    endpoint: process.env.S3_ENDPOINT ?? "https://s3.amazonaws.com",
+    bucket: process.env.S3_BUCKET,
+    region: process.env.S3_REGION || undefined,
+    accessKeyId: need("S3_ACCESS_KEY_ID"),
+    secretAccessKey: need("S3_SECRET_ACCESS_KEY"),
+    pathStyle: process.env.S3_PATH_STYLE !== "false",
+    prefix: process.env.S3_PREFIX || undefined,
+    createBucket: process.env.S3_CREATE_BUCKET === "true",
+  } : undefined,
   backupDir: resolve(process.env.BAAS_BACKUP_DIR ?? "./data/backups"),
   pgBinDir: process.env.BAAS_PG_BIN_DIR,
   pitr: process.env.BAAS_PITR_ARCHIVE_DIR ? {

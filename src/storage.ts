@@ -1,16 +1,18 @@
-import { randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
 import { HttpError, type Resolved } from "./control.js";
 import { type Helpers, type Mountable, type ProjectCtx, jsonBody } from "./gateway.js";
 import { signJwt, verifyJwt } from "./keys.js";
+import { type BlobStore, DiskStore } from "./blobs.js";
 import type { ApiRole, PoolManager } from "./pools.js";
 
 export type StorageLimits = { fileSize: number; totalBytes: number };
-export type StorageOptions = { root: string; limits?: (project: Resolved) => StorageLimits };
+export type StorageOptions = {
+  /** Where bytes live: a BlobStore (disk or S3), or just a directory for plain files. */
+  blobs?: BlobStore;
+  root?: string;
+  limits?: (project: Resolved) => StorageLimits;
+};
 
 const DEFAULT_LIMITS: StorageLimits = { fileSize: 50 * 1024 * 1024, totalBytes: 1024 * 1024 * 1024 };
 const BUCKET_ID = /^[A-Za-z0-9._-]{1,63}$/;
@@ -53,14 +55,20 @@ export function parseMultipart(body: Buffer, contentType: string): { data: Buffe
 type Bucket = { id: string; public: boolean; file_size_limit: number | null; allowed_mime_types: string[] | null; created_at: Date };
 
 export class StorageService implements Mountable {
-  constructor(private pm: PoolManager, private opts: StorageOptions) {}
+  readonly blobs: BlobStore;
+
+  constructor(private pm: PoolManager, private opts: StorageOptions) {
+    if (!opts.blobs && !opts.root) throw new Error("storage needs a blob store or a directory");
+    this.blobs = opts.blobs ?? new DiskStore(opts.root!);
+  }
 
   private limits(p: Resolved) {
     return this.opts.limits?.(p) ?? DEFAULT_LIMITS;
   }
-  private file(ref: string, id: string) {
+  /** Where an object's bytes are kept, whatever the backend. */
+  key(ref: string, id: string) {
     if (!UUID.test(id)) throw new HttpError(500, "bad object id");
-    return join(this.opts.root, ref, id.slice(0, 2), id);
+    return `${ref}/${id.slice(0, 2)}/${id}`;
   }
   private svc<T>(ref: string, fn: (c: pg.PoolClient) => Promise<T>) {
     return this.pm.withRole(ref, { role: "service_role", claims: { role: "service_role" } }, (c) => fn(c));
@@ -83,7 +91,7 @@ export class StorageService implements Mountable {
 
   /** Remove every stored file of a project (used when a project is purged). */
   async purgeProject(ref: string): Promise<void> {
-    await rm(join(this.opts.root, ref), { recursive: true, force: true });
+    await this.blobs.deletePrefix(ref);
   }
 
   async upload(ctx: ProjectCtx, bucketId: string, name: string, data: Buffer, mime: string, upsert: boolean) {
@@ -97,33 +105,24 @@ export class StorageService implements Mountable {
     if ((await this.totalBytes(ctx.ref)) + data.length > lim.totalBytes) throw new HttpError(413, "Storage quota exceeded");
 
     const owner = ctx.who.role === "authenticated" ? (ctx.who.claims.sub as string) : null;
-    let tmp: string | undefined;
-    try {
-      return await this.as(ctx, async (c) => {
-        const sql = upsert
-          ? `INSERT INTO storage.objects (bucket_id, name, owner, size, mimetype, metadata) VALUES ($1,$2,$3,$4,$5,$6)
-             ON CONFLICT (bucket_id, name) DO UPDATE SET size = EXCLUDED.size, mimetype = EXCLUDED.mimetype, metadata = EXCLUDED.metadata, updated_at = now()
-             RETURNING id`
-          : `INSERT INTO storage.objects (bucket_id, name, owner, size, mimetype, metadata) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`;
-        let id: string;
-        try {
-          id = (await c.query<{ id: string }>(sql, [bucketId, name, owner, data.length, mime, JSON.stringify({ size: data.length, mimetype: mime })])).rows[0]!.id;
-        } catch (err) {
-          if ((err as { code?: string }).code === "23505") throw new HttpError(409, "The resource already exists");
-          if ((err as { code?: string }).code === "42501") throw new HttpError(ctx.who.role === "anon" ? 401 : 403, "new row violates row-level security policy");
-          throw err;
-        }
-        const final = this.file(ctx.ref, id);
-        await mkdir(dirname(final), { recursive: true });
-        tmp = `${final}.${randomUUID()}.tmp`;
-        await writeFile(tmp, data);
-        await rename(tmp, final); // just before COMMIT; a failed commit leaves an orphan file, never a dangling row
-        tmp = undefined;
-        return { Id: id, Key: `${bucketId}/${name}` };
-      });
-    } finally {
-      if (tmp) await rm(tmp, { force: true });
-    }
+    return await this.as(ctx, async (c) => {
+      const sql = upsert
+        ? `INSERT INTO storage.objects (bucket_id, name, owner, size, mimetype, metadata) VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (bucket_id, name) DO UPDATE SET size = EXCLUDED.size, mimetype = EXCLUDED.mimetype, metadata = EXCLUDED.metadata, updated_at = now()
+           RETURNING id`
+        : `INSERT INTO storage.objects (bucket_id, name, owner, size, mimetype, metadata) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`;
+      let id: string;
+      try {
+        id = (await c.query<{ id: string }>(sql, [bucketId, name, owner, data.length, mime, JSON.stringify({ size: data.length, mimetype: mime })])).rows[0]!.id;
+      } catch (err) {
+        if ((err as { code?: string }).code === "23505") throw new HttpError(409, "The resource already exists");
+        if ((err as { code?: string }).code === "42501") throw new HttpError(ctx.who.role === "anon" ? 401 : 403, "new row violates row-level security policy");
+        throw err;
+      }
+      // Just before COMMIT: a failed commit leaves an orphan blob, never a row without bytes.
+      await this.blobs.put(this.key(ctx.ref, id), data, mime);
+      return { Id: id, Key: `${bucketId}/${name}` };
+    });
   }
 
   private async findObject(ctx: ProjectCtx, bucketId: string, name: string) {
@@ -132,19 +131,15 @@ export class StorageService implements Mountable {
   }
 
   private async send(reply: FastifyReply, ref: string, obj: { id: string; size: string; mimetype: string | null }) {
-    const path = this.file(ref, obj.id);
-    try {
-      await stat(path);
-    } catch {
-      throw new HttpError(404, "Object not found");
-    }
+    const blob = await this.blobs.get(this.key(ref, obj.id));
+    if (!blob) throw new HttpError(404, "Object not found");
     return reply
       .header("content-type", obj.mimetype ?? "application/octet-stream")
       .header("content-length", obj.size)
       .header("cache-control", "max-age=3600")
       .header("x-content-type-options", "nosniff")
       .header("content-security-policy", "default-src 'none'; sandbox")
-      .send(createReadStream(path));
+      .send(blob.stream);
   }
 
   async download(ctx: ProjectCtx, reply: FastifyReply, bucketId: string, name: string) {
@@ -157,7 +152,7 @@ export class StorageService implements Mountable {
     if (names.length > 1000) throw new HttpError(400, "too many prefixes");
     const rows = await this.as(ctx, async (c) => (await c.query<{ id: string; name: string; bucket_id: string; size: string }>(
       `DELETE FROM storage.objects WHERE bucket_id = $1 AND name = ANY($2) RETURNING id, name, bucket_id, size`, [bucketId, names])).rows);
-    await Promise.all(rows.map((r) => rm(this.file(ctx.ref, r.id), { force: true })));
+    await Promise.all(rows.map((r) => this.blobs.delete(this.key(ctx.ref, r.id))));
     return rows.map((r) => ({ name: r.name, bucket_id: r.bucket_id, id: r.id, metadata: { size: Number(r.size) } }));
   }
 
@@ -226,7 +221,7 @@ export class StorageService implements Mountable {
     }));
     const emptyBucket = async (ref: string, id: string) => {
       const rows = await this.svc(ref, async (c) => (await c.query<{ id: string }>(`DELETE FROM storage.objects WHERE bucket_id = $1 RETURNING id`, [id])).rows);
-      await Promise.all(rows.map((r) => rm(this.file(ref, r.id), { force: true })));
+      await Promise.all(rows.map((r) => this.blobs.delete(this.key(ref, r.id))));
     };
     app.post(`${B}/bucket/:bucket/empty`, (req, reply) => withCtx(req, reply, async (ctx) => {
       svcOnly(ctx);
@@ -314,11 +309,7 @@ export class StorageService implements Mountable {
               `INSERT INTO storage.objects (bucket_id, name, owner, size, mimetype, metadata)
                SELECT bucket_id, $3, owner, size, mimetype, metadata FROM storage.objects WHERE bucket_id = $1 AND name = $2 RETURNING id`, [bucket, from, to]);
             const id = r.rows[0]?.id as string | undefined;
-            if (id) {
-              await mkdir(dirname(this.file(ctx.ref, id)), { recursive: true });
-              const { copyFile } = await import("node:fs/promises");
-              await copyFile(this.file(ctx.ref, src.id), this.file(ctx.ref, id));
-            }
+            if (id) await this.blobs.copy(this.key(ctx.ref, src.id), this.key(ctx.ref, id));
             return id;
           } catch (err) {
             if ((err as { code?: string }).code === "23505") throw new HttpError(409, "The resource already exists");

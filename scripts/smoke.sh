@@ -13,6 +13,8 @@ OVERRIDE="$(mktemp --suffix=.yml)"
 
 cat > "$ENVF" <<ENV
 POSTGRES_PASSWORD=$(openssl rand -hex 12)
+S3_ACCESS_KEY_ID=smoke$(openssl rand -hex 6)
+S3_SECRET_ACCESS_KEY=$(openssl rand -hex 16)
 BAAS_MASTER_KEY=$(openssl rand -hex 32)
 BAAS_BOOTSTRAP_TOKEN=$BOOT
 BAAS_PUBLIC_PORT=$GW_PORT
@@ -27,13 +29,36 @@ services:
 YML
 # SMOKE_PITR=1 also runs the stack with WAL archiving (docker-compose.pitr.yml) and restores to a moment.
 # SMOKE_NODES=2 runs two baas nodes behind a load balancer (docker-compose.nodes.yml) and kills the leader.
+# SMOKE_S3=1 keeps object files in a bundled S3 server (docker-compose.s3.yml) and checks nothing lands on the local volume.
 PITR_FILE=()
 NODES_FILE=()
+S3_FILE=()
+[ "${SMOKE_S3:-}" = 1 ] && S3_FILE=(-f docker-compose.s3.yml)
 [ "${SMOKE_NODES:-}" = 2 ] && NODES_FILE=(-f docker-compose.nodes.yml)
 EXTRA_FILE=()
 [ -n "${SMOKE_EXTRA_COMPOSE:-}" ] && EXTRA_FILE=(-f "$SMOKE_EXTRA_COMPOSE")   # for environments that need extra build settings (a proxy CA)
 [ "${SMOKE_PITR:-}" = 1 ] && PITR_FILE=(-f docker-compose.pitr.yml)
-compose() { docker compose --env-file "$ENVF" -f docker-compose.yml "${PITR_FILE[@]}" "${NODES_FILE[@]}" -f "$OVERRIDE" "${EXTRA_FILE[@]}" "$@"; }
+if [ "${SMOKE_S3:-}" = 1 ] && [ "${SMOKE_NODES:-}" = 2 ]; then
+  # The second node gets its own, empty storage volume: if files were still kept locally the other node could not serve them.
+  cat >> "$OVERRIDE" <<YML
+  baas2:
+    depends_on:
+      s3: { condition: service_started }
+    environment:
+      S3_ENDPOINT: http://s3:8333
+      S3_BUCKET: baas
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: \${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: \${S3_SECRET_ACCESS_KEY}
+      S3_CREATE_BUCKET: "true"
+    volumes: !override
+      - backups:/data/backups
+      - nodelocal:/data/storage
+volumes:
+  nodelocal:
+YML
+fi
+compose() { docker compose --env-file "$ENVF" -f docker-compose.yml "${PITR_FILE[@]}" "${NODES_FILE[@]}" "${S3_FILE[@]}" -f "$OVERRIDE" "${EXTRA_FILE[@]}" "$@"; }
 
 cleanup() {
   status=$?
@@ -89,6 +114,12 @@ step "storage"
 gw POST /storage/v1/bucket -H "apikey: $SERVICE" -H "authorization: Bearer $SERVICE" -H 'content-type: application/json' -d '{"id":"files","name":"files","public":true}' -o /dev/null -f
 echo "hello storage" | gw POST /storage/v1/object/files/hello.txt -H "apikey: $SERVICE" -H "authorization: Bearer $SERVICE" -H 'content-type: text/plain' --data-binary @- -o /dev/null -f
 expect "public file downloads" "hello storage" "$(gw GET /storage/v1/object/public/files/hello.txt)"
+if [ "${SMOKE_S3:-}" = 1 ]; then
+  for i in 1 2 3 4; do expect "file $i is served from the bucket" "hello storage" "$(gw GET /storage/v1/object/public/files/hello.txt)"; done
+  for svc in baas $([ "${SMOKE_NODES:-}" = 2 ] && echo baas2); do
+    expect "no object files on $svc's disk" 0 "$(compose exec -T "$svc" sh -c 'find /data/storage -type f | wc -l' | tr -d '[:space:]')"
+  done
+fi
 
 step "edge function"
 api -fS -XPUT "http://127.0.0.1:$API_PORT/v1/projects/$REF/functions/hi" -d '{"source":"export default async () => Response.json({ hi: 1 });"}' >/dev/null

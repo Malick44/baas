@@ -12,7 +12,10 @@ import { ExtensionService } from "./extensions.js";
 import { FunctionService } from "./functions.js";
 import { buildGateway } from "./gateway.js";
 import { mailerFrom, type Mailer } from "./mailer.js";
+import { DiskStore, S3Store } from "./blobs.js";
 import { ClusterMover } from "./clusters.js";
+import type { S3Config } from "./s3.js";
+import { migrateStorage } from "./storage-migrate.js";
 import { Coordinator } from "./coordinator.js";
 import { PgLimits } from "./limits.js";
 import { PitrService, type PitrOptions } from "./pitr.js";
@@ -33,6 +36,8 @@ export type PlatformConfig = {
   masterKey: string;
   bootstrapToken: string;
   storageDir: string;
+  /** Keep object bytes in an S3 bucket instead of storageDir. Nodes then need no shared filesystem. */
+  s3?: S3Config & { /** Create the bucket at start-up if it does not exist (for a bundled S3 server). */ createBucket?: boolean };
   backupDir: string;
   pgBinDir?: string;
   /** Point-in-time recovery. Set to turn it on; the Postgres server must archive its WAL into `archiveDir`. */
@@ -87,8 +92,28 @@ export async function createPlatform(cfg: PlatformConfig) {
   const dir = new Directory(control);
   const pm = new PoolManager(dir, cfg.pgAdminUrl, { maxPools: 100, perPool: 5, queryTimeoutMs: cfg.queryTimeoutMs });
 
+  const blobs = cfg.s3 ? new S3Store(cfg.s3) : new DiskStore(cfg.storageDir);
+  // A wrong bucket or key is found now, not at the first upload.
+  if (blobs instanceof S3Store) {
+    let last: unknown;
+    // A bundled S3 server may still be starting; try for a while before giving up.
+    for (let i = 0; i < 15; i++) {
+      try {
+        if (cfg.s3!.createBucket) await blobs.s3.createBucket();
+        await blobs.s3.check();
+        last = undefined;
+        break;
+      } catch (e) {
+        last = e;
+        const status = (e as { status?: number }).status ?? 0;
+        if (status !== 0 && status !== 503) break; // a real answer, such as a wrong key: waiting will not change it
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+    if (last) throw new Error(`cannot use the S3 bucket "${cfg.s3!.bucket}": ${(last as Error).message}`);
+  }
   const storage = new StorageService(pm, {
-    root: cfg.storageDir,
+    blobs,
     limits: (p) => {
       const plan = planOf(p.plan);
       return { fileSize: plan.fileSizeBytes, totalBytes: plan.storageBytes };
@@ -119,7 +144,8 @@ export async function createPlatform(cfg: PlatformConfig) {
     alwaysAllow: [...(cfg.dashboardOrigins ?? []), ...(cfg.dashboardHost ? [`https://${cfg.dashboardHost}`] : [])],
   });
   const api: FastifyInstance = buildApi(control, cfg.bootstrapToken, {
-    admin, usage, backups, pitr, mover, coordinator, limits, functions, ai, pipelines, extensions, auth, vault, mailer,
+    admin, usage, backups, pitr, mover, coordinator, limits, functions,
+    storageMigrate: cfg.s3 ? () => migrateStorage(control, new DiskStore(cfg.storageDir), blobs, (r, i) => storage.key(r, i)) : undefined, ai, pipelines, extensions, auth, vault, mailer,
     dashboardUrl: cfg.dashboardUrl ?? (cfg.dashboardHost ? `https://${cfg.dashboardHost}` : cfg.dashboardOrigins?.[0]),
     gateway: { domain: cfg.gatewayDomain, scheme: cfg.publicScheme, port: cfg.publicPort },
     dashboardDir: cfg.dashboardDir ?? defaultDashboardDir, dashboardHost: cfg.dashboardHost,

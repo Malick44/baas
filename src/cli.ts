@@ -28,6 +28,7 @@ const USAGE = `baas <command>
   functions list | deploy <name> <file> [--no-verify-jwt] | delete <name> | logs <name>
   backups list | create [--note <text>] | restore <id>
   admin clusters list | add <id> --url <postgres-admin-url> [--name <n>] [--max-projects <n>] | update <id> [--drain|--activate] [--max-projects <n>|--unlimited] [--url <u>] | remove <id>
+  admin storage migrate                   copy files from the old storage directory into the S3 bucket (safe to repeat)
   admin nodes                             the running baas nodes and which one leads
   admin move <ref> <cluster>              copy a project to another Postgres cluster (operator secret: BAAS_BOOTSTRAP_TOKEN)
   pitr status | base-backup | restore --to <time> [--yes]   restore the database to any moment (owner role; needs WAL archiving on the server)
@@ -314,6 +315,9 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
             await operatorApi("DELETE", `/v1/admin/clusters/${id}`);
             io.out(`Removed cluster ${id}.`);
           } else throw new CliError("usage: baas admin clusters list | add <id> --url <url> | update <id> … | remove <id>");
+        } else if (sub === "storage" && rest[0] === "migrate") {
+          const r = await operatorApi("POST", "/v1/admin/storage/migrate", {});
+          io.out(`Checked ${r.objects} object(s) in ${r.projects} project(s): copied ${r.copied}, already there ${r.alreadyThere}, missing at the source ${r.missingAtSource}, failed ${r.failed}.`);
         } else if (sub === "nodes") {
           const rows = await operatorApi("GET", "/v1/admin/nodes");
           io.out(table([["NODE", "HOST", "ROLE", "SINCE"], ...rows.map((n: any) => [String(n.id).slice(0, 8), n.host, n.leader ? "leader" : "follower", String(n.started_at)])]));

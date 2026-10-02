@@ -8,6 +8,7 @@ import type { PitrService } from "./pitr.js";
 import type { ClusterMover } from "./clusters.js";
 import type { Coordinator } from "./coordinator.js";
 import type { Limits } from "./limits.js";
+import type { MigrationReport } from "./storage-migrate.js";
 import { ControlPlane, HttpError, type Principal, type ProjectRow, type Role } from "./control.js";
 import type { AuthService } from "./authsvc.js";
 import type { ExtensionService } from "./extensions.js";
@@ -29,6 +30,8 @@ export type ApiOps = {
   pitr?: PitrService;
   mover?: ClusterMover;
   coordinator?: Coordinator;
+  /** Copy files from the old storage directory into the S3 bucket (only when S3 is the backend). */
+  storageMigrate?: () => Promise<MigrationReport>;
   /** Failed-attempt counters shared by every node. */
   limits?: Limits;
   functions?: FunctionService;
@@ -105,6 +108,16 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     const owner = b.owner_email !== undefined ? await members.bootstrapOwner(org.id, b.owner_email, b.owner_password, b.owner_name) : undefined;
     return reply.code(201).send({ organization: org, owner_token: ownerToken, ...(owner ? { owner } : {}) });
   });
+
+  if (ops.storageMigrate) {
+    const migrate = ops.storageMigrate;
+    app.post("/v1/admin/storage/migrate", async (req) => {
+      operator(req);
+      const r = await migrate();
+      await control.audit("operator", null, "storage.migrate", null, r);
+      return r;
+    });
+  }
 
   // ---- nodes (operator only) ----
 
