@@ -39,6 +39,11 @@ const isIssuer = (s: string) => {
   try { const u = new URL(s); return (u.protocol === "https:" || u.protocol === "http:") && !u.username && !u.password && !u.search && !u.hash; } catch { return false; }
 };
 
+/** Browsers send an exact origin: scheme and host (and port), nothing else. Plain http is only for localhost. */
+const isOrigin = (s: string) => {
+  try { const u = new URL(s); return u.origin === s && (u.protocol === "https:" || (u.protocol === "http:" && (u.hostname === "localhost" || u.hostname.endsWith(".localhost")))); } catch { return false; }
+};
+
 const SETTINGS_KEYS = {
   email_confirm: (v: unknown) => typeof v === "boolean",
   mailer_from_name: (v: unknown) => typeof v === "string" && v.length <= 60 && !/[\r\n<>"]/.test(v),
@@ -54,6 +59,12 @@ const SETTINGS_KEYS = {
       (f === "enabled" && typeof t === "boolean") || (f === "label" && typeof t === "string" && t.length <= 60 && !/[\r\n<>]/.test(t)) ||
       (f === "issuer" && typeof t === "string" && t.length <= 300 && isIssuer(t)) || (f === "client_id" && typeof t === "string" && t.length <= 300) ||
       (f === "secret" && typeof t === "string" && t.length <= 2000) || (f === "scopes" && typeof t === "string" && t.length <= 300 && /^[\x21\x23-\x5b\x5d-\x7e]+( [\x21\x23-\x5b\x5d-\x7e]+)*$/.test(t) && t.split(" ").includes("openid")))))),
+  webauthn: (v: unknown) =>
+    isObj(v) && Object.entries(v).every(([f, t]) =>
+      (f === "rp_id" && typeof t === "string" && /^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$/.test(t) && !/^\d+(\.\d+){3}$/.test(t)) ||
+      (f === "rp_name" && typeof t === "string" && t.length >= 1 && t.length <= 60 && !/[\r\n<>]/.test(t)) ||
+      (f === "require_user_verification" && typeof t === "boolean") ||
+      (f === "origins" && Array.isArray(t) && t.length <= 20 && t.every((o) => typeof o === "string" && isOrigin(o)))),
   sms_template: (v: unknown) => typeof v === "string" && v.length <= 160 && v.includes("{{ .Token }}") && !/[\r\n]/.test(v),
   site_url: (v: unknown) => typeof v === "string" && /^https?:\/\//.test(v),
   redirect_urls: (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string"),

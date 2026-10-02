@@ -7,6 +7,8 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
+import { readFileSync } from "node:fs";
+import ts from "typescript";
 import { Agent, fetch as ufetch } from "undici";
 import { text, use } from "../src/ai-testkit.js";
 import type { LlmClient, LlmRequest, LlmResponse } from "../src/ai/llm.js";
@@ -1230,6 +1232,20 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     assert.equal((await preflight("https://only-this.example.com")).headers.get("access-control-allow-origin"), "https://only-this.example.com");
     assert.equal((await preflight("https://elsewhere.example.com")).headers.get("access-control-allow-origin"), null);
     assert.equal((await preflight(`http://127.0.0.1:${apiPort}`)).headers.get("access-control-allow-origin"), `http://127.0.0.1:${apiPort}`, "the dashboard's own origin is always allowed");
+
+    // Passkeys: which site they belong to.
+    await page.fill("#auth-rp-id", "app.example.com");
+    await page.fill("#auth-rp-origins", "https://app.example.com/login");
+    await page.click("#save-urls");
+    await toast("invalid value for webauthn");
+    await page.fill("#auth-rp-origins", "https://app.example.com\nhttps://m.app.example.com");
+    await page.check("#auth-rp-uv");
+    await Promise.all([page.waitForResponse((r) => /\/settings$/.test(r.url()) && r.request().method() === "PATCH" && r.status() === 200), page.click("#save-urls")]);
+    assert.deepEqual((await t.api("GET", `/v1/projects/${ref}/settings`, { token: owner })).json.webauthn, { rp_id: "app.example.com", origins: ["https://app.example.com", "https://m.app.example.com"], require_user_verification: true });
+    await page.fill("#auth-rp-id", "");
+    await page.fill("#auth-rp-origins", "");
+    await page.uncheck("#auth-rp-uv");
+    await Promise.all([page.waitForResponse((r) => /\/settings$/.test(r.url()) && r.request().method() === "PATCH" && r.status() === 200), page.click("#save-urls")]);
     await tab("auth", "users");
     await page.waitForSelector("#users");
     await tab("auth", "urls");
@@ -1730,6 +1746,55 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
       if (tabName === "overview") await p.screenshot({ path: join(SHOTS, "16-mobile-overview.png"), fullPage: true });
     }
     await m.close();
+  });
+
+  step("registers and uses a passkey in a real browser with a virtual authenticator", async () => {
+    // The page is a stub served on http://localhost:<port>, so its origin matches the relying party id "localhost".
+    // (A real server, not request interception: intercepted pages stall their own cross-origin requests.)
+    const sdk = ts.transpileModule(readFileSync(join(import.meta.dirname, "..", "src", "client.ts"), "utf8"), { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
+    const stub = http.createServer((req, res) => {
+      if (req.url === "/client.js") { res.setHeader("content-type", "text/javascript"); return res.end(sdk); }
+      res.setHeader("content-type", "text/html");
+      res.end("<!doctype html><title>passkeys</title><p>stub</p>");
+    });
+    const stubPort = await freePort();
+    await new Promise<void>((r) => stub.listen(stubPort, "127.0.0.1", r));
+    const origin = `http://localhost:${stubPort}`;
+    const patch = await t.api("PATCH", `/v1/projects/${ref}/settings`, { token: owner, body: { webauthn: { rp_id: "localhost", origins: [origin] }, cors_origins: [origin] } });
+    assert.equal(patch.status, 200, patch.text);
+    t.platform.dir.forget(ref);
+    const pk = await ctx.newPage();
+    const issues: string[] = [];
+    pk.on("pageerror", (e) => issues.push(e.message));
+    pk.on("console", (m) => { if (m.type() === "error" && !/status of 4\d\d/.test(m.text())) issues.push(m.text()); });
+    await pk.addInitScript("window.__name = (f) => f"); // the test runner's compiler wraps named functions with this helper
+    await pk.goto(`${origin}/`);
+    const cdp = await ctx.newCDPSession(pk);
+    await cdp.send("WebAuthn.enable");
+    const { authenticatorId } = await cdp.send("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
+    const out = await pk.evaluate(async ({ url, anon }) => {
+      const { createClient } = await import("/client.js");
+      const c = createClient(url, anon, {});
+      const level = async () => (await c.auth.mfa.getAuthenticatorAssuranceLevel()).data?.currentLevel;
+      const signUp = await c.auth.signUp({ email: "browser-pk@example.com", password: "password-123" });
+      const reg = await c.auth.mfa.webauthn.register({ friendlyName: "virtual key" });
+      const afterRegister = await level();
+      const factor = (await c.auth.getUser()).data?.user.factors?.[0];
+      await c.auth.signOut();
+      await c.auth.signInWithPassword({ email: "browser-pk@example.com", password: "password-123" });
+      const beforeUse = await level();
+      const used = await c.auth.mfa.webauthn.authenticate({ factorId: factor.id });
+      const usedAgain = await c.auth.mfa.webauthn.authenticate({ factorId: factor.id });
+      return { signUp: signUp.error?.message ?? null, reg: reg.error?.message ?? null, afterRegister, factor: { type: factor.factor_type, status: factor.status, name: factor.friendly_name }, beforeUse, used: used.error?.message ?? null, usedAgain: usedAgain.error?.message ?? null, after: await level() };
+    }, { url: `http://${ref}.localhost:${gwPort}`, anon: (await t.api("GET", `/v1/projects/${ref}/api-keys`, { token: owner })).json.anon });
+    assert.deepEqual(out, { signUp: null, reg: null, afterRegister: "aal2", factor: { type: "webauthn", status: "verified", name: "virtual key" }, beforeUse: "aal1", used: null, usedAgain: null, after: "aal2" });
+    const creds = await cdp.send("WebAuthn.getCredentials", { authenticatorId });
+    assert.equal(creds.credentials.length, 1);
+    assert.ok(creds.credentials[0]!.signCount >= 2, "the authenticator's counter advanced, and the server accepted each step");
+    await cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId });
+    assert.deepEqual(issues, []);
+    await pk.close();
+    stub.close();
   });
 
   step("deletes the project after typed confirmation and returns to the list", async () => {

@@ -8,6 +8,7 @@ import { matchStep, newSecret, otpauthUri, stepAt } from "./totp.js";
 import { isProvider, PROVIDERS, type OAuthProvider, type Profile } from "./oauth.js";
 import { guardedJson, OidcClient, OidcError, profileFromClaims } from "./oidc.js";
 import { NoSms, type SmsSender } from "./sms.js";
+import { ALGS, newChallenge, verifyAssertion, verifyRegistration, WebAuthnError } from "./webauthn.js";
 import type { PoolManager } from "./pools.js";
 import { AUTH_EXTRAS_SQL, urlFor } from "./provision.js";
 import type { Vault } from "./vault.js";
@@ -341,28 +342,32 @@ export class AuthService {
   async mfaEnroll(ref: string, project: Resolved, claims: Record<string, unknown>, body: Record<string, unknown>) {
     const u = await this.sessionUser(ref, claims);
     await this.ensure(ref, project);
-    if (body.factor_type !== undefined && body.factor_type !== "totp") throw new AuthError(422, "validation_failed", "factor_type must be totp");
+    const factorType = body.factor_type === undefined ? "totp" : body.factor_type;
+    if (factorType !== "totp" && factorType !== "webauthn") throw new AuthError(422, "validation_failed", "factor_type must be totp or webauthn");
     const name = body.friendly_name === undefined || body.friendly_name === null ? null : body.friendly_name;
     if (name !== null && (typeof name !== "string" || !name.trim() || name.length > 60)) throw new AuthError(422, "validation_failed", "friendly_name must be 1-60 characters");
     const issuer = typeof body.issuer === "string" && body.issuer.trim() && body.issuer.length <= 60 ? body.issuer.trim() : typeof project.settings.mailer_from_name === "string" && project.settings.mailer_from_name ? project.settings.mailer_from_name : "baas";
     await this.requireAal2IfEnrolled(ref, u.id, claims);
     const id = randomUUID();
+    if (factorType === "webauthn") this.webauthnRp(project); // say so now, not halfway through the browser prompt
     const secret = newSecret();
-    if (!this.opts.vault) throw new AuthError(501, "not_implemented", "Multi-factor authentication needs the platform key store");
+    if (factorType === "totp" && !this.opts.vault) throw new AuthError(501, "not_implemented", "Multi-factor authentication needs the platform key store");
     await this.db(ref, async (c) => {
       await c.query(`DELETE FROM auth.mfa_factors WHERE user_id = $1 AND status = 'unverified' AND created_at < now() - interval '1 hour'`, [u.id]);
       const count = Number((await c.query(`SELECT count(*)::int AS n FROM auth.mfa_factors WHERE user_id = $1`, [u.id])).rows[0].n);
       if (count >= 10) throw new AuthError(422, "too_many_factors", "A user can have at most 10 factors");
       if (name && (await c.query(`SELECT 1 FROM auth.mfa_factors WHERE user_id = $1 AND friendly_name = $2`, [u.id, name.trim()])).rowCount)
         throw new AuthError(422, "mfa_factor_name_conflict", `A factor named "${name.trim()}" already exists`);
-      await c.query(`INSERT INTO auth.mfa_factors (id, user_id, factor_type, friendly_name, secret_enc) VALUES ($1, $2, 'totp', $3, $4)`, [id, u.id, name?.trim() ?? null, this.opts.vault!.seal(secret, `${ref}:mfa:${id}`)]);
+      await c.query(`INSERT INTO auth.mfa_factors (id, user_id, factor_type, friendly_name, secret_enc) VALUES ($1, $2, $3, $4, $5)`,
+        [id, u.id, factorType, name?.trim() ?? null, factorType === "totp" ? this.opts.vault!.seal(secret, `${ref}:mfa:${id}`) : null]);
     });
+    if (factorType === "webauthn") return { id, type: "webauthn", friendly_name: name?.trim() ?? null };
     return { id, type: "totp", friendly_name: name?.trim() ?? null, totp: { secret, uri: otpauthUri(secret, u.email ?? u.id, issuer) } };
   }
 
   private async ownFactor(ref: string, userId: string, factorId: string) {
     if (!/^[0-9a-f-]{36}$/.test(factorId)) throw new AuthError(404, "mfa_factor_not_found", "Factor not found");
-    const f = await this.db(ref, async (c) => (await c.query<{ id: string; status: string; secret_enc: string; last_used_step: string }>(`SELECT id, status, secret_enc, last_used_step FROM auth.mfa_factors WHERE id = $1 AND user_id = $2`, [factorId, userId])).rows[0]);
+    const f = await this.db(ref, async (c) => (await c.query<{ id: string; status: string; factor_type: "totp" | "webauthn"; secret_enc: string; last_used_step: string }>(`SELECT id, status, factor_type, secret_enc, last_used_step FROM auth.mfa_factors WHERE id = $1 AND user_id = $2`, [factorId, userId])).rows[0]);
     if (!f) throw new AuthError(404, "mfa_factor_not_found", "Factor not found");
     return f;
   }
@@ -371,7 +376,8 @@ export class AuthService {
   async mfaChallenge(ref: string, project: Resolved, claims: Record<string, unknown>, factorId: string) {
     const u = await this.sessionUser(ref, claims);
     await this.ensure(ref, project);
-    await this.ownFactor(ref, u.id, factorId);
+    const factor = await this.ownFactor(ref, u.id, factorId);
+    if (factor.factor_type === "webauthn") return this.webauthnChallenge(ref, project, u, factor);
     return this.db(ref, async (c) => {
       const r = (await c.query<{ id: string; created_at: Date }>(`INSERT INTO auth.mfa_challenges (factor_id) VALUES ($1) RETURNING id, created_at`, [factorId])).rows[0]!;
       await c.query(`DELETE FROM auth.mfa_challenges WHERE factor_id = $1 AND created_at < now() - interval '1 day'`, [factorId]);
@@ -386,8 +392,9 @@ export class AuthService {
     const key = `mfa:${ref}:${factorId}`;
     this.attempts.check(key);
     const bad = () => new AuthError(400, "mfa_verification_failed", "The code is wrong, or the challenge expired");
-    if (typeof body.challenge_id !== "string" || !/^[0-9a-f-]{36}$/.test(body.challenge_id) || typeof body.code !== "string") throw bad();
+    if (typeof body.challenge_id !== "string" || !/^[0-9a-f-]{36}$/.test(body.challenge_id) || (typeof body.code !== "string" && body.webauthn === undefined)) throw bad();
     const f = await this.ownFactor(ref, u.id, factorId);
+    if (f.factor_type === "webauthn") return this.webauthnVerify(ref, project, claims, u, f, body, key);
     if (!this.opts.vault) throw new AuthError(501, "not_implemented", "Multi-factor authentication needs the platform key store");
     const secret = this.opts.vault.open(f.secret_enc, `${ref}:mfa:${factorId}`);
     const ok = await this.db(ref, async (c) => {
@@ -403,6 +410,102 @@ export class AuthService {
     // A wrong answer still spends the challenge (it commits above), so every guess needs a fresh challenge and the attempt limit below applies per factor.
     if (!ok) { this.attempts.fail(key); throw bad(); }
     this.attempts.clear(key);
+    const sessionId = typeof claims.session_id === "string" && /^[0-9a-f-]{36}$/.test(claims.session_id) ? claims.session_id : randomUUID();
+    await this.db(ref, (c) => c.query(`UPDATE auth.refresh_tokens SET revoked = true WHERE session_id = $1`, [sessionId]));
+    return this.session(ref, project, u, sessionId, "aal2");
+  }
+
+
+  // ---- passkeys and security keys (WebAuthn) as a second factor ----
+
+  /** Which site the browser should bind a passkey to. It comes from the project's site URL unless settings say otherwise. */
+  private webauthnRp(project: Resolved) {
+    const w = (project.settings.webauthn ?? {}) as { rp_id?: string; rp_name?: string; origins?: string[]; require_user_verification?: boolean };
+    let site: URL | null = null;
+    try { site = new URL(String(project.settings.site_url)); } catch { /* none */ }
+    const id = w.rp_id ?? site?.hostname;
+    const origins = w.origins ?? (site ? [site.origin] : []);
+    if (!id || !origins.length)
+      throw new AuthError(422, "webauthn_not_configured", "Passkeys need a site URL (or the webauthn setting with an id and origins), so the browser knows which site they belong to");
+    for (const o of origins) {
+      const host = new URL(o).hostname;
+      if (host !== id && !host.endsWith(`.${id}`)) throw new AuthError(422, "webauthn_misconfigured", `The origin ${o} is not on the relying party id ${id}, so browsers would refuse it`);
+    }
+    const name = w.rp_name ?? (typeof project.settings.mailer_from_name === "string" && project.settings.mailer_from_name ? project.settings.mailer_from_name : id);
+    return { id, name, origins, uv: w.require_user_verification === true };
+  }
+
+  private async webauthnChallenge(ref: string, project: Resolved, u: UserRow, f: { id: string; status: string }) {
+    const rp = this.webauthnRp(project);
+    const challenge = newChallenge();
+    const row = await this.db(ref, async (c) => {
+      const r = (await c.query<{ id: string; created_at: Date }>(`INSERT INTO auth.mfa_challenges (factor_id, webauthn_challenge) VALUES ($1, $2) RETURNING id, created_at`, [f.id, challenge])).rows[0]!;
+      await c.query(`DELETE FROM auth.mfa_challenges WHERE factor_id = $1 AND created_at < now() - interval '1 day'`, [f.id]);
+      return r;
+    });
+    const expires_at = Math.floor(row.created_at.getTime() / 1000) + 300;
+    const uv = rp.uv ? "required" : "preferred";
+    if (f.status !== "verified") {
+      // Registering: exclude passkeys this person already has, so one device is not added twice.
+      const have = await this.db(ref, async (c) => (await c.query<{ credential_id: string }>(
+        `SELECT w.credential_id FROM auth.webauthn_credentials w JOIN auth.mfa_factors m ON m.id = w.factor_id WHERE m.user_id = $1`, [u.id])).rows);
+      return { id: row.id, type: "webauthn", expires_at, webauthn: { type: "create", credential_options: { publicKey: {
+        rp: { id: rp.id, name: rp.name },
+        user: { id: Buffer.from(u.id.replace(/-/g, ""), "hex").toString("base64url"), name: u.email ?? u.phone ?? u.id, displayName: u.email ?? u.phone ?? u.id },
+        challenge, pubKeyCredParams: ALGS.map((alg) => ({ type: "public-key", alg })), timeout: 300_000, attestation: "none",
+        authenticatorSelection: { residentKey: "preferred", userVerification: uv },
+        excludeCredentials: have.map((h) => ({ type: "public-key", id: h.credential_id })),
+      } } } };
+    }
+    const cred = await this.db(ref, async (c) => (await c.query<{ credential_id: string }>(`SELECT credential_id FROM auth.webauthn_credentials WHERE factor_id = $1`, [f.id])).rows[0]);
+    return { id: row.id, type: "webauthn", expires_at, webauthn: { type: "request", credential_options: { publicKey: {
+      challenge, rpId: rp.id, timeout: 300_000, userVerification: uv,
+      allowCredentials: cred ? [{ type: "public-key", id: cred.credential_id }] : [],
+    } } } };
+  }
+
+  private async webauthnVerify(ref: string, project: Resolved, claims: Record<string, unknown>, u: UserRow, f: { id: string; status: string }, body: Record<string, unknown>, limiterKey: string) {
+    const bad = (why?: string) => new AuthError(400, "mfa_verification_failed", why ? `The passkey was not accepted: ${why}` : "The passkey was not accepted, or the challenge expired");
+    const w = body.webauthn as { type?: unknown; credential_response?: { id?: unknown; response?: Record<string, unknown> } } | undefined;
+    const resp = w?.credential_response?.response;
+    const b64 = (v: unknown) => (typeof v === "string" && /^[\w-]{1,20000}$/.test(v) ? Buffer.from(v, "base64url") : null);
+    const wantType = f.status === "verified" ? "request" : "create";
+    if (!w || w.type !== wantType || !resp) throw bad();
+    const clientDataJSON = b64(resp.clientDataJSON);
+    if (!clientDataJSON) throw bad();
+    const rp = this.webauthnRp(project);
+    // Take the challenge first, so a wrong answer spends it: every guess needs a fresh challenge, and the limiter below counts them.
+    const ch = await this.db(ref, async (c) => (await c.query<{ webauthn_challenge: string }>(
+      `UPDATE auth.mfa_challenges SET verified_at = now() WHERE id = $1 AND factor_id = $2 AND verified_at IS NULL AND created_at > now() - interval '5 minutes' RETURNING webauthn_challenge`,
+      [body.challenge_id, f.id])).rows[0]);
+    if (!ch?.webauthn_challenge) { this.attempts.fail(limiterKey); throw bad(); }
+    const expect = { challenge: ch.webauthn_challenge, rpId: rp.id, origins: rp.origins, requireUserVerification: rp.uv };
+    try {
+      if (wantType === "create") {
+        const attestationObject = b64(resp.attestationObject);
+        if (!attestationObject) throw new WebAuthnError("the attestation is missing");
+        const reg = verifyRegistration({ attestationObject, clientDataJSON }, expect);
+        await this.db(ref, async (c) => {
+          await c.query(`INSERT INTO auth.webauthn_credentials (factor_id, credential_id, public_key, sign_count, aaguid) VALUES ($1, $2, $3, $4, $5)`, [f.id, reg.credentialId, reg.publicKey, reg.signCount, reg.aaguid]);
+          await c.query(`UPDATE auth.mfa_factors SET status = 'verified', updated_at = now() WHERE id = $1`, [f.id]);
+        }).catch((e) => { if ((e as { code?: string }).code === "23505") throw new WebAuthnError("this passkey is already registered"); throw e; });
+      } else {
+        const authenticatorData = b64(resp.authenticatorData), signature = b64(resp.signature);
+        if (!authenticatorData || !signature) throw new WebAuthnError("the assertion is incomplete");
+        const cred = await this.db(ref, async (c) => (await c.query<{ credential_id: string; public_key: string; sign_count: string }>(`SELECT credential_id, public_key, sign_count FROM auth.webauthn_credentials WHERE factor_id = $1`, [f.id])).rows[0]);
+        if (!cred) throw new WebAuthnError("no passkey is registered for this factor");
+        const given = w.credential_response?.id;
+        if (typeof given !== "string" || given !== cred.credential_id) throw new WebAuthnError("this is not the passkey for this factor");
+        const count = verifyAssertion({ authenticatorData, clientDataJSON, signature }, expect, { publicKey: cred.public_key, signCount: Number(cred.sign_count) });
+        // Only one of two racing answers can move the counter forward.
+        const moved = await this.db(ref, (c) => c.query(`UPDATE auth.webauthn_credentials SET sign_count = $2 WHERE factor_id = $1 AND sign_count = $3`, [f.id, count, cred.sign_count]));
+        if (!moved.rowCount) throw new WebAuthnError("this response was already used");
+      }
+    } catch (e) {
+      if (e instanceof WebAuthnError) { this.attempts.fail(limiterKey); throw bad(e.message); }
+      throw e;
+    }
+    this.attempts.clear(limiterKey);
     const sessionId = typeof claims.session_id === "string" && /^[0-9a-f-]{36}$/.test(claims.session_id) ? claims.session_id : randomUUID();
     await this.db(ref, (c) => c.query(`UPDATE auth.refresh_tokens SET revoked = true WHERE session_id = $1`, [sessionId]));
     return this.session(ref, project, u, sessionId, "aal2");

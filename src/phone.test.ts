@@ -183,4 +183,18 @@ describe("phone sign-in", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
     await assert.rejects(new TwilioSms({ accountSid: sid, authToken: "tok", from: "+1", fetch: fake }).send({ to: "+1", body: "x" }), /Twilio answered 400: The 'To' number is not valid/);
     assert.throws(() => new TwilioSms({ accountSid: "nope", authToken: "t", from: "+1" }), /ACCOUNT_SID/);
   });
+
+  it("upgrades projects that predate phone sign-in", async () => {
+    const o = await t.project(owner, "legacy-phone");
+    const c = new (await import("pg")).default.Client({ connectionString: o.dbUrl });
+    await c.connect();
+    await c.query("DROP TABLE auth.phone_codes; DROP INDEX auth.users_phone_key; ALTER TABLE auth.users DROP COLUMN phone, DROP COLUMN phone_confirmed_at");
+    await c.end();
+    const g = (m: string, u: string, body?: unknown) => t.gw(o.ref, m, u, { key: o.anon, body });
+    await wait();
+    assert.equal((await g("POST", "/auth/v1/otp", { phone: "+14155550120" })).status, 200);
+    const v = await g("POST", "/auth/v1/verify", { phone: "+14155550120", token: codeTo("+14155550120"), type: "sms" });
+    assert.equal(v.status, 200, v.text);
+    assert.equal(v.json.user.phone, "+14155550120");
+  });
 });

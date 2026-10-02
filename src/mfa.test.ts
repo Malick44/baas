@@ -189,7 +189,7 @@ describe("multi-factor authentication", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     const old = await t.project(owner, "legacy-mfa");
     const c = new pg.Client({ connectionString: old.dbUrl });
     await c.connect();
-    await c.query("DROP TABLE auth.mfa_challenges, auth.mfa_factors");
+    await c.query("DROP TABLE auth.webauthn_credentials, auth.mfa_challenges, auth.mfa_factors");
     await c.query("ALTER TABLE auth.refresh_tokens DROP COLUMN aal");
     await c.end();
     const g = (m: string, url: string, o: { key?: string; body?: unknown } = {}) => t.gw(old.ref, m, url, { key: o.key ?? old.anon, body: o.body });

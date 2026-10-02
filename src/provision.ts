@@ -63,8 +63,20 @@ CREATE TABLE IF NOT EXISTS auth.mfa_challenges (
   created_at timestamptz NOT NULL DEFAULT now(),
   verified_at timestamptz
 );
+ALTER TABLE auth.mfa_factors DROP CONSTRAINT IF EXISTS mfa_factors_factor_type_check;
+ALTER TABLE auth.mfa_factors ADD CONSTRAINT mfa_factors_factor_type_check CHECK (factor_type IN ('totp', 'webauthn'));
+ALTER TABLE auth.mfa_factors ALTER COLUMN secret_enc DROP NOT NULL;
+ALTER TABLE auth.mfa_challenges ADD COLUMN IF NOT EXISTS webauthn_challenge text;
+CREATE TABLE IF NOT EXISTS auth.webauthn_credentials (
+  factor_id uuid PRIMARY KEY REFERENCES auth.mfa_factors ON DELETE CASCADE,
+  credential_id text NOT NULL UNIQUE,
+  public_key text NOT NULL,
+  sign_count bigint NOT NULL DEFAULT 0,
+  aaguid text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 ALTER TABLE auth.refresh_tokens ADD COLUMN IF NOT EXISTS aal text NOT NULL DEFAULT 'aal1';
-GRANT ALL ON auth.one_time_tokens, auth.identities, auth.mfa_factors, auth.mfa_challenges, auth.phone_codes TO service_role;
+GRANT ALL ON auth.one_time_tokens, auth.identities, auth.mfa_factors, auth.mfa_challenges, auth.phone_codes, auth.webauthn_credentials TO service_role;
 `;
 
 export const PROJECT_SCHEMA_SQL = `

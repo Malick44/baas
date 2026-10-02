@@ -11,7 +11,14 @@ export type Session = { access_token: string; refresh_token: string; expires_at:
 export type User = { id: string; email: string | null; app_metadata: Record<string, unknown>; user_metadata: Record<string, unknown>; [k: string]: unknown };
 
 type KV = { getItem(k: string): string | null; setItem(k: string, v: string): void; removeItem(k: string): void };
+/** The part of navigator.credentials the passkey helpers use. Pass your own in tests or non-browser runtimes. */
+export type CredentialsApi = { create(o: unknown): Promise<unknown>; get(o: unknown): Promise<unknown> };
+const toB64u = (b: ArrayBuffer | Uint8Array) => { let s = ""; for (const x of new Uint8Array(b instanceof ArrayBuffer ? b : b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength))) s += String.fromCharCode(x); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
+const fromB64u = (s: string) => { const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/")); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u.buffer; };
+
 export type ClientOptions = {
+  /** Where passkey prompts come from. Defaults to navigator.credentials. */
+  credentials?: CredentialsApi;
   fetch?: typeof fetch;
   WebSocket?: new (url: string) => WebSocket;
   /** Where to keep the session; defaults to memory. Pass localStorage in a browser. */
@@ -83,6 +90,14 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
     const res = await doFetch(`${base}/auth/v1${path}`, { ...init, headers: { apikey: key, "content-type": "application/json", ...(init.headers as object) } });
     return { res, body: await parse(res) };
   };
+
+  async function verifyPasskey(factorId: string, challengeId: string, type: "create" | "request", credential_response: unknown): Promise<Result<Session>> {
+    if (!session) return { data: null, error: { message: "Auth session missing" }, status: 401 };
+    const { res, body } = await authCall(`/factors/${encodeURIComponent(factorId)}/verify`, { method: "POST", body: JSON.stringify({ challenge_id: challengeId, webauthn: { type, credential_response } }), headers: { authorization: `Bearer ${await token()}` } });
+    if (!res.ok) return { data: null, error: err(res.status, body, "the passkey was not accepted"), status: res.status };
+    setSession(body as Session, "SIGNED_IN");
+    return { data: body as Session, error: null, status: res.status };
+  }
 
   const auth = {
     /** Resolves with a session, or with just the user when the project wants the email address confirmed first. */
@@ -183,12 +198,12 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
     },
     /** Authenticator-app sign-in. A password gives an aal1 session; answering a challenge upgrades it to aal2, which policies can require. */
     mfa: {
-      async enroll(c: { factorType?: "totp"; friendlyName?: string; issuer?: string } = {}): Promise<Result<{ id: string; type: "totp"; friendly_name: string | null; totp: { secret: string; uri: string } }>> {
+      async enroll(c: { factorType?: "totp" | "webauthn"; friendlyName?: string; issuer?: string } = {}): Promise<Result<{ id: string; type: "totp" | "webauthn"; friendly_name: string | null; totp: { secret: string; uri: string } }>> {
         if (!session) return { data: null, error: { message: "Auth session missing" }, status: 401 };
         const { res, body } = await authCall("/factors", { method: "POST", body: JSON.stringify({ factor_type: c.factorType ?? "totp", friendly_name: c.friendlyName, issuer: c.issuer }), headers: { authorization: `Bearer ${await token()}` } });
         return res.ok ? { data: body, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not enrol"), status: res.status };
       },
-      async challenge(c: { factorId: string }): Promise<Result<{ id: string; expires_at: number }>> {
+      async challenge(c: { factorId: string }): Promise<Result<{ id: string; expires_at: number; webauthn?: { type: "create" | "request"; credential_options: { publicKey: Record<string, any> } } }>> {
         if (!session) return { data: null, error: { message: "Auth session missing" }, status: 401 };
         const { res, body } = await authCall(`/factors/${encodeURIComponent(c.factorId)}/challenge`, { method: "POST", headers: { authorization: `Bearer ${await token()}` } });
         return res.ok ? { data: body, error: null, status: res.status } : { data: null, error: err(res.status, body, "could not create a challenge"), status: res.status };
@@ -205,6 +220,42 @@ export function createClient(url: string, key: string, opts: ClientOptions = {})
         const ch = await auth.mfa.challenge({ factorId: c.factorId });
         if (ch.error) return { data: null, error: ch.error, status: ch.status };
         return auth.mfa.verify({ factorId: c.factorId, challengeId: ch.data!.id, code: c.code });
+      },
+      /** Passkeys and security keys as a second factor. Needs a browser (or pass `credentials` to createClient). */
+      webauthn: {
+        /** Add a passkey: enrol, ask the browser to make one, and check it. Resolves with the session upgraded to aal2. */
+        async register(c: { friendlyName: string }): Promise<Result<Session>> {
+          const creds = opts.credentials ?? (globalThis as { navigator?: { credentials?: CredentialsApi } }).navigator?.credentials;
+          if (!creds) return { data: null, error: { message: "This environment cannot make passkeys" }, status: 400 };
+          const e = await auth.mfa.enroll({ factorType: "webauthn", friendlyName: c.friendlyName });
+          if (e.error) return { data: null, error: e.error, status: e.status };
+          const ch = await auth.mfa.challenge({ factorId: e.data!.id });
+          if (ch.error) return { data: null, error: ch.error, status: ch.status };
+          const o = ch.data!.webauthn!.credential_options.publicKey;
+          let cred: any;
+          try {
+            cred = await creds.create({ publicKey: { ...o, challenge: fromB64u(o.challenge), user: { ...o.user, id: fromB64u(o.user.id) }, excludeCredentials: (o.excludeCredentials ?? []).map((x: any) => ({ ...x, id: fromB64u(x.id) })) } });
+          } catch (ex) {
+            await auth.mfa.unenroll({ factorId: e.data!.id }).catch(() => {}); // do not leave an unfinished factor behind
+            return { data: null, error: { message: (ex as Error).message || "the passkey was not created" }, status: 400 };
+          }
+          return verifyPasskey(e.data!.id, ch.data!.id, "create", { id: cred.id, rawId: toB64u(cred.rawId), type: cred.type, response: { clientDataJSON: toB64u(cred.response.clientDataJSON), attestationObject: toB64u(cred.response.attestationObject) } });
+        },
+        /** Prove it is you with a passkey you added before. Resolves with the session upgraded to aal2. */
+        async authenticate(c: { factorId: string }): Promise<Result<Session>> {
+          const creds = opts.credentials ?? (globalThis as { navigator?: { credentials?: CredentialsApi } }).navigator?.credentials;
+          if (!creds) return { data: null, error: { message: "This environment cannot use passkeys" }, status: 400 };
+          const ch = await auth.mfa.challenge({ factorId: c.factorId });
+          if (ch.error) return { data: null, error: ch.error, status: ch.status };
+          const o = ch.data!.webauthn!.credential_options.publicKey;
+          let cred: any;
+          try {
+            cred = await creds.get({ publicKey: { ...o, challenge: fromB64u(o.challenge), allowCredentials: (o.allowCredentials ?? []).map((x: any) => ({ ...x, id: fromB64u(x.id) })) } });
+          } catch (ex) {
+            return { data: null, error: { message: (ex as Error).message || "the passkey was not used" }, status: 400 };
+          }
+          return verifyPasskey(c.factorId, ch.data!.id, "request", { id: cred.id, rawId: toB64u(cred.rawId), type: cred.type, response: { clientDataJSON: toB64u(cred.response.clientDataJSON), authenticatorData: toB64u(cred.response.authenticatorData), signature: toB64u(cred.response.signature) } });
+        },
       },
       async unenroll(c: { factorId: string }): Promise<Result<{ id: string }>> {
         if (!session) return { data: null, error: { message: "Auth session missing" }, status: 401 };
