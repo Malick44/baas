@@ -59,4 +59,8 @@ jobs:
             -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2 caddy validate --config /etc/caddy/Caddyfile
           POSTGRES_PASSWORD=x BAAS_MASTER_KEY=x BAAS_BOOTSTRAP_TOKEN=x DOMAIN=example.com DASHBOARD_HOST=baas.example.com ACME_EMAIL=ci@example.com \
             docker compose -f docker-compose.yml -f docker-compose.tls.yml config --quiet
+      - name: The point-in-time recovery overlay is valid
+        run: POSTGRES_PASSWORD=x BAAS_MASTER_KEY=x BAAS_BOOTSTRAP_TOKEN=x docker compose -f docker-compose.yml -f docker-compose.pitr.yml config --quiet
       - run: scripts/smoke.sh
+      - name: Smoke test with WAL archiving, restoring a project to a moment in time
+        run: SMOKE_PITR=1 scripts/smoke.sh

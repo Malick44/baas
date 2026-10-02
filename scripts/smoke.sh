@@ -24,7 +24,12 @@ services:
       - "127.0.0.1:$API_PORT:8080"
       - "127.0.0.1:$GW_PORT:8081"
 YML
-compose() { docker compose --env-file "$ENVF" -f docker-compose.yml -f "$OVERRIDE" "$@"; }
+# SMOKE_PITR=1 also runs the stack with WAL archiving (docker-compose.pitr.yml) and restores to a moment.
+PITR_FILE=()
+EXTRA_FILE=()
+[ -n "${SMOKE_EXTRA_COMPOSE:-}" ] && EXTRA_FILE=(-f "$SMOKE_EXTRA_COMPOSE")   # for environments that need extra build settings (a proxy CA)
+[ "${SMOKE_PITR:-}" = 1 ] && PITR_FILE=(-f docker-compose.pitr.yml)
+compose() { docker compose --env-file "$ENVF" -f docker-compose.yml "${PITR_FILE[@]}" -f "$OVERRIDE" "${EXTRA_FILE[@]}" "$@"; }
 
 cleanup() {
   status=$?
@@ -98,6 +103,24 @@ api -fS -XPOST "http://127.0.0.1:$API_PORT/v1/projects/$REF/backups/$BACKUP_ID/r
 expect "restore removes what came after the backup" 0 "$(sql "select count(*) from public.todos where title = 'written after the backup'" | jq -r '.results[0].rows[0][0]')"
 expect "restore keeps what was in the backup" 1 "$(sql "select count(*) from public.todos where title = 'from the smoke test'" | jq -r '.results[0].rows[0][0]')"
 expect "the project still serves requests after a restore" 200 "$(gw GET /rest/v1/todos -H "apikey: $ANON" -H "authorization: Bearer $USER_TOKEN" -o /dev/null -w '%{http_code}')"
+
+if [ "${SMOKE_PITR:-}" = 1 ]; then
+  step "point-in-time recovery"
+  api -fS -XPATCH "http://127.0.0.1:$API_PORT/v1/projects/$REF" -d '{"plan":"pro"}' >/dev/null
+  expect "WAL archiving is on" true "$(api -fS "http://127.0.0.1:$API_PORT/v1/projects/$REF/pitr" | jq .enabled)"
+  BASE=$(api -fS -XPOST "http://127.0.0.1:$API_PORT/v1/projects/$REF/pitr/base-backup" -d '{}')
+  expect "a base backup completes" complete "$(jq -r .status <<<"$BASE")"
+  sql "create table public.ledger (n int); insert into public.ledger values (1), (2)" >/dev/null
+  sleep 2
+  MOMENT=$(sql "select to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')" | jq -r '.results[0].rows[0][0]')
+  sleep 2
+  sql "insert into public.ledger values (3); drop table public.todos" >/dev/null
+  expect "the later change happened" 3 "$(sql "select count(*) from public.ledger" | jq -r '.results[0].rows[0][0]')"
+  RESTORED=$(api -fS -XPOST "http://127.0.0.1:$API_PORT/v1/projects/$REF/pitr/restore" -d "{\"to\":\"$MOMENT\"}")
+  [ "$(jq -r .safety_backup <<<"$RESTORED")" != null ] || fail "restore answered: $RESTORED"; echo "ok  restore to $MOMENT"
+  expect "rows after the moment are gone" 2 "$(sql "select count(*) from public.ledger" | jq -r '.results[0].rows[0][0]')"
+  expect "the dropped table is back" 1 "$(sql "select count(*) from public.todos where title = 'from the smoke test'" | jq -r '.results[0].rows[0][0]')"
+fi
 
 step "certificate check used by the TLS proxy"
 tls() { curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$API_PORT/v1/tls-check?domain=$1"; }

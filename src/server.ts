@@ -16,6 +16,13 @@ const platform = await createPlatform({
   storageDir: resolve(process.env.BAAS_STORAGE_DIR ?? "./data/storage"),
   backupDir: resolve(process.env.BAAS_BACKUP_DIR ?? "./data/backups"),
   pgBinDir: process.env.BAAS_PG_BIN_DIR,
+  pitr: process.env.BAAS_PITR_ARCHIVE_DIR ? {
+    archiveDir: resolve(process.env.BAAS_PITR_ARCHIVE_DIR),
+    baseDir: resolve(process.env.BAAS_PITR_BASE_DIR ?? "./data/pitr/base"),
+    scratchDir: resolve(process.env.BAAS_PITR_SCRATCH_DIR ?? "./data/pitr/scratch"),
+    retentionDays: process.env.BAAS_PITR_RETENTION_DAYS ? Number(process.env.BAAS_PITR_RETENTION_DAYS) : undefined,
+    baseEveryHours: process.env.BAAS_PITR_BASE_EVERY_HOURS ? Number(process.env.BAAS_PITR_BASE_EVERY_HOURS) : undefined,
+  } : undefined,
   gatewayDomain: process.env.BAAS_GATEWAY_DOMAIN ?? "localhost",
   publicScheme: process.env.BAAS_PUBLIC_SCHEME ?? "http",
   publicPort: process.env.BAAS_PUBLIC_PORT ? Number(process.env.BAAS_PUBLIC_PORT) : gatewayPort,

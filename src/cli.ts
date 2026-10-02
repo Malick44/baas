@@ -27,6 +27,7 @@ const USAGE = `baas <command>
   db status [--dir baas/migrations]
   functions list | deploy <name> <file> [--no-verify-jwt] | delete <name> | logs <name>
   backups list | create [--note <text>] | restore <id>
+  pitr status | base-backup | restore --to <time> [--yes]   restore the database to any moment (owner role; needs WAL archiving on the server)
   pipelines list | show <pipeline>        send row changes to a webhook (admin role); <pipeline> is a name or id
   pipelines create <name> --tables <a,b> --url <url> [--events insert,update,delete] [--no-rows] [--where <table.column:op:value>]...
   pipelines edit <pipeline> [--name <n>] [--tables <a,b>] [--url <url>] [--events <list>] [--rows|--no-rows] [--where …]... | [--no-where]
@@ -54,7 +55,7 @@ function parseArgs(argv: string[]) {
     if (a.startsWith("--")) {
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith("--") && !["no-verify-jwt", "no-rows", "rows", "installed", "available", "no-where", "follow"].includes(key)) {
+      if (next !== undefined && !next.startsWith("--") && !["no-verify-jwt", "no-rows", "rows", "installed", "available", "no-where", "follow", "yes"].includes(key)) {
         if (key === "where") (multi.where ??= []).push(next);
         else flags[key] = next;
         i++;
@@ -265,6 +266,28 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           await api("POST", `/v1/projects/${ref}/backups/${rest[0]}/restore`);
           io.out(`Restored ${ref} from ${rest[0]}.`);
         } else throw new CliError("usage: baas backups list | create [--note <text>] | restore <id>");
+        return 0;
+      }
+      case "pitr": {
+        const ref = await projectRef();
+        if (sub === "status") {
+          const s = await api("GET", `/v1/projects/${ref}/pitr`);
+          if (!s.enabled) io.out(s.configured === false ? "Point-in-time recovery is not set up on this server (BAAS_PITR_ARCHIVE_DIR)." : `Point-in-time recovery is off: the Postgres server is not archiving WAL (archive_mode=${s.archive_mode}).`);
+          else {
+            io.out(s.window ? `You can restore to any moment between ${s.window.earliest} and now (kept ${s.retention_days} days).` : "Archiving is on, but there is no base backup yet: run `baas pitr base-backup`.");
+            if (!s.plan_allows) io.out("This project's plan does not include point-in-time recovery.");
+            if (s.archiver?.failed_count) io.out(`Warning: ${s.archiver.failed_count} WAL archive failure(s), last at ${s.archiver.last_failed_time}.`);
+          }
+        } else if (sub === "base-backup") {
+          const b = await api("POST", `/v1/projects/${ref}/pitr/base-backup`);
+          io.out(`Base backup ${b.id} ${b.status} (${b.size_bytes} bytes).`);
+        } else if (sub === "restore") {
+          const to = typeof flags.to === "string" ? flags.to : "";
+          if (!to || Number.isNaN(Date.parse(to))) throw new CliError("usage: baas pitr restore --to <time, like 2026-10-02T14:30:00Z> [--yes]");
+          if (flags.yes !== true) throw new CliError(`This replaces ${ref}'s database with how it was at ${new Date(to).toISOString()}; everything since is lost (a backup of the current state is saved first). Run again with --yes to do it.`);
+          const r = await api("POST", `/v1/projects/${ref}/pitr/restore`, { to: new Date(to).toISOString() });
+          io.out(`Restored ${ref} to ${r.restored_to}. The previous state is saved as backup ${r.safety_backup}.`);
+        } else throw new CliError("usage: baas pitr status | base-backup | restore --to <time> [--yes]");
         return 0;
       }
       case "pipelines": {

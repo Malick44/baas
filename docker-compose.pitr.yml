@@ -1,0 +1,34 @@
+# Adds point-in-time recovery: Postgres archives its WAL, and baas keeps base backups so a project can be restored to any
+# moment in the last BAAS_PITR_RETENTION_DAYS (default 7).
+#   docker compose -f docker-compose.yml -f docker-compose.pitr.yml up -d
+# Then take the first base backup:  baas pitr base-backup   (or it happens at the next housekeeping run)
+# Costs: disk for the WAL archive (grows with write volume) and for one base backup per day of retention.
+services:
+  walinit:
+    image: postgres:15-bookworm
+    user: root
+    command: sh -c "chown postgres:postgres /wal && chmod 2770 /wal"
+    volumes: [walarchive:/wal]
+  postgres:
+    depends_on:
+      walinit: { condition: service_completed_successfully }
+    # Archived segments are made group-readable so baas (a member of the postgres group) can replay and prune them.
+    command: >
+      postgres -c max_connections=500 -c wal_level=replica -c archive_mode=on
+      -c archive_command='test ! -f /wal/%f && cp %p /wal/%f && chmod 640 /wal/%f'
+      -c max_wal_senders=5 -c hba_file=/etc/baas/pg_hba.conf
+    volumes:
+      - walarchive:/wal
+      - ./deploy/pg_hba_pitr.conf:/etc/baas/pg_hba.conf:ro
+  baas:
+    group_add: ["999"]          # the postgres user's group in the postgres image
+    environment:
+      BAAS_PITR_ARCHIVE_DIR: /wal
+      BAAS_PITR_RETENTION_DAYS: ${BAAS_PITR_RETENTION_DAYS:-7}
+      BAAS_PITR_BASE_EVERY_HOURS: ${BAAS_PITR_BASE_EVERY_HOURS:-24}
+    volumes:
+      - walarchive:/wal
+      - pitr:/data/pitr
+volumes:
+  walarchive:
+  pitr:

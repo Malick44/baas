@@ -12,6 +12,7 @@ import { ExtensionService } from "./extensions.js";
 import { FunctionService } from "./functions.js";
 import { buildGateway } from "./gateway.js";
 import { mailerFrom, type Mailer } from "./mailer.js";
+import { PitrService, type PitrOptions } from "./pitr.js";
 import { smsFrom, type SmsSender, type TwilioConfig } from "./sms.js";
 import { migrate } from "./migrate.js";
 import { PipelineService, type PipelineOptions } from "./pipelines.js";
@@ -31,6 +32,8 @@ export type PlatformConfig = {
   storageDir: string;
   backupDir: string;
   pgBinDir?: string;
+  /** Point-in-time recovery. Set to turn it on; the Postgres server must archive its WAL into `archiveDir`. */
+  pitr?: PitrOptions;
   /** Base domain for project hosts: <ref>.<gatewayDomain>. */
   gatewayDomain: string;
   publicScheme: string;
@@ -98,6 +101,7 @@ export async function createPlatform(cfg: PlatformConfig) {
   });
   const realtime = new RealtimeHub(pm, cfg.pgAdminUrl, { checkMs: cfg.realtimeCheckMs });
   const backups = new BackupService(control, { dir: cfg.backupDir, pgBinDir: cfg.pgBinDir });
+  const pitr = cfg.pitr ? new PitrService(control, backups, { pgBinDir: cfg.pgBinDir, ...cfg.pitr }) : undefined;
   const admin = new ProjectAdmin(pm);
   const pipelines = new PipelineService(pool, control, pm, cfg.pgAdminUrl, vault, cfg.pipelines);
   const extensions = new ExtensionService(control, pm, cfg.pgAdminUrl);
@@ -109,7 +113,7 @@ export async function createPlatform(cfg: PlatformConfig) {
     alwaysAllow: [...(cfg.dashboardOrigins ?? []), ...(cfg.dashboardHost ? [`https://${cfg.dashboardHost}`] : [])],
   });
   const api: FastifyInstance = buildApi(control, cfg.bootstrapToken, {
-    admin, usage, backups, functions, ai, pipelines, extensions, auth, vault, mailer,
+    admin, usage, backups, pitr, functions, ai, pipelines, extensions, auth, vault, mailer,
     dashboardUrl: cfg.dashboardUrl ?? (cfg.dashboardHost ? `https://${cfg.dashboardHost}` : cfg.dashboardOrigins?.[0]),
     gateway: { domain: cfg.gatewayDomain, scheme: cfg.publicScheme, port: cfg.publicPort },
     dashboardDir: cfg.dashboardDir ?? defaultDashboardDir, dashboardHost: cfg.dashboardHost,
@@ -142,11 +146,12 @@ export async function createPlatform(cfg: PlatformConfig) {
     await step("measured", () => usage.measure());
     await step("prunedHourly", () => usage.pruneHourly());
     await step("scheduledBackups", () => backups.runScheduled());
+    if (pitr) await step("pitr", () => pitr.runScheduled());
     return report;
   }
 
   return {
-    cfg, pool, control, pm, dir, storage, usage, functions, realtime, backups, admin, ai, pipelines, extensions, auth, gateway, api, migrations, housekeep,
+    cfg, pool, control, pm, dir, storage, usage, functions, realtime, backups, pitr, admin, ai, pipelines, extensions, auth, gateway, api, migrations, housekeep,
 
     start(intervalMs = 10 * 60_000) {
       usage.start();

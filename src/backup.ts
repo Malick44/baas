@@ -18,8 +18,8 @@ export type BackupRow = { id: string; ref: string; kind: string; status: string;
 
 /**
  * Logical backups (pg_dump custom format) of a project's database, with retention per plan and restore by
- * building a fresh database and swapping it in. Point-in-time recovery is not provided: enable WAL archiving on
- * the Postgres cluster if you need it. Stored files (Storage) are NOT part of these backups.
+ * building a fresh database and swapping it in. For recovery to any moment, see PitrService (needs WAL archiving).
+ * Stored files (Storage) are NOT part of these backups.
  */
 export class BackupService {
   private busy = new Set<string>();
@@ -121,9 +121,16 @@ export class BackupService {
       throw new HttpError(500, "backup file is missing");
     }
     if (hash.digest("hex") !== b.sha256) throw new HttpError(500, "backup file failed its integrity check");
+    await this.swapIn(ref, b.path, p, "backup.restore", { id });
+  }
+
+  /**
+   * Build a fresh database from a pg_dump file beside the live one and swap it in by rename. Access is cut during the swap
+   * and a failure leaves the project as it was. Shared by backup restore and point-in-time recovery.
+   */
+  async swapIn(ref: string, dumpPath: string, p: Principal, action: string, meta: object): Promise<void> {
     if (this.busy.has(ref)) throw new HttpError(409, "a backup or restore is already running for this project");
     this.busy.add(ref);
-
     const live = dbNameOf(ref);
     const fresh = `${live}_restore`;
     const old = `${live}_old`;
@@ -136,7 +143,7 @@ export class BackupService {
       await admin.query(`DROP DATABASE IF EXISTS "${fresh}" WITH (FORCE)`);
       await admin.query(`DROP DATABASE IF EXISTS "${old}" WITH (FORCE)`);
       await admin.query(`CREATE DATABASE "${fresh}"`);
-      await this.run("pg_restore", ["--exit-on-error", "-d", fresh, b.path], adminUrl);
+      await this.run("pg_restore", ["--exit-on-error", "-d", fresh, dumpPath], adminUrl);
       // From here the project is briefly unavailable.
       await setProjectAccess(adminUrl, ref, false);
       await admin.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, [live]);
@@ -147,7 +154,7 @@ export class BackupService {
       await admin.query(`GRANT CONNECT ON DATABASE "${live}" TO "authenticator_${ref}"`);
       await admin.query(`GRANT CREATE ON DATABASE "${live}" TO service_role`);
       await admin.query(`DROP DATABASE "${old}" WITH (FORCE)`);
-      await this.control.audit(p.tokenId, p.orgId, "backup.restore", ref, { id });
+      await this.control.audit(p.tokenId, p.orgId, action, ref, meta);
     } catch (err) {
       if (!swapped) await admin.query(`DROP DATABASE IF EXISTS "${fresh}" WITH (FORCE)`).catch(() => {});
       else await admin.query(`ALTER DATABASE "${live}" RENAME TO "${fresh}"`).then(() => admin.query(`ALTER DATABASE "${old}" RENAME TO "${live}"`)).catch(() => {});

@@ -1442,6 +1442,44 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await shot("12-backups");
   });
 
+  step("explains point-in-time recovery when the server cannot do it, and drives the restore form when it can", async () => {
+    await tab("backups");
+    await page.waitForSelector("#pitr-card");
+    assert.equal(await page.getAttribute("#pitr-state", "data-state"), "not-configured", "this server has no WAL archive");
+    assert.match((await page.textContent("#pitr-state"))!, /BAAS_PITR_ARCHIVE_DIR/);
+
+    // The server side is covered by the API tests against a real archiving cluster; here the form is driven against canned answers.
+    const earliest = new Date(Date.now() - 2 * 86_400_000).toISOString();
+    const posted: any[] = [];
+    await page.route(`**/v1/projects/${ref}/pitr`, (r) => r.fulfill({ contentType: "application/json", body: JSON.stringify({ enabled: true, archive_mode: "on", retention_days: 7, plan_allows: true, archiver: { failed_count: 0 }, window: { earliest, latest: new Date().toISOString() }, base_backups: [] }) }));
+    await page.route(`**/v1/projects/${ref}/pitr/restore`, (r) => { posted.push(JSON.parse(r.request().postData() ?? "{}")); return r.fulfill({ contentType: "application/json", body: JSON.stringify({ restored_to: posted.at(-1).to, base_backup: "b", safety_backup: "0123456789abcdef" }) }); });
+    await tab("overview");
+    await tab("backups");
+    await page.waitForSelector("#pitr-to");
+    assert.equal(await page.getAttribute("#pitr-state", "data-state"), "ready");
+    assert.match((await page.textContent("#pitr-state"))!, /kept 7 days/);
+    const min = new Date(await page.getAttribute("#pitr-to", "min") as string);
+    assert.ok(Math.abs(min.getTime() - new Date(earliest).getTime()) < 120_000, "the picker starts at the earliest restorable moment");
+    await page.fill("#pitr-to", "");
+    await page.click("#pitr-restore");
+    await toast("Pick a moment first");
+    const target = new Date(Date.now() - 3_600_000);
+    const local = new Date(target.getTime() - target.getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
+    await page.fill("#pitr-to", local);
+    await page.click("#pitr-restore");
+    await page.fill("dialog input[name=typed]", "wrong");
+    await page.click("dialog button[type=submit]");
+    await page.locator("dialog .notice.bad:not([hidden])").waitFor();
+    assert.equal(posted.length, 0, "nothing is sent until the project name is typed");
+    await page.fill("dialog input[name=typed]", "shop");
+    await page.click("dialog button[type=submit]");
+    await page.locator("#toasts .toast.ok", { hasText: "previous state is saved as backup 01234567" }).waitFor();
+    assert.equal(posted.length, 1);
+    assert.ok(Math.abs(new Date(posted[0].to).getTime() - target.getTime()) < 1500, "the chosen local time was sent as an exact instant");
+    await page.unroute(`**/v1/projects/${ref}/pitr`);
+    await page.unroute(`**/v1/projects/${ref}/pitr/restore`);
+  });
+
   step("saves settings that the API enforces, and changes the plan", async () => {
     /** Click save and wait for the server to answer, so a toast left over from an earlier save cannot satisfy the wait. */
     const saveSettings = async (status = 200) => {

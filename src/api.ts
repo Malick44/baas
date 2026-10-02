@@ -4,6 +4,7 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import type { ProjectAdmin } from "./admin-sql.js";
 import type { AiAssistant } from "./ai/assistant.js";
 import type { BackupService } from "./backup.js";
+import type { PitrService } from "./pitr.js";
 import { ControlPlane, HttpError, type Principal, type ProjectRow, type Role } from "./control.js";
 import type { AuthService } from "./authsvc.js";
 import type { ExtensionService } from "./extensions.js";
@@ -22,6 +23,7 @@ export type ApiOps = {
   admin?: ProjectAdmin;
   usage?: UsageService;
   backups?: BackupService;
+  pitr?: PitrService;
   functions?: FunctionService;
   ai?: AiAssistant;
   pipelines?: PipelineService;
@@ -340,6 +342,32 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     });
     app.get<{ Params: { ref: string } }>("/v1/projects/:ref/metrics", async (req) => ops.usage!.metrics((await owned(req)).ref, Number((req.query as Record<string, string>).hours) || 24));
     app.get<{ Params: { ref: string } }>("/v1/projects/:ref/logs", async (req) => ops.usage!.logsFor((await owned(req, "admin")).ref));
+  }
+
+  // ---- point-in-time recovery ----
+  if (ops.pitr) {
+    const pitr = ops.pitr;
+    app.get<{ Params: { ref: string } }>("/v1/projects/:ref/pitr", async (req) => {
+      const p = await principal(req);
+      const project = await control.getProject(p, refParam(req));
+      return { ...(await pitr.status()), plan_allows: planOf(project.plan).pitr };
+    });
+    app.post<{ Params: { ref: string } }>("/v1/projects/:ref/pitr/restore", async (req) => {
+      const to = body(req).to;
+      if (typeof to !== "string" || !/^\d{4}-\d\d-\d\d[T ]\d\d:\d\d/.test(to)) throw new HttpError(400, "to must be an ISO date and time, like 2026-10-02T14:30:00Z");
+      return pitr.restore(await principal(req), refParam(req), new Date(to));
+    });
+    app.post<{ Params: { ref: string } }>("/v1/projects/:ref/pitr/base-backup", async (req, reply) => {
+      const p = await principal(req);
+      await control.getProject(p, refParam(req));
+      ControlPlane.require(p, "owner");
+      return reply.code(201).send(await pitr.takeBaseBackup());
+    });
+  } else {
+    app.get<{ Params: { ref: string } }>("/v1/projects/:ref/pitr", async (req) => {
+      await control.getProject(await principal(req), refParam(req));
+      return { enabled: false, archive_mode: "unknown", retention_days: 0, archiver: null, window: null, base_backups: [], plan_allows: false, configured: false };
+    });
   }
 
   // ---- backups ----

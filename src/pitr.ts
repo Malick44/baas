@@ -1,0 +1,324 @@
+/**
+ * Point-in-time recovery for a project's database.
+ *
+ * All projects share one Postgres cluster, and WAL archiving is cluster-wide, so history cannot be rewound for one
+ * project in place. Instead: keep periodic base backups of the cluster plus the archived WAL; to recover, start a throwaway
+ * server from the newest base backup before the target, let it replay the WAL up to the target moment, dump that one
+ * project's database from it, and swap the dump in with the same machinery as a backup restore. Nothing else on the
+ * cluster is touched, and a logical backup of the current state is taken first so the restore can itself be undone.
+ *
+ * Not covered: files in Storage, and anything outside the project's database.
+ *
+ * Operator setup: the server needs archive_mode=on and an archive_command that copies WAL into `archiveDir` (a volume baas can read),
+ * and baas needs the server binaries (`postgres`, `pg_basebackup`, `pg_archivecleanup`) of the SAME major version in `pgBinDir`.
+ */
+import { spawn, type ChildProcess } from "node:child_process";
+import { cp, chmod, chown, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
+import { join } from "node:path";
+import pg from "pg";
+import type { BackupService } from "./backup.js";
+import { ControlPlane, HttpError, type Principal } from "./control.js";
+import { planOf } from "./plans.js";
+import { dbNameOf } from "./provision.js";
+
+export type PitrOptions = {
+  /** Where the server's archive_command puts WAL segments, as baas sees it. */
+  archiveDir: string;
+  /** Where base backups of the cluster are kept. */
+  baseDir: string;
+  /** Scratch space for the recovery server; needs room for one copy of the cluster. */
+  scratchDir: string;
+  /** Directory holding postgres, pg_basebackup and pg_archivecleanup. */
+  pgBinDir?: string;
+  /** How far back recovery can go. */
+  retentionDays?: number;
+  /** Take a new base backup when the last is older than this. */
+  baseEveryHours?: number;
+  /** How long to wait for a recovery to finish. */
+  recoveryTimeoutMs?: number;
+  /** Run the scratch server as this user (PostgreSQL refuses to run as root). Defaults to the "postgres" user when baas runs as root. */
+  runAs?: { uid: number; gid: number };
+};
+
+export type BaseBackup = { id: string; status: string; started_at: Date; finished_at: Date | null; size_bytes: string | null; error: string | null };
+
+const run = (cmd: string, args: string[], env: Record<string, string> = {}, o: { uid?: number; gid?: number } = {}): Promise<{ out: string; err: string }> =>
+  new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { env: { PATH: process.env.PATH ?? "", ...env }, stdio: ["ignore", "pipe", "pipe"], ...(o.uid !== undefined ? { uid: o.uid, gid: o.gid } : {}) });
+    let out = "", err = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (err += d));
+    p.on("error", (e) => reject(new Error(`${cmd} could not start: ${e.message}`)));
+    p.on("close", (code) => (code === 0 ? resolve({ out, err }) : reject(new Error(`${cmd} failed (${code}): ${err.trim().split("\n").slice(-3).join(" ")}`))));
+  });
+
+async function chownR(dir: string, uid: number, gid: number) {
+  await chown(dir, uid, gid);
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) await chownR(p, uid, gid);
+    else await chown(p, uid, gid).catch(() => {});
+  }
+}
+
+const freePort = () => new Promise<number>((res, rej) => {
+  const s = createServer().listen(0, "127.0.0.1", () => { const port = (s.address() as { port: number }).port; s.close(() => res(port)); });
+  s.on("error", rej);
+});
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** A value for postgresql.conf: quoted, with quotes and backslashes escaped. */
+const q = (v: string) => `'${v.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
+
+export class PitrService {
+  private busy = false;
+  private opts: Required<Omit<PitrOptions, "runAs" | "pgBinDir">> & Pick<PitrOptions, "runAs" | "pgBinDir">;
+
+  constructor(private control: ControlPlane, private backups: BackupService, opts: PitrOptions) {
+    if (/["'\\\n]/.test(opts.archiveDir)) throw new Error("the WAL archive path must not contain quotes, backslashes or newlines");
+    this.opts = { retentionDays: 7, baseEveryHours: 24, recoveryTimeoutMs: 15 * 60_000, ...opts };
+  }
+
+  private bin(n: string) {
+    return this.opts.pgBinDir ? join(this.opts.pgBinDir, n) : n;
+  }
+
+  private connEnv() {
+    const u = new URL(this.control.adminUrl);
+    return { args: ["-h", u.hostname, "-p", u.port || "5432", "-U", decodeURIComponent(u.username)], env: { PGPASSWORD: decodeURIComponent(u.password) } };
+  }
+
+  private async resolveUser(): Promise<{ uid: number; gid: number } | undefined> {
+    if (this.opts.runAs) return this.opts.runAs;
+    if (typeof process.getuid !== "function" || process.getuid() !== 0) return undefined;
+    try {
+      const uid = Number((await run("id", ["-u", "postgres"])).out.trim());
+      const gid = Number((await run("id", ["-g", "postgres"])).out.trim());
+      if (Number.isInteger(uid) && Number.isInteger(gid)) return { uid, gid };
+    } catch { /* fall through */ }
+    throw new Error("baas is running as root and there is no postgres user to run the recovery server as; run baas as a normal user");
+  }
+
+  private async admin<T>(fn: (c: pg.Client) => Promise<T>): Promise<T> {
+    const c = new pg.Client({ connectionString: this.control.adminUrl });
+    c.on("error", () => {});
+    await c.connect();
+    try { return await fn(c); } finally { await c.end().catch(() => {}); }
+  }
+
+  /** Is the server archiving, and what does the archive cover? */
+  async status() {
+    const s = await this.admin(async (c) => {
+      const set = (await c.query<{ name: string; setting: string }>(`SELECT name, setting FROM pg_settings WHERE name IN ('archive_mode', 'archive_command', 'wal_level')`)).rows;
+      const v = Object.fromEntries(set.map((r) => [r.name, r.setting]));
+      const a = (await c.query(`SELECT last_archived_wal, last_archived_time, failed_count, last_failed_wal, last_failed_time FROM pg_stat_archiver`)).rows[0];
+      return { archive_mode: v.archive_mode ?? "off", wal_level: v.wal_level ?? "", archive_command_set: !!v.archive_command && v.archive_command !== "(disabled)", archiver: a };
+    });
+    const enabled = s.archive_mode !== "off" && s.archive_command_set && s.wal_level !== "minimal";
+    const bases = (await this.control.pool.query<BaseBackup>(
+      `SELECT id, status, started_at, finished_at, size_bytes, error FROM pitr_base_backups ORDER BY started_at DESC LIMIT 20`)).rows;
+    const earliest = (await this.control.pool.query<{ t: Date | null }>(`SELECT min(finished_at) AS t FROM pitr_base_backups WHERE status = 'complete'`)).rows[0]!.t;
+    return {
+      enabled, archive_mode: s.archive_mode, retention_days: this.opts.retentionDays,
+      archiver: s.archiver ? { last_archived_wal: s.archiver.last_archived_wal, last_archived_time: s.archiver.last_archived_time, failed_count: Number(s.archiver.failed_count), last_failed_time: s.archiver.last_failed_time } : null,
+      window: enabled && earliest ? { earliest, latest: new Date() } : null,
+      base_backups: bases,
+    };
+  }
+
+  async takeBaseBackup(): Promise<BaseBackup> {
+    if (this.busy) throw new HttpError(409, "a base backup or recovery is already running");
+    this.busy = true;
+    const id = (await this.control.pool.query<{ id: string }>(`INSERT INTO pitr_base_backups (status) VALUES ('running') RETURNING id`)).rows[0]!.id;
+    const dir = join(this.opts.baseDir, id);
+    try {
+      const st = await this.status();
+      if (!st.enabled) throw new Error("WAL archiving is not switched on for this Postgres server");
+      await mkdir(this.opts.baseDir, { recursive: true, mode: 0o700 });
+      const { args, env } = this.connEnv();
+      // -X none: the WAL a backup needs is fetched from the archive at recovery time, which Postgres makes sure is complete before it returns.
+      await run(this.bin("pg_basebackup"), [...args, "-D", dir, "-F", "p", "-X", "none", "-c", "fast", "--no-sync"], env);
+      const label = await readFile(join(dir, "backup_label"), "utf8");
+      const startWal = /START WAL LOCATION: \S+ \(file ([0-9A-F]{24})\)/.exec(label)?.[1] ?? null;
+      const finished = (await this.admin((c) => c.query<{ t: Date }>(`SELECT now() AS t`))).rows[0]!.t;
+      const size = await dirSize(dir);
+      const row = (await this.control.pool.query<BaseBackup>(
+        `UPDATE pitr_base_backups SET status = 'complete', path = $2, finished_at = $3, start_wal = $4, size_bytes = $5 WHERE id = $1
+         RETURNING id, status, started_at, finished_at, size_bytes, error`, [id, dir, finished, startWal, size])).rows[0]!;
+      return row;
+    } catch (err) {
+      await rm(dir, { recursive: true, force: true });
+      await this.control.pool.query(`UPDATE pitr_base_backups SET status = 'failed', error = $2, path = NULL WHERE id = $1`, [id, (err as Error).message.slice(0, 500)]);
+      throw new HttpError(500, `base backup failed: ${(err as Error).message.slice(0, 200)}`);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** Forget base backups past retention (always keeping the newest) and the WAL only they needed. */
+  async prune(): Promise<{ removedBackups: number }> {
+    const keep = (await this.control.pool.query<{ id: string; path: string | null; start_wal: string | null; finished_at: Date }>(
+      `SELECT id, path, start_wal, finished_at FROM pitr_base_backups WHERE status = 'complete' ORDER BY finished_at DESC`)).rows;
+    const cutoff = Date.now() - this.opts.retentionDays * 86_400_000;
+    // Recovery to a moment needs the newest backup before it, so the newest backup older than the window is kept too.
+    const firstOld = keep.findIndex((b) => b.finished_at.getTime() < cutoff);
+    const drop = firstOld === -1 ? [] : keep.slice(firstOld + 1);
+    for (const b of drop) {
+      if (b.path) await rm(b.path, { recursive: true, force: true });
+      await this.control.pool.query(`DELETE FROM pitr_base_backups WHERE id = $1`, [b.id]);
+    }
+    await this.control.pool.query(`DELETE FROM pitr_base_backups WHERE status = 'failed' AND started_at < now() - interval '7 days'`);
+    const oldest = keep.slice(0, keep.length - drop.length).at(-1);
+    if (oldest?.start_wal) await run(this.bin("pg_archivecleanup"), [this.opts.archiveDir, oldest.start_wal]).catch(() => {});
+    return { removedBackups: drop.length };
+  }
+
+  /** Housekeeping: a fresh base backup when due, then pruning. Quiet when archiving is not switched on. */
+  async runScheduled(): Promise<string> {
+    const st = await this.status();
+    if (!st.enabled) return "off";
+    const last = (await this.control.pool.query<{ t: Date | null }>(`SELECT max(started_at) AS t FROM pitr_base_backups WHERE status IN ('complete', 'running')`)).rows[0]!.t;
+    let taken = false;
+    if (!last || Date.now() - last.getTime() > this.opts.baseEveryHours * 3_600_000) { await this.takeBaseBackup(); taken = true; }
+    const { removedBackups } = await this.prune();
+    return `${taken ? "base backup taken" : "base backup current"}${removedBackups ? `, ${removedBackups} old removed` : ""}`;
+  }
+
+  /** Make sure everything up to this moment is in the archive, so a target close to "now" can be replayed. */
+  private async flushArchive(): Promise<Date> {
+    return this.admin(async (c) => {
+      // A WAL record first, so the switch has something to close; then wait for exactly that segment to be archived.
+      await c.query(`SELECT pg_logical_emit_message(false, 'baas', 'point-in-time recovery')`);
+      const { t, seg } = (await c.query<{ t: Date; seg: string }>(`SELECT now() AS t, pg_walfile_name(pg_switch_wal()) AS seg`)).rows[0]!;
+      for (let i = 0; i < 100; i++) {
+        const last = (await c.query<{ w: string | null }>(`SELECT last_archived_wal AS w FROM pg_stat_archiver`)).rows[0]!.w;
+        if (last && last >= seg) return t;
+        await sleep(300);
+      }
+      throw new Error("the server did not archive its latest WAL in time; check archive_command");
+    });
+  }
+
+  /**
+   * Replace the project's database with how it was at `to`. Owner only. The current state is saved as a backup first.
+   * Resolves with what was done; the project is unreachable for the moment of the swap only.
+   */
+  async restore(p: Principal, ref: string, to: Date): Promise<{ restored_to: string; base_backup: string; safety_backup: string }> {
+    ControlPlane.require(p, "owner");
+    const project = await this.control.getProject(p, ref);
+    if (project.status !== "active") throw new HttpError(409, `cannot restore a project that is ${project.status}`);
+    if (!planOf(project.plan).pitr) throw new HttpError(403, `point-in-time recovery is not part of the ${project.plan} plan`);
+    if (Number.isNaN(to.getTime())) throw new HttpError(400, "to must be a date and time");
+    if (to.getTime() > Date.now()) throw new HttpError(400, "to is in the future");
+    const st = await this.status();
+    if (!st.enabled) throw new HttpError(409, "point-in-time recovery is not set up on this server (WAL archiving is off)");
+    const base = (await this.control.pool.query<{ id: string; path: string; finished_at: Date }>(
+      `SELECT id, path, finished_at FROM pitr_base_backups WHERE status = 'complete' AND finished_at <= $1 ORDER BY finished_at DESC LIMIT 1`, [to])).rows[0];
+    if (!base) throw new HttpError(400, st.window ? `the earliest moment that can be restored is ${st.window.earliest.toISOString()}` : "no base backup exists yet");
+    if (this.busy) throw new HttpError(409, "a base backup or recovery is already running");
+    this.busy = true;
+    const scratch = join(this.opts.scratchDir, `recover-${base.id.slice(0, 8)}-${Date.now()}`);
+    let proc: ChildProcess | null = null;
+    try {
+      await this.flushArchive();
+      const user = await this.resolveUser();
+      await mkdir(this.opts.scratchDir, { recursive: true, mode: 0o700 });
+      if (user) await chmod(this.opts.scratchDir, 0o711); // the recovery user has to be able to reach its copy
+      await cp(base.path, scratch, { recursive: true });
+      await chmod(scratch, 0o700);
+      const port = await freePort();
+      const settings = await this.admin(async (c) => Object.fromEntries((await c.query<{ name: string; setting: string }>(
+        `SELECT name, setting FROM pg_settings WHERE name IN ('max_connections','max_worker_processes','max_wal_senders','max_prepared_transactions','max_locks_per_transaction','shared_preload_libraries','wal_level')`)).rows.map((r) => [r.name, r.setting])));
+      const superuser = decodeURIComponent(new URL(this.control.adminUrl).username);
+      await writeFile(join(scratch, "baas_hba.conf"), "local all all trust\n");
+      await writeFile(join(scratch, "postgresql.auto.conf"), [
+        // Later settings win, so these override whatever the copied configuration says.
+        `# written by baas for a point-in-time recovery`,
+        ...Object.entries(settings).filter(([k, v]) => v !== "" && k !== "wal_level").map(([k, v]) => `${k} = ${q(v)}`),
+        `hot_standby = off`, `archive_mode = off`, `archive_command = ''`,
+        // Formatting only, and this host may not have the primary's locales (the databases themselves need en_US.UTF-8 if they use it).
+        `lc_messages = 'C'`, `lc_monetary = 'C'`, `lc_numeric = 'C'`, `lc_time = 'C'`, `ssl = off`, `listen_addresses = ''`, `port = ${port}`,
+        `unix_socket_directories = ${q(scratch)}`, `hba_file = ${q(join(scratch, "baas_hba.conf"))}`,
+        `fsync = off`, `synchronous_commit = off`, `full_page_writes = off`, `log_min_messages = warning`,
+        `restore_command = ${q(`cp "${this.opts.archiveDir}/%f" "%p"`)}`,
+        `recovery_target_time = ${q(to.toISOString().replace("T", " ").replace("Z", "+00"))}`, `recovery_target_action = 'promote'`, `recovery_target_inclusive = on`,
+      ].join("\n") + "\n");
+      await writeFile(join(scratch, "recovery.signal"), "");
+      if (user) await chownR(scratch, user.uid, user.gid);
+
+      proc = spawn(this.bin("postgres"), ["-D", scratch], { env: { PATH: process.env.PATH ?? "" }, stdio: ["ignore", "ignore", "pipe"], ...(user ? { uid: user.uid, gid: user.gid } : {}) });
+      let log = "";
+      proc.stderr!.on("data", (d) => { log = (log + d).slice(-4000); });
+      let exited: number | null = null;
+      proc.on("exit", (code) => { exited = code ?? -1; });
+      proc.on("error", (e) => { log += `\n${e.message}`; exited = -1; });
+
+      const dump = join(scratch, "baas.dump"); // inside the scratch directory, which the recovery user owns
+      const deadline = Date.now() + this.opts.recoveryTimeoutMs;
+      let ready = false;
+      while (Date.now() < deadline) {
+        if (exited !== null) throw new Error(`the recovery server stopped (${exited}): ${log.trim().split("\n").slice(-3).join(" ")}`);
+        const c = new pg.Client({ host: scratch, port, user: superuser, database: "postgres" });
+        c.on("error", () => {});
+        try {
+          await c.connect();
+          const inRecovery = (await c.query<{ r: boolean }>(`SELECT pg_is_in_recovery() AS r`)).rows[0]!.r;
+          const exists = (await c.query(`SELECT 1 FROM pg_database WHERE datname = $1`, [dbNameOf(ref)])).rowCount;
+          await c.end();
+          if (!inRecovery) {
+            if (!exists) throw new HttpError(400, "this project did not exist at that moment");
+            ready = true;
+            break;
+          }
+        } catch (e) {
+          await c.end().catch(() => {});
+          if (e instanceof HttpError) throw e;
+        }
+        await sleep(400);
+      }
+      if (!ready) throw new Error("the recovery did not finish in time");
+      await run(this.bin("pg_dump"), ["-Fc", "-h", scratch, "-p", String(port), "-U", superuser, "-f", dump, "-d", dbNameOf(ref)], {}, user ?? {});
+      await stopServer(proc);
+      proc = null;
+      await this.stopped(scratch);
+
+      // Keep the way back: the state being replaced is saved as a backup first.
+      const safety = await this.backups.create(null, ref, "manual", `before point-in-time restore to ${to.toISOString()}`);
+      await this.backups.swapIn(ref, dump, p, "pitr.restore", { to: to.toISOString(), base_backup: base.id, safety_backup: safety.id });
+      return { restored_to: to.toISOString(), base_backup: base.id, safety_backup: safety.id };
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      throw new HttpError(500, `point-in-time restore failed: ${(err as Error).message.slice(0, 300)}`);
+    } finally {
+      if (proc) await stopServer(proc).catch(() => {});
+      await rm(scratch, { recursive: true, force: true });
+      this.busy = false;
+    }
+  }
+
+  private async stopped(dir: string) {
+    for (let i = 0; i < 50; i++) {
+      if (!(await stat(join(dir, "postmaster.pid")).then(() => true, () => false))) return;
+      await sleep(100);
+    }
+  }
+}
+
+async function stopServer(proc: ChildProcess): Promise<void> {
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+  proc.kill("SIGINT"); // fast shutdown
+  await new Promise<void>((resolve) => {
+    const t = setTimeout(() => { proc.kill("SIGKILL"); }, 15_000);
+    proc.once("exit", () => { clearTimeout(t); resolve(); });
+  });
+}
+
+async function dirSize(dir: string): Promise<number> {
+  let n = 0;
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    n += e.isDirectory() ? await dirSize(p) : (await stat(p)).size;
+  }
+  return n;
+}

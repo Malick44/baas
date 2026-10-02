@@ -2856,8 +2856,43 @@ async function logs(body, p) {
 }
 
 // ---------- backups ----------
+/** Restore to any moment: the card under the backup list. */
+function pitrCard(p, s, onDone) {
+  const owner = S.me.role === "owner";
+  const card = h("div", { class: "card stack", id: "pitr-card" }, h("h3", null, "Point-in-time recovery"));
+  if (s.configured === false) {
+    card.append(h("p", { class: "muted", id: "pitr-state", "data-state": "not-configured" }, "Not set up on this server. Restoring to any moment needs WAL archiving: the operator sets BAAS_PITR_ARCHIVE_DIR and turns on archive_mode on the Postgres server (see the README)."));
+    return card;
+  }
+  if (!s.enabled) {
+    card.append(h("p", { class: "muted", id: "pitr-state", "data-state": "off" }, `Switched off: the Postgres server is not archiving its WAL (archive_mode is ${s.archive_mode}).`));
+    return card;
+  }
+  if (!s.plan_allows) card.append(h("div", { class: "notice", id: "pitr-plan" }, "This project's plan does not include point-in-time recovery."));
+  if (s.archiver?.failed_count) card.append(h("div", { class: "notice bad" }, `The server failed to archive WAL ${s.archiver.failed_count} time(s); the last failure was ${fmtDate(s.archiver.last_failed_time)}. Recent moments may not be restorable.`));
+  if (!s.window) {
+    card.append(h("p", { class: "muted", id: "pitr-state", "data-state": "no-base" }, "Archiving is on, but there is no base backup yet, so there is nothing to restore from."),
+      owner && h("button", { id: "pitr-base", onclick: async (e) => { e.target.disabled = true; try { await api("POST", `/v1/projects/${p.ref}/pitr/base-backup`); toast("Base backup taken", "ok"); } catch (ex) { toast(ex.message, "bad"); } onDone(); } }, "Take a base backup now"));
+    return card;
+  }
+  const local = (d) => { const x = new Date(d); x.setMinutes(x.getMinutes() - x.getTimezoneOffset()); return x.toISOString().slice(0, 16); };
+  const when = h("input", { id: "pitr-to", type: "datetime-local", step: "1", min: local(s.window.earliest), max: local(s.window.latest), value: local(s.window.latest), disabled: !owner || !s.plan_allows });
+  card.append(
+    h("p", { id: "pitr-state", "data-state": "ready" }, `You can restore ${p.name} to any moment from ${fmtDate(s.window.earliest)} until now (kept ${s.retention_days} days). The database is replaced with how it was then, and everything after is lost. A backup of the current state is saved first, so this can be undone. Files in Storage are not affected.`),
+    h("div", { class: "row" }, when, h("button", { class: "danger", id: "pitr-restore", disabled: !owner || !s.plan_allows, title: owner ? "" : "Only owners can restore", onclick: async () => {
+      const at = new Date(when.value);
+      if (Number.isNaN(at.getTime())) { toast("Pick a moment first", "bad"); return; }
+      if (!(await confirmBox("Restore to a moment", `This replaces the current database of ${p.name} with how it was at ${at.toLocaleString()}. Everything since is lost, apart from the backup saved first.`, { typed: p.name, confirmLabel: "Restore" }))) return;
+      try { const r = await api("POST", `/v1/projects/${p.ref}/pitr/restore`, { to: at.toISOString() }); toast(`Restored. The previous state is saved as backup ${r.safety_backup.slice(0, 8)}`, "ok"); S.tables = null; } catch (ex) { toast(ex.message, "bad"); }
+      onDone();
+    } }, "Restore to this moment")),
+    !owner && h("p", { class: "muted" }, "Only owners can restore."));
+  return card;
+}
+
 async function backups(body, p) {
   const rows = await api("GET", `/v1/projects/${p.ref}/backups`);
+  const pitr = await api("GET", `/v1/projects/${p.ref}/pitr`).catch(() => null);
   clear(body);
   body.append(h("div", { class: "stack" },
     h("div", { class: "row between" }, h("h2", null, "Backups"), h("button", { class: "primary", id: "create-backup", onclick: async (e) => {
@@ -2865,14 +2900,15 @@ async function backups(body, p) {
       try { await api("POST", `/v1/projects/${p.ref}/backups`, {}); toast("Backup created", "ok"); } catch (ex) { toast(ex.message, "bad"); }
       backups(body, p);
     } }, "Create backup")),
-    h("p", { class: "muted" }, "Logical database backups. Restoring replaces the whole database with the backup; files in Storage are not included. Point-in-time recovery is not provided."),
+    h("p", { class: "muted" }, "Logical database backups. Restoring replaces the whole database with the backup; files in Storage are not included. To go back to any moment instead, see point-in-time recovery below."),
     h("div", { class: "tablewrap" }, rows.length ? h("table", { class: "data", id: "backup-list" }, h("thead", null, h("tr", null, ["Created", "Kind", "Status", "Size", "Note", ""].map((x) => h("th", null, x)))),
       h("tbody", null, rows.map((b) => h("tr", { "data-backup": b.id }, h("td", null, fmtDate(b.created_at)), h("td", null, b.kind), h("td", { class: b.status === "failed" ? "bad" : "" }, b.status), h("td", null, b.size_bytes ? fmtBytes(b.size_bytes) : "—"), h("td", null, b.note || b.error || ""),
         h("td", { class: "row" }, b.status === "complete" && h("button", { class: "small danger", "data-action": "restore", onclick: async () => {
           if (!(await confirmBox("Restore backup", `This replaces the current database of ${p.name} with the backup from ${fmtDate(b.created_at)}.`, { typed: p.name, confirmLabel: "Restore" }))) return;
           try { await api("POST", `/v1/projects/${p.ref}/backups/${b.id}/restore`); toast("Restored", "ok"); S.tables = null; } catch (ex) { toast(ex.message, "bad"); }
           backups(body, p);
-        } }, "Restore"), h("button", { class: "small", onclick: async () => { await api("DELETE", `/v1/projects/${p.ref}/backups/${b.id}`); backups(body, p); } }, "Delete")))))) : h("div", { class: "empty" }, "No backups yet."))));
+        } }, "Restore"), h("button", { class: "small", onclick: async () => { await api("DELETE", `/v1/projects/${p.ref}/backups/${b.id}`); backups(body, p); } }, "Delete")))))) : h("div", { class: "empty" }, "No backups yet.")),
+    pitr && pitrCard(p, pitr, () => backups(body, p))));
 }
 
 // ---------- settings ----------

@@ -39,7 +39,7 @@ Without Docker: `npm ci && npm run build`, set the variables in `.env.example`, 
 | **Functions** | Your JavaScript in an isolated Node process with a timeout, memory cap and no filesystem/subprocess access | `src/functions.ts`, `src/sandbox.ts` |
 | **Ask AI** | Ask questions about your data in plain language; the assistant runs read-only SQL to answer and *proposes* changes for you to review and run | `src/ai/`, dashboard tab, `baas ask` |
 | **Dashboard** | Supabase-style workspace: project overview with live per-service request charts (`GET /v1/projects/:ref/metrics`), table and SQL editors, a Schema Visualizer with foreign-key lines, a Database section (tables, database functions, triggers, enums, extensions, indexes, policies, roles, backups, migrations), Ask AI, Advisors (security and performance checks), Reports, Pipelines (signed webhook delivery of row changes), Integrations (Postgres extensions and connected services), users, storage, edge functions, realtime inspector, logs, settings, project/organisation switchers and a Ctrl/⌘+K page switcher | `dashboard/` |
-| **Ops** | Usage metering, plan quotas, idle auto-pause, `pg_dump` backups with integrity-checked restore, housekeeping | `src/usage.ts`, `src/backup.ts`, `src/platform.ts` |
+| **Ops** | Usage metering, plan quotas, idle auto-pause, `pg_dump` backups with integrity-checked restore, point-in-time recovery from archived WAL, housekeeping | `src/usage.ts`, `src/backup.ts`, `src/pitr.ts`, `src/platform.ts` |
 | **CLI** | `baas` — projects, SQL, checksummed atomic migrations, functions, backups | `src/cli.ts` |
 | **SDK** | `createClient(url, key)` shaped like supabase-js | `src/client.ts` |
 
@@ -145,7 +145,7 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 - **Enabling the assistant revokes `set_config` from `anon` and `authenticated`** in that project's database (see above). A function of yours that calls `set_config` while running as one of those roles will fail with "permission denied". `current_setting`, `SET LOCAL` inside your own `SECURITY DEFINER` functions, and everything `service_role` does are unaffected. Turning the assistant off restores it.
 - **Email needs an SMTP server.** Without `SMTP_URL`, sign-ups are confirmed automatically and password reset and magic links answer 501. 
 - **REST subset.** No JSON-path operators, casts, spread (`...table`), or full-text operators. Embedded resources follow foreign keys (`orders(id,items(*))`, aliases `a:orders(*)`, hints `orders!fk_name(*)`, `!inner`, per-embed filters/order/limit like `orders.status=eq.paid`), at most 3 deep and 10 per request, up to 1000 rows per embed; an ambiguous relationship returns `PGRST201` until hinted. Row-level security applies to embedded tables as the caller. Unfiltered `PATCH`/`DELETE` are rejected.
-- **No point-in-time recovery.** Backups are logical dumps; enable WAL archiving on the cluster if you need PITR. Stored files are not part of backups.
+- **Point-in-time recovery needs WAL archiving** (below); without it, backups are logical dumps taken daily on the pro plan. Stored files are never part of either.
 - **Bulk inserts** fill keys missing from some rows with `NULL` rather than defaults (PostgREST does the same without `missing=default`).
 - **Realtime** DELETE events carry only the primary key and go to `service_role`, or to other roles only on tables without RLS; filtered subscriptions receive no deletes. One extra query per subscriber per event.
 - **Single node.** One Postgres cluster, one process; request logs and rate-limit state are in memory. No sharding across clusters.
@@ -169,6 +169,20 @@ Tests create and drop their own databases. Without `BAAS_TEST_PG_URL` the databa
 Rough numbers from `scripts/load.ts` on one small machine with Postgres and the platform side by side (32 connections): REST reads 7–9k req/s (p95 5–10 ms), inserts with an RLS check ~7k req/s, public file download ~7k req/s, password login ~130/s (scrypt-bound), function calls ~30/s (a fresh process each). Treat these as an order of magnitude, not a benchmark.
 
 See [PLAN.md](PLAN.md) for the architecture notes and how the build differs from the original plan.
+
+## Point-in-time recovery
+
+Restore one project's database to any moment in the last 7 days (pro plan), for the "I dropped the wrong table at 14:02" case. The projects share one Postgres cluster, so history cannot be rewound in place. Instead baas keeps periodic **base backups** of the cluster plus the **archived WAL**. To recover, it starts a throwaway Postgres from the newest base backup before your moment, replays the WAL up to it, dumps that one project's database, and swaps the dump in like a backup restore. Other projects are never touched, and the state being replaced is saved as an ordinary backup first, so a restore can be undone.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.pitr.yml up -d    # archive WAL + keep base backups
+npx baas pitr status                                                      # the window you can restore to
+npx baas pitr restore --to 2026-10-02T14:01:30Z --yes
+```
+
+The overlay makes Postgres archive WAL into a shared volume (`archive_mode=on`, group-readable files so baas can replay and prune them), allows `pg_basebackup` to connect (a `replication` line in `pg_hba.conf`), and sets `BAAS_PITR_ARCHIVE_DIR`. A base backup is taken at start-up when none exists, then daily (`BAAS_PITR_BASE_EVERY_HOURS`); backups and WAL older than `BAAS_PITR_RETENTION_DAYS` (default 7) are pruned, always keeping the base backup that anchors the oldest moment in the window. The image carries the Postgres server binaries and the `en_US.UTF-8` locale for the recovery server; without Docker you need the **same major version** of `postgres`, `pg_basebackup` and `pg_archivecleanup` in `BAAS_PG_BIN_DIR`, and baas must not run as root (or a `postgres` user must exist to drop to). Restoring needs the **owner** role, and a plan with `pitr` (pro). The dashboard has it under **Backups**.
+
+What it costs and what it does not do: WAL grows with write volume (budget disk for it, plus one cluster-sized base backup per retained day); a recovery copies a base backup, so it needs that much free space under `BAAS_PITR_SCRATCH_DIR` and takes as long as the WAL replay; the project is unreachable only for the moment of the swap. It restores the **database only**, not Storage files, function code or settings. Archiving errors show in `baas pitr status` and in the dashboard (`pg_stat_archiver`): if the archive command is failing, recent moments are not restorable. History on the cluster is linear: a restore is itself part of history, so restoring to a moment after an earlier restore includes it, and moments before it stay reachable. This is tested against a real archiving cluster in CI and on the real Postgres 15 and baas containers with `SMOKE_PITR=1 scripts/smoke.sh`.
 
 ## Authentication: email and providers
 
