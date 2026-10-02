@@ -70,11 +70,14 @@ jobs:
       - name: The point-in-time recovery and multi-node overlays are valid
         run: |
           POSTGRES_PASSWORD=x BAAS_MASTER_KEY=x BAAS_BOOTSTRAP_TOKEN=x docker compose -f docker-compose.yml -f docker-compose.pitr.yml config --quiet
+          POSTGRES_PASSWORD=x BAAS_MASTER_KEY=x BAAS_BOOTSTRAP_TOKEN=x BAAS_PITR_ARCHIVE_TOKEN=x docker compose -f docker-compose.yml -f docker-compose.pitr-shared.yml config --quiet
           POSTGRES_PASSWORD=x BAAS_MASTER_KEY=x BAAS_BOOTSTRAP_TOKEN=x docker compose -f docker-compose.yml -f docker-compose.nodes.yml config --quiet
           docker run --rm -v "$PWD/deploy/Caddyfile.lb:/etc/caddy/Caddyfile:ro" caddy:2 caddy validate --config /etc/caddy/Caddyfile
       - run: scripts/smoke.sh
       - name: Smoke test with WAL archiving, restoring a project to a moment in time
         run: SMOKE_PITR=1 scripts/smoke.sh
+      - name: Smoke test with the WAL archive in the shared store (Postgres uploads over HTTP), restoring to a moment in time
+        run: SMOKE_PITR=shared scripts/smoke.sh
       - name: Smoke test with two nodes behind a load balancer, stopping the leader
         run: SMOKE_NODES=2 scripts/smoke.sh
       - name: Smoke test keeping object files in an S3 server, on two nodes with no shared storage

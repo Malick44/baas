@@ -429,6 +429,21 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
       return reply.code(201).send(await pitr.takeBaseBackup((await control.getProject(p, refParam(req))).cluster_id));
     });
     // Operator: the same for a cluster directly, including the ones with no project of yours on them.
+    if (pitr.sharedStore) {
+      // Where a cluster's archive_command sends WAL when the archive is kept in the shared store. The token is the credential, so no operator secret leaves baas.
+      app.addContentTypeParser("application/octet-stream", { parseAs: "buffer", bodyLimit: 256 * 1024 * 1024 }, (_req, body, done) => done(null, body));
+      app.put<{ Params: { cluster: string; file: string } }>("/v1/pitr/wal/:cluster/:file", { bodyLimit: 256 * 1024 * 1024 }, async (req, reply) => {
+        const token = req.headers["x-archive-token"];
+        await pitr.ingestWal(req.params.cluster, req.params.file, typeof token === "string" ? token : "", Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
+        return reply.code(200).send({ archived: req.params.file });
+      });
+      app.get<{ Params: { id: string }; Querystring: { url?: string } }>("/v1/admin/clusters/:id/pitr/archive-command", async (req) => {
+        operator(req);
+        await control.clusters.adminUrl(req.params.id); // 500s for a cluster that does not exist
+        const base = req.query.url ?? `${req.protocol}://${req.headers.host}`;
+        return pitr.archiveCommand(req.params.id, base);
+      });
+    }
     app.get<{ Params: { id: string } }>("/v1/admin/clusters/:id/pitr", async (req) => { operator(req); return pitr.status(req.params.id); });
     app.post<{ Params: { id: string } }>("/v1/admin/clusters/:id/pitr/base-backup", async (req, reply) => { operator(req); return reply.code(201).send(await pitr.takeBaseBackup(req.params.id)); });
   } else {

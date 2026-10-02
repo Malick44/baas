@@ -27,8 +27,10 @@ const platform = await createPlatform({
   storageBackend: process.env.BAAS_STORAGE_BACKEND === "postgres" ? "postgres" : undefined,
   backupDir: resolve(process.env.BAAS_BACKUP_DIR ?? "./data/backups"),
   pgBinDir: process.env.BAAS_PG_BIN_DIR,
-  pitr: process.env.BAAS_PITR_ARCHIVE_DIR ? {
-    archiveDir: resolve(process.env.BAAS_PITR_ARCHIVE_DIR),
+  pitr: process.env.BAAS_PITR_ARCHIVE_DIR || process.env.BAAS_PITR_SHARED === "true" ? {
+    shared: process.env.BAAS_PITR_SHARED === "true",
+    mainToken: process.env.BAAS_PITR_ARCHIVE_TOKEN && process.env.BAAS_PITR_ARCHIVE_TOKEN.length >= 32 ? process.env.BAAS_PITR_ARCHIVE_TOKEN : undefined,
+    archiveDir: process.env.BAAS_PITR_ARCHIVE_DIR ? resolve(process.env.BAAS_PITR_ARCHIVE_DIR) : undefined,
     baseDir: resolve(process.env.BAAS_PITR_BASE_DIR ?? "./data/pitr/base"),
     scratchDir: resolve(process.env.BAAS_PITR_SCRATCH_DIR ?? "./data/pitr/scratch"),
     retentionDays: process.env.BAAS_PITR_RETENTION_DAYS ? Number(process.env.BAAS_PITR_RETENTION_DAYS) : undefined,
@@ -54,9 +56,11 @@ const platform = await createPlatform({
 });
 if (platform.migrations.length) console.log(`applied migrations: ${platform.migrations.join(", ")}`);
 
-console.log("housekeeping:", JSON.stringify(await platform.housekeep()));
 platform.start().catch((e) => { console.error("could not start background work:", e); process.exit(1); });
+// Listen before the first housekeeping run: a base backup waits for the database to archive its WAL, and with the archive in the
+// shared store the database uploads that WAL to this very server.
 const ports = await platform.listen({ api: Number(process.env.PORT ?? 8080), gateway: gatewayPort });
+void platform.housekeep().then((r) => console.log("housekeeping:", JSON.stringify(r))).catch((e) => console.error("housekeeping failed:", e));
 console.log(platform.ai.available ? `AI assistant on (${process.env.BAAS_AI_MODEL ?? "claude-opus-5-5"})` : "AI assistant off (set ANTHROPIC_API_KEY to enable)");
 console.log(`management API + dashboard on :${ports.api}, data plane on :${ports.gateway} (<ref>.${process.env.BAAS_GATEWAY_DOMAIN ?? "localhost"})`);
 

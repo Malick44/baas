@@ -18,6 +18,7 @@ S3_SECRET_ACCESS_KEY=$(openssl rand -hex 16)
 BAAS_MASTER_KEY=$(openssl rand -hex 32)
 BAAS_BOOTSTRAP_TOKEN=$BOOT
 BAAS_PUBLIC_PORT=$GW_PORT
+BAAS_PITR_ARCHIVE_TOKEN=$(openssl rand -hex 24)
 ENV
 if [ "${SMOKE_NODES:-}" = 2 ]; then PUBLISHER=lb; else PUBLISHER=baas; fi   # whatever is in front publishes the ports
 cat > "$OVERRIDE" <<YML
@@ -28,6 +29,7 @@ services:
       - "127.0.0.1:$GW_PORT:8081"
 YML
 # SMOKE_PITR=1 also runs the stack with WAL archiving (docker-compose.pitr.yml) and restores to a moment.
+# SMOKE_PITR=shared does the same with the archive in the shared store: Postgres uploads WAL over HTTP, no volume is shared (docker-compose.pitr-shared.yml).
 # SMOKE_NODES=2 runs two baas nodes behind a load balancer (docker-compose.nodes.yml) and kills the leader.
 # SMOKE_S3=1 keeps object files in a bundled S3 server (docker-compose.s3.yml) and checks nothing lands on the local volume.
 PITR_FILE=()
@@ -38,6 +40,7 @@ S3_FILE=()
 EXTRA_FILE=()
 [ -n "${SMOKE_EXTRA_COMPOSE:-}" ] && EXTRA_FILE=(-f "$SMOKE_EXTRA_COMPOSE")   # for environments that need extra build settings (a proxy CA)
 [ "${SMOKE_PITR:-}" = 1 ] && PITR_FILE=(-f docker-compose.pitr.yml)
+[ "${SMOKE_PITR:-}" = shared ] && PITR_FILE=(-f docker-compose.pitr-shared.yml)
 if [ "${SMOKE_S3:-}" = 1 ] && [ "${SMOKE_NODES:-}" = 2 ]; then
   # The nodes overlay gives baas2 its own volumes; it only needs the same S3 settings as baas.
   cat >> "$OVERRIDE" <<YML
@@ -135,7 +138,7 @@ expect "restore removes what came after the backup" 0 "$(sql "select count(*) fr
 expect "restore keeps what was in the backup" 1 "$(sql "select count(*) from public.todos where title = 'from the smoke test'" | jq -r '.results[0].rows[0][0]')"
 expect "the project still serves requests after a restore" 200 "$(gw GET /rest/v1/todos -H "apikey: $ANON" -H "authorization: Bearer $USER_TOKEN" -o /dev/null -w '%{http_code}')"
 
-if [ "${SMOKE_PITR:-}" = 1 ]; then
+if [ "${SMOKE_PITR:-}" = 1 ] || [ "${SMOKE_PITR:-}" = shared ]; then
   step "point-in-time recovery"
   api -fS -XPATCH "http://127.0.0.1:$API_PORT/v1/projects/$REF" -d '{"plan":"pro"}' >/dev/null
   expect "WAL archiving is on" true "$(api -fS "http://127.0.0.1:$API_PORT/v1/projects/$REF/pitr" | jq .enabled)"

@@ -320,13 +320,16 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         } else if (sub === "storage" && rest[0] === "migrate") {
           const r = await operatorApi("POST", "/v1/admin/storage/migrate", {});
           io.out(`Checked ${r.objects} object(s) in ${r.projects} project(s): copied ${r.copied}, already there ${r.alreadyThere}, missing at the source ${r.missingAtSource}, failed ${r.failed}.${r.backups ? ` Backups: copied ${r.backups.copied}, already there ${r.backups.alreadyThere}, missing ${r.backups.missing}, failed ${r.backups.failed}.` : ""}`);
+        } else if (sub === "pitr-command" && rest[0]) {
+          const r = await operatorApi("GET", `/v1/admin/clusters/${rest[0]}/pitr/archive-command${typeof flags.url === "string" ? `?url=${encodeURIComponent(flags.url)}` : ""}`);
+          io.out(`Put this in the cluster's postgresql.conf (archive_mode = on, wal_level = replica) after copying deploy/pitr-archive.sh to /etc/baas/pitr-archive.sh on the database host:\n  archive_command = '${r.command}'`);
         } else if (sub === "nodes") {
           const rows = await operatorApi("GET", "/v1/admin/nodes");
           io.out(table([["NODE", "HOST", "ROLE", "SINCE"], ...rows.map((n: any) => [String(n.id).slice(0, 8), n.host, n.leader ? "leader" : "follower", String(n.started_at)])]));
         } else if (sub === "move" && rest[0] && rest[1]) {
           const r = await operatorApi("POST", `/v1/admin/projects/${rest[0]}/move`, { cluster: rest[1] });
           io.out(`Moved ${rest[0]} from ${r.from} to ${r.to}.`);
-        } else throw new CliError("usage: baas admin clusters … | baas admin nodes | baas admin move <ref> <cluster>");
+        } else throw new CliError("usage: baas admin clusters … | baas admin nodes | baas admin pitr-command <cluster> [--url <baas-url>] | baas admin move <ref> <cluster>");
         return 0;
       }
       case "pitr": {

@@ -43,7 +43,8 @@ export type PlatformConfig = {
   backupDir: string;
   pgBinDir?: string;
   /** Point-in-time recovery. Set to turn it on; the Postgres server must archive its WAL into `archiveDir`. */
-  pitr?: PitrOptions;
+  /** `shared: true` keeps the WAL archive and base backups in the shared store (S3, else Postgres) instead of directories. */
+  pitr?: PitrOptions & { shared?: boolean };
   /** Base domain for project hosts: <ref>.<gatewayDomain>. */
   gatewayDomain: string;
   publicScheme: string;
@@ -137,7 +138,8 @@ export async function createPlatform(cfg: PlatformConfig) {
   const backupBlobs = blobs.kind === "disk" ? undefined : new PrefixStore(blobs, "backups/");
   const backups = new BackupService(control, { dir: cfg.backupDir, pgBinDir: cfg.pgBinDir, blobs: backupBlobs });
   const mover = new ClusterMover(control.clusters, pool, vault, backups, cfg.backupDir, (action, ref, orgId, meta) => control.audit("operator", orgId, action, ref, meta), (ref) => dir.forget(ref));
-  const pitr = cfg.pitr ? new PitrService(control, backups, { pgBinDir: cfg.pgBinDir, ...cfg.pitr }) : undefined;
+  const pitrStore = cfg.pitr?.shared ? new PrefixStore(blobs.kind === "disk" ? new PgStore(pool) : blobs, "pitr/") : undefined;
+  const pitr = cfg.pitr ? new PitrService(control, backups, { pgBinDir: cfg.pgBinDir, archiveSecret: cfg.masterKey, ...cfg.pitr, store: pitrStore }) : undefined;
   const admin = new ProjectAdmin(pm);
   const pipelines = new PipelineService(pool, control, pm, vault, cfg.pipelines);
   const extensions = new ExtensionService(control, pm);

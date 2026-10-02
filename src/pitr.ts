@@ -12,6 +12,12 @@
  *
  * Not covered: files in Storage, and anything outside the project's database.
  *
+ * Two ways to keep the archive and the base backups. In a directory (`archiveDir`, `baseDir`): simple, but every baas node and the
+ * database host must share it. In a shared store (`store`, S3 or Postgres): the database's archive_command uploads each WAL segment
+ * to baas over HTTP (`PUT /v1/pitr/wal/<cluster>/<file>`, authenticated with a per-cluster token), base backups are stored as
+ * tarballs, and a recovery pulls what it needs into scratch space, so any node can take a base backup or run a recovery and nothing
+ * has to be shared at the filesystem level.
+ *
  * Operator setup: the server needs archive_mode=on and an archive_command that copies WAL into `archiveDir` (a volume baas can read),
  * and baas needs the server binaries (`postgres`, `pg_basebackup`, `pg_archivecleanup`) of the SAME major version in `pgBinDir`.
  */
@@ -21,16 +27,24 @@ import { createServer } from "node:net";
 import { join } from "node:path";
 import pg from "pg";
 import type { BackupService } from "./backup.js";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import type { BlobStore } from "./blobs.js";
 import { MAIN } from "./clusters.js";
 import { ControlPlane, HttpError, type Principal } from "./control.js";
 import { planOf } from "./plans.js";
 import { dbNameOf } from "./provision.js";
 
 export type PitrOptions = {
-  /** Where the server's archive_command puts WAL segments, as baas sees it. */
-  archiveDir: string;
-  /** Where base backups of the cluster are kept. */
-  baseDir: string;
+  /** Where the server's archive_command puts WAL segments, as baas sees it. Not used with `store`. */
+  archiveDir?: string;
+  /** Where base backups of the cluster are kept. Not used with `store`. */
+  baseDir?: string;
+  /** Keep WAL and base backups in a shared store instead of directories (see above). Needs `archiveSecret`. */
+  store?: BlobStore;
+  /** Secret the per-cluster WAL upload tokens are derived from (the platform key will do). */
+  archiveSecret?: string;
+  /** A fixed upload token for the main cluster, for setups (Compose) where the database's command line is written before baas has run. */
+  mainToken?: string;
   /** Scratch space for the recovery server; needs room for one copy of the cluster. */
   scratchDir: string;
   /** Directory holding postgres, pg_basebackup and pg_archivecleanup. */
@@ -46,7 +60,7 @@ export type PitrOptions = {
 };
 
 /** One cluster as recovery sees it. `archiveDir` is null for an added cluster whose operator has not said where its WAL goes. */
-type Target = { id: string; adminUrl: string; archiveDir: string | null; baseDir: string };
+type Target = { id: string; adminUrl: string; archiveDir: string | null; baseDir: string; /** WAL has somewhere to go: a registered directory, or the shared store. */ archived: boolean };
 
 export type BaseBackup = { id: string; status: string; started_at: Date; finished_at: Date | null; size_bytes: string | null; error: string | null };
 
@@ -82,11 +96,15 @@ export class PitrService {
   /** Clusters with a base backup or recovery running: one at a time on each. */
   private busy = new Set<string>();
   private binMajor: number | null = null;
-  private opts: Required<Omit<PitrOptions, "runAs" | "pgBinDir">> & Pick<PitrOptions, "runAs" | "pgBinDir">;
+  private opts: Required<Omit<PitrOptions, "runAs" | "pgBinDir" | "store" | "archiveSecret" | "mainToken">> & Pick<PitrOptions, "runAs" | "pgBinDir" | "store" | "archiveSecret" | "mainToken">;
+  private store?: BlobStore;
 
   constructor(private control: ControlPlane, private backups: BackupService, opts: PitrOptions) {
-    if (/["'\\\n]/.test(opts.archiveDir)) throw new Error("the WAL archive path must not contain quotes, backslashes or newlines");
-    this.opts = { retentionDays: 7, baseEveryHours: 24, recoveryTimeoutMs: 15 * 60_000, ...opts };
+    if (opts.store && !opts.archiveSecret) throw new Error("a shared point-in-time recovery store needs an archive secret");
+    if (!opts.store && !opts.archiveDir) throw new Error("point-in-time recovery needs a WAL archive directory or a shared store");
+    if (opts.archiveDir && /["'\\\n]/.test(opts.archiveDir)) throw new Error("the WAL archive path must not contain quotes, backslashes or newlines");
+    this.store = opts.store;
+    this.opts = { retentionDays: 7, baseEveryHours: 24, recoveryTimeoutMs: 15 * 60_000, archiveDir: opts.archiveDir ?? "", baseDir: opts.baseDir ?? join(opts.scratchDir, "base"), ...opts };
   }
 
   private bin(n: string) {
@@ -95,10 +113,11 @@ export class PitrService {
 
   private async target(id: string): Promise<Target> {
     const adminUrl = await this.control.clusters.adminUrl(id);
-    if (id === MAIN) return { id, adminUrl, archiveDir: this.opts.archiveDir, baseDir: this.opts.baseDir };
+    if (this.store) return { id, adminUrl, archiveDir: null, baseDir: this.opts.baseDir, archived: true };
+    if (id === MAIN) return { id, adminUrl, archiveDir: this.opts.archiveDir, baseDir: this.opts.baseDir, archived: true };
     const r = (await this.control.pool.query<{ archive_dir: string | null }>(`SELECT archive_dir FROM clusters WHERE id = $1`, [id])).rows[0];
     if (!r) throw new HttpError(404, "cluster not found");
-    return { id, adminUrl, archiveDir: r.archive_dir, baseDir: join(this.opts.baseDir, id) };
+    return { id, adminUrl, archiveDir: r.archive_dir, baseDir: join(this.opts.baseDir, id), archived: r.archive_dir !== null };
   }
 
   /** Recovery runs this host's server binaries against the cluster's backups, so they have to be the same major version. */
@@ -140,7 +159,7 @@ export class PitrService {
       const a = (await c.query(`SELECT last_archived_wal, last_archived_time, failed_count, last_failed_wal, last_failed_time FROM pg_stat_archiver`)).rows[0];
       return { archive_mode: v.archive_mode ?? "off", wal_level: v.wal_level ?? "", archive_command_set: !!v.archive_command && v.archive_command !== "(disabled)", archiver: a };
     });
-    const archive_dir_configured = t.archiveDir !== null;
+    const archive_dir_configured = t.archived;
     const enabled = archive_dir_configured && s.archive_mode !== "off" && s.archive_command_set && s.wal_level !== "minimal";
     const bases = (await this.control.pool.query<BaseBackup>(
       `SELECT id, status, started_at, finished_at, size_bytes, error FROM pitr_base_backups WHERE cluster_id = $1 ORDER BY started_at DESC LIMIT 20`, [t.id])).rows;
@@ -158,12 +177,13 @@ export class PitrService {
     if (this.busy.has(t.id)) throw new HttpError(409, "a base backup or recovery is already running on this cluster");
     this.busy.add(t.id);
     const id = (await this.control.pool.query<{ id: string }>(`INSERT INTO pitr_base_backups (status, cluster_id) VALUES ('running', $1) RETURNING id`, [t.id])).rows[0]!.id;
-    const dir = join(t.baseDir, id);
+    const dir = join(this.store ? this.opts.scratchDir : t.baseDir, this.store ? `base-${id}` : id);
+    const tarball = join(this.opts.scratchDir, `base-${id}.tar.gz`);
     try {
       const st = await this.status(t.id);
       if (!st.enabled) throw new Error(st.archive_dir_configured ? "WAL archiving is not switched on for this Postgres server" : `cluster ${t.id} has no WAL archive directory registered (baas admin clusters update ${t.id} --archive-dir <path>)`);
       await this.checkVersions(t);
-      await mkdir(t.baseDir, { recursive: true, mode: 0o700 });
+      await mkdir(this.store ? this.opts.scratchDir : t.baseDir, { recursive: true, mode: 0o700 });
       const { args, env } = this.connEnv(t);
       // -X none: the WAL a backup needs is fetched from the archive at recovery time, which Postgres makes sure is complete before it returns.
       await run(this.bin("pg_basebackup"), [...args, "-D", dir, "-F", "p", "-X", "none", "-c", "fast", "--no-sync"], env);
@@ -171,15 +191,26 @@ export class PitrService {
       const startWal = /START WAL LOCATION: \S+ \(file ([0-9A-F]{24})\)/.exec(label)?.[1] ?? null;
       const finished = (await this.admin(t, (c) => c.query<{ t: Date }>(`SELECT now() AS t`))).rows[0]!.t;
       const size = await dirSize(dir);
+      let where = dir;
+      if (this.store) {
+        // Into the shared store as one tarball, then the local copy goes: any node can recover from it.
+        await run("tar", ["-czf", tarball, "-C", dir, "."]);
+        where = `${t.id}/base/${id}.tar.gz`;
+        await this.store.putFile(where, tarball);
+        await rm(dir, { recursive: true, force: true });
+      }
       const row = (await this.control.pool.query<BaseBackup>(
         `UPDATE pitr_base_backups SET status = 'complete', path = $2, finished_at = $3, start_wal = $4, size_bytes = $5 WHERE id = $1
-         RETURNING id, status, started_at, finished_at, size_bytes, error`, [id, dir, finished, startWal, size])).rows[0]!;
+         RETURNING id, status, started_at, finished_at, size_bytes, error`, [id, where, finished, startWal, size])).rows[0]!;
       return row;
     } catch (err) {
       await rm(dir, { recursive: true, force: true });
+      await rm(tarball, { force: true });
+      if (this.store) await this.store.delete(`${t.id}/base/${id}.tar.gz`).catch(() => {});
       await this.control.pool.query(`UPDATE pitr_base_backups SET status = 'failed', error = $2, path = NULL WHERE id = $1`, [id, (err as Error).message.slice(0, 500)]);
       throw new HttpError(500, `base backup failed: ${(err as Error).message.slice(0, 200)}`);
     } finally {
+      await rm(tarball, { force: true });
       this.busy.delete(t.id);
     }
   }
@@ -194,12 +225,18 @@ export class PitrService {
     const firstOld = keep.findIndex((b) => b.finished_at.getTime() < cutoff);
     const drop = firstOld === -1 ? [] : keep.slice(firstOld + 1);
     for (const b of drop) {
-      if (b.path) await rm(b.path, { recursive: true, force: true });
+      if (b.path) { if (this.store) await this.store.delete(b.path); else await rm(b.path, { recursive: true, force: true }); }
       await this.control.pool.query(`DELETE FROM pitr_base_backups WHERE id = $1`, [b.id]);
     }
     await this.control.pool.query(`DELETE FROM pitr_base_backups WHERE status = 'failed' AND cluster_id = $1 AND started_at < now() - interval '7 days'`, [t.id]);
     const oldest = keep.slice(0, keep.length - drop.length).at(-1);
-    if (oldest?.start_wal && t.archiveDir) await run(this.bin("pg_archivecleanup"), [t.archiveDir, oldest.start_wal]).catch(() => {});
+    if (oldest?.start_wal && this.store) {
+      // What pg_archivecleanup does for a directory: segments older than the oldest backup's first one are of no use any more.
+      for (const k of await this.store.list(`${t.id}/wal/`).catch(() => [] as string[])) {
+        const name = k.slice(k.lastIndexOf("/") + 1);
+        if (/^[0-9A-F]{24}$/.test(name) && name < oldest.start_wal) await this.store.delete(k).catch(() => {});
+      }
+    } else if (oldest?.start_wal && t.archiveDir) await run(this.bin("pg_archivecleanup"), [t.archiveDir, oldest.start_wal]).catch(() => {});
     return { removedBackups: drop.length };
   }
 
@@ -224,8 +261,45 @@ export class PitrService {
     return done.length ? done.join("; ") : "off";
   }
 
+  /** The secret a cluster's archive_command presents when it uploads WAL: derived, so there is nothing to store and a cluster's token is useless for another. */
+  archiveToken(clusterId: string): string {
+    if (!this.opts.archiveSecret) throw new HttpError(409, "WAL upload is not enabled: this server keeps its archive in a directory");
+    if (clusterId === MAIN && this.opts.mainToken) return this.opts.mainToken;
+    return createHmac("sha256", this.opts.archiveSecret).update(`pitr-wal:${clusterId}`).digest("hex");
+  }
+
+  get sharedStore(): boolean {
+    return !!this.store;
+  }
+
+  /** Accept one WAL file from a cluster's archive_command. Safe to repeat: the same file again is fine, a different one under the same name is refused. */
+  async ingestWal(clusterId: string, file: string, token: string, data: Buffer): Promise<void> {
+    const want = Buffer.from(this.archiveToken(clusterId));
+    const got = Buffer.from(token);
+    // (a fixed main token must be long enough to be a secret)
+    if (got.length !== want.length || !timingSafeEqual(got, want)) throw new HttpError(401, "bad archive token");
+    if (!/^(?:[0-9A-F]{24}(?:\.[0-9A-F]{8}\.backup)?|[0-9A-F]{8}\.history)$/.test(file)) throw new HttpError(400, "not a WAL file name");
+    if (!(await this.control.pool.query(`SELECT 1 FROM clusters WHERE id = $1`, [clusterId])).rowCount) throw new HttpError(404, "cluster not found");
+    const key = `${clusterId}/wal/${file}`;
+    const have = await this.store!.get(key);
+    if (have) {
+      const same = have.size === data.length;
+      have.stream.destroy();
+      if (same) return;
+      throw new HttpError(409, "a different file with this name is already archived");
+    }
+    await this.store!.put(key, data);
+  }
+
+  /** The archive_command to give a cluster's Postgres (see deploy/pitr-archive.sh), for baas reachable at `baseUrl` from the database host. */
+  archiveCommand(clusterId: string, baseUrl: string): { command: string; token: string } {
+    const token = this.archiveToken(clusterId);
+    return { token, command: `/etc/baas/pitr-archive.sh ${baseUrl.replace(/\/+$/, "")} ${clusterId} ${token} %p %f` };
+  }
+
   /** Delete what a removed cluster left behind. */
   async forgetCluster(id: string): Promise<void> {
+    if (this.store) { await this.store.deletePrefix(`${id}/`).catch(() => {}); return; }
     if (id !== MAIN) await rm(join(this.opts.baseDir, id), { recursive: true, force: true });
   }
 
@@ -256,19 +330,19 @@ export class PitrService {
     if (Number.isNaN(to.getTime())) throw new HttpError(400, "to must be a date and time");
     if (to.getTime() > Date.now()) throw new HttpError(400, "to is in the future");
     const t = await this.target(project.cluster_id);
-    if (t.archiveDir === null) throw new HttpError(409, `point-in-time recovery is not set up for cluster ${t.id}: it has no WAL archive directory registered`);
-    const archiveDir = t.archiveDir;
+    if (!t.archived) throw new HttpError(409, `point-in-time recovery is not set up for cluster ${t.id}: it has no WAL archive directory registered`);
     const st = await this.status(t.id);
     if (!st.enabled) throw new HttpError(409, "point-in-time recovery is not set up on this server (WAL archiving is off)");
     // A project that moved here has no history here from before it arrived; what came earlier lives on the cluster it left.
     const arrived = (await this.control.pool.query<{ at: Date }>(`SELECT max(at) AS at FROM audit_log WHERE action = 'project.move' AND target = $1 AND meta->>'to' = $2`, [ref, t.id])).rows[0]!.at;
     if (arrived && to < arrived) throw new HttpError(400, `this project moved onto cluster ${t.id} at ${arrived.toISOString()}, so it can only be restored to a moment after that`);
-    const base = (await this.control.pool.query<{ id: string; path: string; finished_at: Date }>(
-      `SELECT id, path, finished_at FROM pitr_base_backups WHERE status = 'complete' AND cluster_id = $2 AND finished_at <= $1 ORDER BY finished_at DESC LIMIT 1`, [to, t.id])).rows[0];
+    const base = (await this.control.pool.query<{ id: string; path: string; finished_at: Date; start_wal: string | null }>(
+      `SELECT id, path, finished_at, start_wal FROM pitr_base_backups WHERE status = 'complete' AND cluster_id = $2 AND finished_at <= $1 ORDER BY finished_at DESC LIMIT 1`, [to, t.id])).rows[0];
     if (!base) throw new HttpError(400, st.window ? `the earliest moment that can be restored is ${st.window.earliest.toISOString()}` : "no base backup exists yet");
     if (this.busy.has(t.id)) throw new HttpError(409, "a base backup or recovery is already running on this cluster");
     this.busy.add(t.id);
     const scratch = join(this.opts.scratchDir, `recover-${base.id.slice(0, 8)}-${Date.now()}`);
+    const walCache = `${scratch}-wal`;
     let proc: ChildProcess | null = null;
     try {
       await this.checkVersions(t);
@@ -276,7 +350,22 @@ export class PitrService {
       const user = await this.resolveUser();
       await mkdir(this.opts.scratchDir, { recursive: true, mode: 0o700 });
       if (user) await chmod(this.opts.scratchDir, 0o711); // the recovery user has to be able to reach its copy
-      await cp(base.path, scratch, { recursive: true });
+      if (this.store) {
+        // Pull the base backup and the WAL since it began out of the shared store into scratch space.
+        const tarball = `${scratch}.tar.gz`;
+        await mkdir(scratch, { recursive: true, mode: 0o700 });
+        if (!(await this.store.getToFile(base.path, tarball))) throw new Error("the base backup is missing from the store");
+        await run("tar", ["-xzf", tarball, "-C", scratch]);
+        await rm(tarball, { force: true });
+        await mkdir(walCache, { recursive: true, mode: 0o755 });
+        for (const k of await this.store.list(`${t.id}/wal/`)) {
+          const name = k.slice(k.lastIndexOf("/") + 1);
+          if (/^[0-9A-F]{24}$/.test(name) ? name >= (base.start_wal ?? "") : /^[0-9A-F]{8}\.history$/.test(name)) {
+            await this.store.getToFile(k, join(walCache, name));
+            await chmod(join(walCache, name), 0o644);
+          }
+        }
+      } else await cp(base.path, scratch, { recursive: true });
       await chmod(scratch, 0o700);
       const port = await freePort();
       const settings = await this.admin(t, async (c) => Object.fromEntries((await c.query<{ name: string; setting: string }>(
@@ -292,7 +381,7 @@ export class PitrService {
         `lc_messages = 'C'`, `lc_monetary = 'C'`, `lc_numeric = 'C'`, `lc_time = 'C'`, `ssl = off`, `listen_addresses = ''`, `port = ${port}`,
         `unix_socket_directories = ${q(scratch)}`, `hba_file = ${q(join(scratch, "baas_hba.conf"))}`,
         `fsync = off`, `synchronous_commit = off`, `full_page_writes = off`, `log_min_messages = warning`,
-        `restore_command = ${q(`cp "${archiveDir}/%f" "%p"`)}`,
+        `restore_command = ${q(`cp "${this.store ? walCache : t.archiveDir}/%f" "%p"`)}`,
         `recovery_target_time = ${q(to.toISOString().replace("T", " ").replace("Z", "+00"))}`, `recovery_target_action = 'promote'`, `recovery_target_inclusive = on`,
       ].join("\n") + "\n");
       await writeFile(join(scratch, "recovery.signal"), "");
@@ -344,6 +433,7 @@ export class PitrService {
     } finally {
       if (proc) await stopServer(proc).catch(() => {});
       await rm(scratch, { recursive: true, force: true });
+      await rm(walCache, { recursive: true, force: true });
       this.busy.delete(t.id);
     }
   }

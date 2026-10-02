@@ -1,0 +1,25 @@
+# Point-in-time recovery with nothing shared at the filesystem level: Postgres uploads each WAL segment to baas over HTTP, and baas
+# keeps the archive and the base backups in its shared store (S3 if S3_* is set, else Postgres), so any baas node can take a base
+# backup or run a recovery.
+#   docker compose -f docker-compose.yml -f docker-compose.pitr-shared.yml up -d
+# Set BAAS_PITR_ARCHIVE_TOKEN (32+ characters, for example `openssl rand -hex 24`) in .env: Postgres presents it when uploading.
+# Prefer S3 for a busy database: in Postgres the archive lives in the control database, which then carries the WAL volume too.
+services:
+  postgres:
+    command: >
+      postgres -c max_connections=500 -c wal_level=replica -c archive_mode=on
+      -c archive_command='/etc/baas/pitr-archive.sh http://baas:8080 main ${BAAS_PITR_ARCHIVE_TOKEN:?set BAAS_PITR_ARCHIVE_TOKEN} %p %f'
+      -c max_wal_senders=5 -c hba_file=/etc/baas/pg_hba.conf
+    volumes:
+      - ./deploy/pg_hba_pitr.conf:/etc/baas/pg_hba.conf:ro
+      - ./deploy/pitr-archive.sh:/etc/baas/pitr-archive.sh:ro
+  baas:
+    environment:
+      BAAS_PITR_SHARED: "true"
+      BAAS_PITR_ARCHIVE_TOKEN: ${BAAS_PITR_ARCHIVE_TOKEN:?set BAAS_PITR_ARCHIVE_TOKEN}
+      BAAS_PITR_RETENTION_DAYS: ${BAAS_PITR_RETENTION_DAYS:-7}
+      BAAS_PITR_BASE_EVERY_HOURS: ${BAAS_PITR_BASE_EVERY_HOURS:-24}
+    volumes:
+      - pitr:/data/pitr          # scratch space for a recovery only
+volumes:
+  pitr:
