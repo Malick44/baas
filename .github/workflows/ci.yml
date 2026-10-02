@@ -49,7 +49,7 @@ jobs:
   compose-smoke:
     name: docker compose smoke test
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq jq curl
@@ -59,8 +59,13 @@ jobs:
             -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2 caddy validate --config /etc/caddy/Caddyfile
           POSTGRES_PASSWORD=x BAAS_MASTER_KEY=x BAAS_BOOTSTRAP_TOKEN=x DOMAIN=example.com DASHBOARD_HOST=baas.example.com ACME_EMAIL=ci@example.com \
             docker compose -f docker-compose.yml -f docker-compose.tls.yml config --quiet
-      - name: The point-in-time recovery overlay is valid
-        run: POSTGRES_PASSWORD=x BAAS_MASTER_KEY=x BAAS_BOOTSTRAP_TOKEN=x docker compose -f docker-compose.yml -f docker-compose.pitr.yml config --quiet
+      - name: The point-in-time recovery and multi-node overlays are valid
+        run: |
+          POSTGRES_PASSWORD=x BAAS_MASTER_KEY=x BAAS_BOOTSTRAP_TOKEN=x docker compose -f docker-compose.yml -f docker-compose.pitr.yml config --quiet
+          POSTGRES_PASSWORD=x BAAS_MASTER_KEY=x BAAS_BOOTSTRAP_TOKEN=x docker compose -f docker-compose.yml -f docker-compose.nodes.yml config --quiet
+          docker run --rm -v "$PWD/deploy/Caddyfile.lb:/etc/caddy/Caddyfile:ro" caddy:2 caddy validate --config /etc/caddy/Caddyfile
       - run: scripts/smoke.sh
       - name: Smoke test with WAL archiving, restoring a project to a moment in time
         run: SMOKE_PITR=1 scripts/smoke.sh
+      - name: Smoke test with two nodes behind a load balancer, stopping the leader
+        run: SMOKE_NODES=2 scripts/smoke.sh

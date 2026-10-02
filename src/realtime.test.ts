@@ -81,7 +81,7 @@ describe("realtime", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
   };
 
   before(async () => {
-    h = await makeHarness(ADMIN!, (pm) => ({ services: { realtime: new RealtimeHub(pm, ADMIN!, { checkMs: 300, maxSubsPerConn: 3 }) } }));
+    h = await makeHarness(ADMIN!, (pm) => ({ services: { realtime: new RealtimeHub(pm, { checkMs: 300, maxSubsPerConn: 3 }) } }));
     port = await h.listen();
     [a, b] = await Promise.all([h.project(), h.project()]);
     for (const p of [a, b])

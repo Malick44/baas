@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { hashPassword, verifyPassword } from "./authsvc.js";
+import { MemoryLimits, type Limits } from "./limits.js";
 import { NoMailer, type Mailer } from "./mailer.js";
 import { matchStep, newSecret, otpauthUri } from "./totp.js";
 import type { Vault } from "./vault.js";
@@ -13,7 +14,7 @@ const MIN_PASSWORD = 8;
 const MAX_FAILS = 10;
 const FAIL_WINDOW_MS = 15 * 60_000;
 
-export type MembersOptions = { vault?: Vault; mailer?: Mailer; /** Where the dashboard is reached, for links in emails. Without it, emailed resets are off. */ dashboardUrl?: string; issuer?: string };
+export type MembersOptions = { limits?: Limits; vault?: Vault; mailer?: Mailer; /** Where the dashboard is reached, for links in emails. Without it, emailed resets are off. */ dashboardUrl?: string; issuer?: string };
 export type MfaChallenge = { mfa_required: true; mfa_token: string };
 const RESET_MS = 3600_000;
 const TICKET_MS = 5 * 60_000;
@@ -36,14 +37,13 @@ function checkEmail(e: unknown): string {
 
 /** Dashboard accounts: password sign-in, invitations and roles, on top of the control plane's token model. */
 export class Members {
-  /** Recent failed sign-ins per address, so a password cannot be guessed by trying forever. */
-  private fails = new Map<string, number[]>();
-
   private mailer: Mailer;
-  private resetSent = new Map<string, number>();
+  /** Recent failed sign-ins per address (so a password cannot be guessed by trying forever) and reset-mail cooldowns, shared across nodes. */
+  private limits: Limits;
 
   constructor(private readonly control: ControlPlane, private readonly opts: MembersOptions = {}) {
     this.mailer = opts.mailer ?? new NoMailer();
+    this.limits = opts.limits ?? new MemoryLimits();
   }
 
   get emailResetAvailable() {
@@ -54,11 +54,11 @@ export class Members {
     return this.control.pool;
   }
 
-  private throttled(key: string): boolean {
-    const now = Date.now();
-    const recent = (this.fails.get(key) ?? []).filter((t) => now - t < FAIL_WINDOW_MS);
-    this.fails.set(key, recent);
-    return recent.length >= MAX_FAILS;
+  private async throttled(key: string): Promise<boolean> {
+    return (await this.limits.count(`member-fail:${key}`)) >= MAX_FAILS;
+  }
+  private fail(key: string) {
+    return this.limits.hit(`member-fail:${key}`, FAIL_WINDOW_MS);
   }
 
   private async session(m: MemberView & { org_id: string }): Promise<Session> {
@@ -75,11 +75,11 @@ export class Members {
   async login(email: unknown, password: unknown): Promise<Session | MfaChallenge> {
     if (typeof email !== "string" || typeof password !== "string") throw new HttpError(400, "email and password are required");
     const key = email.trim().toLowerCase();
-    if (this.throttled(key)) throw new HttpError(429, "too many failed sign-ins; try again in a few minutes", { "retry-after": "900" });
+    if (await this.throttled(key)) throw new HttpError(429, "too many failed sign-ins; try again in a few minutes", { "retry-after": "900" });
     const m = (await this.pool.query(`SELECT id, org_id, email, name, role, password_hash FROM members WHERE lower(email) = $1`, [key])).rows[0];
     const ok = await verifyPassword(password, m?.password_hash ?? null);
     if (!m || !ok) {
-      this.fails.set(key, [...(this.fails.get(key) ?? []), Date.now()]);
+      await this.fail(key);
       throw new HttpError(401, "invalid email or password");
     }
     if ((await this.pool.query(`SELECT 1 FROM member_factors WHERE member_id = $1 AND status = 'verified'`, [m.id])).rowCount) {
@@ -89,7 +89,7 @@ export class Members {
       await this.pool.query(`INSERT INTO member_mfa_tickets (member_id, token_hash, expires_at) VALUES ($1, $2, $3)`, [m.id, hash(ticket), new Date(Date.now() + TICKET_MS)]);
       return { mfa_required: true, mfa_token: ticket };
     }
-    this.fails.delete(key);
+    await this.limits.clear(`member-fail:${key}`);
     await this.control.audit(`member:${m.id}`, m.org_id, "member.login", m.id);
     return this.session(m);
   }
@@ -102,13 +102,13 @@ export class Members {
     if (!t) throw new HttpError(401, "this sign-in has expired; start again");
     const m = (await this.pool.query(`SELECT id, org_id, email, name, role FROM members WHERE id = $1`, [t.member_id])).rows[0];
     const key = m.email.toLowerCase();
-    if (this.throttled(key)) throw new HttpError(429, "too many failed sign-ins; try again in a few minutes", { "retry-after": "900" });
+    if (await this.throttled(key)) throw new HttpError(429, "too many failed sign-ins; try again in a few minutes", { "retry-after": "900" });
     if (!(await this.checkSecondFactor(t.member_id, code))) {
-      this.fails.set(key, [...(this.fails.get(key) ?? []), Date.now()]);
+      await this.fail(key);
       throw new HttpError(401, "that code is not right");
     }
     await this.pool.query(`DELETE FROM member_mfa_tickets WHERE member_id = $1`, [t.member_id]);
-    this.fails.delete(key);
+    await this.limits.clear(`member-fail:${key}`);
     await this.control.audit(`member:${m.id}`, m.org_id, "member.login", m.id, { mfa: true });
     return this.session(m);
   }
@@ -280,9 +280,7 @@ export class Members {
   async forgotPassword(email: unknown): Promise<void> {
     if (!this.emailResetAvailable) throw new HttpError(501, "Email is not set up on this server, so passwords cannot be reset by email. Ask an owner to set a new password for you.");
     const e = checkEmail(email).toLowerCase();
-    const last = this.resetSent.get(e) ?? 0;
-    if (Date.now() - last < RESET_COOLDOWN_MS) return;
-    this.resetSent.set(e, Date.now());
+    if ((await this.limits.hit(`member-reset:${e}`, RESET_COOLDOWN_MS)).count > 1) return;
     const m = (await this.pool.query(`SELECT id, org_id, email FROM members WHERE lower(email) = $1`, [e])).rows[0];
     if (!m) return;
     const token = `baasrst_${randomBytes(24).toString("base64url")}`;

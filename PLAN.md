@@ -21,6 +21,7 @@ Self-hosted, multi-project Supabase-style platform. All six phases of the origin
 | — | **Pipelines**, **Integrations** and **Advisors** (added after the plan): signed webhook delivery of row changes with filters, extension install for Postgres-trusted extensions, read-only security and performance checks (`src/pipelines.ts`, `src/extensions.ts`) | Studio-style features that need the platform's own access, so they are admin-only and parameterized end to end |
 | — | **Ask AI** (added after the plan): LLM tool loop with a database-enforced read-only reader role and human-approved proposals | Requested feature; see README for the safety model |
 | Supavisor pooling | One small `pg.Pool` per project, LRU-evicted | Enough for one node |
+| Multi-node | Built after the plan | Several clusters (`src/clusters.ts`) and several processes (`src/coordinator.ts`, `src/limits.ts`, `docker-compose.nodes.yml`) |
 | PITR | Built after the plan | Base backups plus archived WAL, replayed in a scratch server, one project extracted (`src/pitr.ts`, `docker-compose.pitr.yml`) |
 
 ## Architecture
@@ -70,4 +71,4 @@ A signed-in user could set their own `app_metadata`, which policies may trust (n
 - **CI.** Nothing runs the 250 unit tests or the browser suite automatically, and `docker compose up` has not been exercised end to end by a test. A workflow plus a compose smoke test (start, create an org and project, make a request) is the next step.
 - **Auth gaps.** Single sign-on for dashboard members; passkeys as a primary (passwordless) sign-in rather than only a second factor; attestation statements are not verified.
 - **Dashboard gaps.** Roles and Publications are read-only; the Schema Visualizer shows relationships but does not edit them; editors are plain textareas without syntax highlighting.
-- **Platform.** A function runner that is a real network boundary (the in-process egress guard is defence in depth); multi-node (shard project databases across clusters, move request logs and rate-limit state to shared storage). Member accounts: SSO.
+- **Platform.** A function runner that is a real network boundary (the in-process egress guard is defence in depth); shared object storage (S3) so nodes need no shared filesystem; point-in-time recovery for projects on added clusters; moving a project without downtime. Member accounts: SSO.

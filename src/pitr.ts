@@ -208,6 +208,7 @@ export class PitrService {
     ControlPlane.require(p, "owner");
     const project = await this.control.getProject(p, ref);
     if (project.status !== "active") throw new HttpError(409, `cannot restore a project that is ${project.status}`);
+    if (project.cluster_id !== "main") throw new HttpError(409, `point-in-time recovery covers the main cluster only, and this project is on cluster ${project.cluster_id}`);
     if (!planOf(project.plan).pitr) throw new HttpError(403, `point-in-time recovery is not part of the ${project.plan} plan`);
     if (Number.isNaN(to.getTime())) throw new HttpError(400, "to must be a date and time");
     if (to.getTime() > Date.now()) throw new HttpError(400, "to is in the future");

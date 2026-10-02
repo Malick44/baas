@@ -23,20 +23,26 @@ const SKIP_RES_HEADERS = new Set(["connection", "content-length", "transfer-enco
 export class FunctionService implements Mountable {
   private running = new Map<string, number>();
   private total = 0;
-  private logs = new Map<string, LogEntry[]>();
+  /** Writes in flight, in order, so a read right after an invocation sees it. */
+  private writes: Promise<unknown> = Promise.resolve();
+  private written = 0;
 
   constructor(private control: ControlPlane, private opts: FunctionOptions) {}
 
-  logsFor(ref: string, name?: string): LogEntry[] {
-    return (this.logs.get(ref) ?? []).filter((l) => !name || l.name === name);
+  /** The newest 200 invocations, from every node (oldest first). */
+  async logsFor(ref: string, name?: string): Promise<LogEntry[]> {
+    await this.writes;
+    const r = await this.control.pool.query<{ at: Date; name: string; status: number | null; ms: number | null; note: string | null }>(
+      `SELECT at, name, status, ms, note FROM function_logs WHERE ref = $1 AND ($2::text IS NULL OR name = $2) ORDER BY id DESC LIMIT 200`, [ref, name ?? null]);
+    return r.rows.reverse().map((x) => ({ at: x.at.toISOString(), name: x.name, status: x.status ?? 0, ms: x.ms ?? 0, ...(x.note ? { note: x.note } : {}) }));
   }
 
   private log(ref: string, e: Omit<LogEntry, "at">) {
-    const list = this.logs.get(ref) ?? [];
-    list.push({ at: new Date().toISOString(), ...e });
-    if (list.length > 200) list.shift();
-    this.logs.set(ref, list);
-    if (this.logs.size > 1000) this.logs.delete(this.logs.keys().next().value!);
+    const at = new Date();
+    this.writes = this.writes.then(async () => {
+      await this.control.pool.query(`INSERT INTO function_logs (ref, at, name, status, ms, note) VALUES ($1, $2, $3, $4, $5, $6)`, [ref, at, e.name, e.status, Math.round(e.ms), e.note ?? null]);
+      if (++this.written % 25 === 0) await this.control.pool.query(`DELETE FROM function_logs WHERE ref = $1 AND id <= (SELECT id FROM function_logs WHERE ref = $1 ORDER BY id DESC OFFSET 200 LIMIT 1)`, [ref]);
+    }).catch(() => {});
   }
 
   mount(app: FastifyInstance, { authenticate }: Helpers): void {

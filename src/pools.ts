@@ -45,7 +45,8 @@ export class PoolManager {
 
   constructor(
     readonly dir: Directory,
-    private adminUrl: string,
+    /** The main cluster; each project carries the address of its own. */
+    _mainAdminUrl: string,
     private opts: { maxPools: number; perPool: number; queryTimeoutMs?: number } = { maxPools: 100, perPool: 5 },
   ) {}
 
@@ -60,14 +61,15 @@ export class PoolManager {
   async pool(ref: string): Promise<{ pool: pg.Pool; url: string; project: Resolved }> {
     const project = await this.active(ref);
     const password = project.secrets!.dbPassword;
+    // Where the database is can change (a project moved to another cluster), and then the old pool must go.
+    const url = urlFor(project.adminUrl, project.dbName, { user: `authenticator_${ref}`, password });
     let e = this.pools.get(ref);
-    if (e && e.password !== password) {
+    if (e && (e.password !== password || e.url !== url)) {
       void e.pool.end().catch(() => {});
       this.pools.delete(ref);
       e = undefined;
     }
     if (!e) {
-      const url = urlFor(this.adminUrl, project.dbName, { user: `authenticator_${ref}`, password });
       const pool = new pg.Pool({ connectionString: url, max: this.opts.perPool, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 5_000 });
       pool.on("error", () => {});
       e = { pool, url, password };

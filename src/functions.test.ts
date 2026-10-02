@@ -160,9 +160,9 @@ describe("edge functions", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () => {
   });
 
   it("records invocation logs", async () => {
-    const logs = svc.logsFor(a.ref, "boom");
+    const logs = await svc.logsFor(a.ref, "boom");
     assert.ok(logs.length >= 1 && logs[0]!.status === 500 && /kaboom/.test(logs[0]!.note ?? ""));
-    assert.deepEqual(svc.logsFor(b.ref), []);
+    assert.deepEqual(await svc.logsFor(b.ref), []);
   });
 
   it("stops a paused project's functions", async () => {

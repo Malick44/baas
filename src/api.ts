@@ -5,6 +5,9 @@ import type { ProjectAdmin } from "./admin-sql.js";
 import type { AiAssistant } from "./ai/assistant.js";
 import type { BackupService } from "./backup.js";
 import type { PitrService } from "./pitr.js";
+import type { ClusterMover } from "./clusters.js";
+import type { Coordinator } from "./coordinator.js";
+import type { Limits } from "./limits.js";
 import { ControlPlane, HttpError, type Principal, type ProjectRow, type Role } from "./control.js";
 import type { AuthService } from "./authsvc.js";
 import type { ExtensionService } from "./extensions.js";
@@ -24,6 +27,10 @@ export type ApiOps = {
   usage?: UsageService;
   backups?: BackupService;
   pitr?: PitrService;
+  mover?: ClusterMover;
+  coordinator?: Coordinator;
+  /** Failed-attempt counters shared by every node. */
+  limits?: Limits;
   functions?: FunctionService;
   ai?: AiAssistant;
   pipelines?: PipelineService;
@@ -46,7 +53,7 @@ export type ApiOps = {
 const ROLES: Role[] = ["developer", "admin", "owner"];
 
 const view = (p: ProjectRow) => ({
-  ref: p.ref, name: p.name, status: p.status, plan: p.plan, created_at: p.created_at, updated_at: p.updated_at,
+  ref: p.ref, name: p.name, status: p.status, plan: p.plan, cluster: p.cluster_id, created_at: p.created_at, updated_at: p.updated_at,
 });
 
 function body(req: FastifyRequest): Record<string, unknown> {
@@ -72,7 +79,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     return reply.code(500).send({ error: "internal error" });
   });
 
-  const members = new Members(control, { vault: ops.vault, mailer: ops.mailer, dashboardUrl: ops.dashboardUrl });
+  const members = new Members(control, { limits: ops.limits, vault: ops.vault, mailer: ops.mailer, dashboardUrl: ops.dashboardUrl });
 
   const bearer = (req: FastifyRequest) => /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
 
@@ -83,16 +90,59 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     return p;
   }
 
-  app.post("/v1/organizations", async (req, reply) => {
+  /** The platform operator's secret: needed to create organisations and to manage infrastructure (clusters, placement). */
+  const operator = (req: FastifyRequest) => {
     const given = Buffer.from(String(req.headers["x-bootstrap-token"] ?? ""));
     const want = Buffer.from(bootstrapToken);
     if (given.length !== want.length || !timingSafeEqual(given, want)) throw new HttpError(401, "invalid bootstrap token");
+  };
+
+  app.post("/v1/organizations", async (req, reply) => {
+    operator(req);
     const b = body(req);
     const { org, ownerToken } = await control.createOrg(text(b.name, "name"), text(b.slug, "slug", 40));
     // Optionally create the first owner's dashboard account in the same call.
     const owner = b.owner_email !== undefined ? await members.bootstrapOwner(org.id, b.owner_email, b.owner_password, b.owner_name) : undefined;
     return reply.code(201).send({ organization: org, owner_token: ownerToken, ...(owner ? { owner } : {}) });
   });
+
+  // ---- nodes (operator only) ----
+
+  if (ops.coordinator) {
+    const nodes = ops.coordinator;
+    app.get("/v1/admin/nodes", async (req) => { operator(req); return nodes.list(); });
+  }
+
+  // ---- clusters (operator only) ----
+
+  app.get("/v1/admin/clusters", async (req) => { operator(req); return control.clusters.list(); });
+  app.post("/v1/admin/clusters", async (req, reply) => {
+    operator(req);
+    const cluster = await control.clusters.add(body(req));
+    await control.audit("operator", null, "cluster.add", cluster.id, { host: cluster.host });
+    return reply.code(201).send(cluster);
+  });
+  app.patch<{ Params: { id: string } }>("/v1/admin/clusters/:id", async (req) => {
+    operator(req);
+    const cluster = await control.clusters.update(req.params.id, body(req));
+    await control.audit("operator", null, "cluster.update", req.params.id, { keys: Object.keys(body(req)) });
+    return cluster;
+  });
+  app.delete<{ Params: { id: string } }>("/v1/admin/clusters/:id", async (req, reply) => {
+    operator(req);
+    await control.clusters.remove(req.params.id);
+    await control.audit("operator", null, "cluster.remove", req.params.id);
+    return reply.code(204).send();
+  });
+  if (ops.mover) {
+    const mover = ops.mover;
+    app.post<{ Params: { ref: string } }>("/v1/admin/projects/:ref/move", async (req) => {
+      operator(req);
+      const to = body(req).cluster;
+      if (typeof to !== "string") throw new HttpError(400, "cluster is required");
+      return mover.move(req.params.ref, to);
+    });
+  }
 
   // ---- dashboard accounts ----
 
@@ -267,7 +317,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
   if (ops.functions) {
     app.get<{ Params: { ref: string; name: string } }>("/v1/projects/:ref/functions/:name/logs", async (req) => {
       const { ref } = await owned(req, "admin");
-      return ops.functions!.logsFor(ref, req.params.name).reverse();
+      return (await ops.functions!.logsFor(ref, req.params.name)).reverse();
     });
   }
 

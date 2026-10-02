@@ -55,7 +55,7 @@ export class RealtimeHub implements Mountable {
   private wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
   private beat?: NodeJS.Timeout;
 
-  constructor(private pm: PoolManager, private adminUrl: string, private opts: RealtimeOptions = {}) {}
+  constructor(private pm: PoolManager, private opts: RealtimeOptions = {}) {}
 
   mount(app: FastifyInstance, { authenticate }: Helpers): void {
     const domainRef = (req: IncomingMessage) => (app as unknown as { refFromHost(h?: string): string | null }).refFromHost?.(req.headers.host) ?? null;
@@ -203,7 +203,7 @@ export class RealtimeHub implements Mountable {
   private async enable(feed: Feed, table: string) {
     if (feed.enabled.has(table)) return;
     const project = await this.pm.active(feed.ref);
-    const c = new pg.Client({ connectionString: urlFor(this.adminUrl, project.dbName) });
+    const c = new pg.Client({ connectionString: urlFor(project.adminUrl, project.dbName) });
     c.on("error", () => {});
     await c.connect();
     try {

@@ -1,0 +1,19 @@
+# Two baas nodes behind a load balancer:  docker compose -f docker-compose.yml -f docker-compose.nodes.yml up -d
+# Both talk to the same Postgres and share the storage and backup volumes. Housekeeping and webhook delivery run on one of
+# them (a leader, elected through Postgres); if it stops, the other takes over. Add more nodes the same way (baas3 ...,
+# and a line for each in deploy/Caddyfile.lb). The load balancer is the only thing published; it listens on 8080 and 8081.
+services:
+  baas:
+    ports: !override []
+  baas2:
+    extends: { file: docker-compose.yml, service: baas }
+    ports: !override []
+  lb:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [baas, baas2]
+    ports:
+      - "8080:8080"   # management API and dashboard
+      - "8081:8081"   # data plane: <ref>.localhost:8081
+    volumes:
+      - ./deploy/Caddyfile.lb:/etc/caddy/Caddyfile:ro

@@ -44,7 +44,7 @@ const platform = await createPlatform({
 if (platform.migrations.length) console.log(`applied migrations: ${platform.migrations.join(", ")}`);
 
 console.log("housekeeping:", JSON.stringify(await platform.housekeep()));
-platform.start();
+platform.start().catch((e) => { console.error("could not start background work:", e); process.exit(1); });
 const ports = await platform.listen({ api: Number(process.env.PORT ?? 8080), gateway: gatewayPort });
 console.log(platform.ai.available ? `AI assistant on (${process.env.BAAS_AI_MODEL ?? "claude-opus-5-5"})` : "AI assistant off (set ANTHROPIC_API_KEY to enable)");
 console.log(`management API + dashboard on :${ports.api}, data plane on :${ports.gateway} (<ref>.${process.env.BAAS_GATEWAY_DOMAIN ?? "localhost"})`);

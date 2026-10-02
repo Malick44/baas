@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import pg from "pg";
 import { isProvider } from "./oauth.js";
 import { PLANS } from "./plans.js";
+import { ClusterRegistry } from "./clusters.js";
 import { checkSyntax } from "./sandbox.js";
 import { dbNameOf, dropProject, newRef, provisionProject, setProjectAccess, type Project } from "./provision.js";
 import type { Vault } from "./vault.js";
@@ -28,6 +29,8 @@ export type ProjectRow = {
   created_at: Date;
   updated_at: Date;
   deleted_at: Date | null;
+  cluster_id: string;
+  moving_to: string | null;
 };
 
 export type ProjectSecrets = { jwtSecret: string; serviceKey: string; anonKey: string; dbPassword: string };
@@ -81,6 +84,9 @@ export type Resolved = {
   plan: string;
   orgId: string;
   dbName: string;
+  /** Which Postgres cluster the project's database lives on, and how to reach it as an administrator. */
+  clusterId: string;
+  adminUrl: string;
   settings: Record<string, unknown>;
   /** Present only while the project is active. */
   secrets?: ProjectSecrets;
@@ -89,13 +95,24 @@ export type Resolved = {
 const hashToken = (t: string) => createHash("sha256").update(t).digest("hex");
 
 export class ControlPlane {
+  /** Where projects live: the main cluster (`adminUrl`) and any added later. */
+  readonly clusters: ClusterRegistry;
+
   constructor(
     readonly pool: pg.Pool,
+    /** The main cluster. Project-specific code asks `adminUrlFor(ref)` instead. */
     readonly adminUrl: string,
     private readonly vault: Vault,
     /** Injectable so tests can simulate a failing provision. */
     private readonly provision: (adminUrl: string, ref: string) => Promise<Project> = provisionProject,
-  ) {}
+  ) {
+    this.clusters = new ClusterRegistry(pool, vault, adminUrl);
+  }
+
+  /** Admin connection URL for the cluster this project's database is on. */
+  adminUrlFor(ref: string): Promise<string> {
+    return this.clusters.adminUrlOfProject(ref);
+  }
 
   static require(p: Principal, min: Role): void {
     if (RANK[p.role] < RANK[min]) throw new HttpError(403, `requires ${min} role`);
@@ -166,18 +183,37 @@ export class ControlPlane {
   async createProject(p: Principal, name: string): Promise<ProjectRow> {
     ControlPlane.require(p, "admin");
     const ref = newRef();
+    // Try the best cluster, and if it cannot provision (down, out of disk), the next best, so one sick cluster does not stop creation.
+    const tried = new Set<string>();
+    let cluster = await this.clusters.pick();
+    let adminUrl = await this.clusters.adminUrl(cluster);
     try {
-      await this.pool.query(`INSERT INTO projects (ref, org_id, name, status, db_name) VALUES ($1, $2, $3, 'provisioning', $4)`, [ref, p.orgId, name, dbNameOf(ref)]);
+      await this.pool.query(`INSERT INTO projects (ref, org_id, name, status, db_name, cluster_id) VALUES ($1, $2, $3, 'provisioning', $4, $5)`, [ref, p.orgId, name, dbNameOf(ref), cluster]);
     } catch (err) {
       if ((err as { code?: string }).code === "23505") throw new HttpError(409, "a project with that name already exists");
       throw err;
     }
-    let project: Project;
-    try {
-      project = await this.provision(this.adminUrl, ref);
-    } catch (err) {
+    let project: Project | undefined;
+    let lastError: unknown;
+    for (;;) {
+      try {
+        project = await this.provision(adminUrl, ref);
+        break;
+      } catch (err) {
+        lastError = err;
+        await dropProject(adminUrl, ref).catch(() => {});
+        tried.add(cluster); // only for this creation: one failed attempt does not mark a cluster unhealthy for everyone
+        let next: string | null = null;
+        try { next = await this.clusters.pick(tried); } catch { /* nothing left to try */ }
+        if (!next) break;
+        cluster = next;
+        adminUrl = await this.clusters.adminUrl(cluster);
+        await this.pool.query(`UPDATE projects SET cluster_id = $2 WHERE ref = $1`, [ref, cluster]);
+      }
+    }
+    if (!project) {
       await this.setStatus(ref, ["provisioning"], "failed");
-      await this.audit(p.tokenId, p.orgId, "project.create_failed", ref, { error: (err as Error).message });
+      await this.audit(p.tokenId, p.orgId, "project.create_failed", ref, { error: (lastError as Error).message });
       throw new HttpError(500, "provisioning failed");
     }
     try {
@@ -188,7 +224,7 @@ export class ControlPlane {
       await this.pool.query(`INSERT INTO project_settings (ref) VALUES ($1)`, [ref]);
     } catch (err) {
       // Never leave a database whose secrets we did not keep.
-      await dropProject(this.adminUrl, ref).catch(() => {});
+      await dropProject(adminUrl, ref).catch(() => {});
       await this.setStatus(ref, ["provisioning"], "failed");
       throw err;
     }
@@ -223,7 +259,7 @@ export class ControlPlane {
     const row = await this.setStatus(ref, from, to);
     if (!row) throw new HttpError(409, `cannot ${action} a project that is ${current.status}`);
     try {
-      await setProjectAccess(this.adminUrl, ref, access);
+      await setProjectAccess(await this.adminUrlFor(ref), ref, access);
     } catch (err) {
       // Keep the recorded state truthful about what the database allows.
       await this.pool.query(`UPDATE projects SET status = $2, updated_at = now(), deleted_at = NULL WHERE ref = $1`, [ref, current.status]);
@@ -246,7 +282,7 @@ export class ControlPlane {
   async systemPause(ref: string, reason: string): Promise<boolean> {
     const row = await this.setStatus(ref, ["active"], "paused");
     if (!row) return false;
-    await setProjectAccess(this.adminUrl, ref, false);
+    await setProjectAccess(await this.adminUrlFor(ref), ref, false);
     await this.audit("system", row.org_id, "project.pause", ref, { reason });
     return true;
   }
@@ -411,7 +447,7 @@ export class ControlPlane {
   async resolve(ref: string): Promise<Resolved | null> {
     if (!/^[a-z0-9]{20}$/.test(ref)) return null;
     const r = await this.pool.query(
-      `SELECT p.status, p.plan, p.db_name, p.org_id, s.jwt_secret_enc, s.service_key_enc, s.db_password_enc, s.anon_key,
+      `SELECT p.status, p.plan, p.db_name, p.org_id, p.cluster_id, s.jwt_secret_enc, s.service_key_enc, s.db_password_enc, s.anon_key,
               coalesce(ps.settings, '{}'::jsonb) AS settings
        FROM projects p LEFT JOIN project_secrets s ON s.ref = p.ref LEFT JOIN project_settings ps ON ps.ref = p.ref
        WHERE p.ref = $1`,
@@ -419,7 +455,7 @@ export class ControlPlane {
     );
     const row = r.rows[0];
     if (!row) return null;
-    const out: Resolved = { ref, status: row.status, plan: row.plan, orgId: row.org_id, dbName: row.db_name, settings: row.settings };
+    const out: Resolved = { ref, status: row.status, plan: row.plan, orgId: row.org_id, dbName: row.db_name, clusterId: row.cluster_id, adminUrl: await this.clusters.adminUrl(row.cluster_id), settings: row.settings };
     if (row.status === "active" && row.jwt_secret_enc) {
       out.secrets = {
         jwtSecret: this.vault.open(row.jwt_secret_enc, ref),
@@ -455,7 +491,7 @@ export class ControlPlane {
     )).rows;
     const purged: string[] = [];
     for (const { ref, org_id } of due) {
-      await dropProject(this.adminUrl, ref);
+      await dropProject(await this.adminUrlFor(ref), ref);
       await this.pool.query(`DELETE FROM project_secrets WHERE ref = $1`, [ref]);
       if (await this.setStatus(ref, ["deleted"], "purged")) {
         await this.audit("system", org_id, "project.purge", ref);
@@ -472,7 +508,7 @@ export class ControlPlane {
       [stuckForMs],
     )).rows;
     for (const { ref, org_id } of stuck) {
-      await dropProject(this.adminUrl, ref);
+      await dropProject(await this.adminUrlFor(ref), ref);
       await this.setStatus(ref, ["provisioning"], "failed");
       await this.audit("system", org_id, "project.reconcile", ref);
     }

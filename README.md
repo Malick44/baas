@@ -148,7 +148,7 @@ Plans (`src/plans.ts`) set request, size and rate limits. Changing a project's p
 - **Point-in-time recovery needs WAL archiving** (below); without it, backups are logical dumps taken daily on the pro plan. Stored files are never part of either.
 - **Bulk inserts** fill keys missing from some rows with `NULL` rather than defaults (PostgREST does the same without `missing=default`).
 - **Realtime** DELETE events carry only the primary key and go to `service_role`, or to other roles only on tables without RLS; filtered subscriptions receive no deletes. One extra query per subscriber per event.
-- **Single node.** One Postgres cluster, one process; request logs and rate-limit state are in memory. No sharding across clusters.
+- **Scaling has edges.** Several baas processes and several Postgres clusters are supported (below), but object files need a filesystem shared by all nodes (a mounted volume, not S3), and the data plane's request rate limit is split between nodes (so it is exact only when a load balancer spreads requests evenly). Moving a project to another cluster takes it offline for the length of a backup and restore. Point-in-time recovery covers the main cluster only.
 - Project and role **names are visible** to SQL run inside a project (`pg_database`, `pg_roles`); secrets are not.
 - Dashboard accounts have no single sign-on, and one account belongs to one organisation.
 
@@ -169,6 +169,32 @@ Tests create and drop their own databases. Without `BAAS_TEST_PG_URL` the databa
 Rough numbers from `scripts/load.ts` on one small machine with Postgres and the platform side by side (32 connections): REST reads 7–9k req/s (p95 5–10 ms), inserts with an RLS check ~7k req/s, public file download ~7k req/s, password login ~130/s (scrypt-bound), function calls ~30/s (a fresh process each). Treat these as an order of magnitude, not a benchmark.
 
 See [PLAN.md](PLAN.md) for the architecture notes and how the build differs from the original plan.
+
+## Scaling out
+
+**More than one baas process.** Run several nodes against the same Postgres and put a load balancer in front:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.nodes.yml up -d     # two nodes + a Caddy balancer on 8080/8081
+npx baas admin nodes                                                       # who is running, and who leads
+```
+
+Nodes share everything that matters through the control database: sessions and keys, settings (a change reaches another node within about two seconds, the length of its short cache), failed-sign-in counts and email/text cooldowns (so guesses spread across nodes still add up), and request and function logs (written in batches, so another node's requests show within a couple of seconds). The jobs that must run once (housekeeping: scheduled backups, base backups, purging, idle pause, measuring; and webhook delivery) run on one node, the **leader**, chosen with a Postgres advisory lock; if it stops, another takes over within seconds. Usage counters are added up from every node. Realtime works from any node, since each listens to the database itself.
+
+What to know: every node must mount the same **storage and backup volumes** (the Compose overlay does this); add a node by copying the `baas2` block and a line in `deploy/Caddyfile.lb`; the per-project **rate limit** (requests per second) is divided by the number of live nodes, so with even balancing the total is the plan's limit, and a lopsided balancer is throttled harder than it needs to be; the **daily quota** is read from the shared counters and can overshoot by a few seconds of traffic per node. The overlay is tested in CI on real containers: two nodes behind the balancer, the leader stopped, the survivor taking over while the project keeps serving.
+
+**More than one Postgres cluster.** One cluster is the default (`BAAS_PG_ADMIN_URL`, called `main`). To spread projects over more servers, register them (the operator secret is needed, because this is infrastructure):
+
+```bash
+export BAAS_BOOTSTRAP_TOKEN=…
+npx baas admin clusters add eu2 --url postgres://postgres:pw@db2.internal:5432/postgres --max-projects 200
+npx baas admin clusters list
+npx baas admin move <project-ref> eu2        # copy a project to another cluster
+npx baas admin clusters update eu2 --drain   # take no new projects (existing ones stay)
+npx baas admin clusters remove eu2           # only when nothing lives on it
+```
+
+New projects go to the active, reachable cluster that is least full (by share of its project limit, else by count); if provisioning fails on one, the next is tried. Everything per project follows it: its REST, auth, storage metadata, realtime, pipelines, backups and usage measurement use the cluster it lives on. A cluster's address is sealed with the platform key and never returned. **Moving** a project cuts its access, dumps it, builds it on the target with the same login password, checks the table and row counts match, switches, and drops the old copy; any failure before the switch gives the project back exactly as it was. Keys, users, sessions, files and settings are unaffected, so tokens issued before the move keep working. Limits: extensions the project uses must exist on the target, roles created by hand with SQL are not carried over (the platform's own are), and a node that dies mid-move leaves the project cut off until housekeeping gives it back (after 30 minutes at most). A cluster being down affects only its own projects. Tested against real extra clusters (`initdb`) in CI.
 
 ## Point-in-time recovery
 

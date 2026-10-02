@@ -144,13 +144,13 @@ export class PipelineService {
   private running = new Set<string>();
   private opts: Required<PipelineOptions>;
 
-  constructor(private pool: pg.Pool, private control: ControlPlane, private pm: PoolManager, private adminUrl: string, private vault: Vault, opts: PipelineOptions = {}) {
+  constructor(private pool: pg.Pool, private control: ControlPlane, private pm: PoolManager, private vault: Vault, opts: PipelineOptions = {}) {
     this.opts = { allowPrivateTargets: false, batchSize: 100, timeoutMs: 10_000, maxFailures: 30, backoffBaseMs: 5_000, maxPerProject: 10, ...opts };
   }
 
   private async withAdmin<T>(ref: string, fn: (c: pg.Client) => Promise<T>): Promise<T> {
     const project = await this.pm.active(ref);
-    const c = new pg.Client({ connectionString: urlFor(this.adminUrl, project.dbName) });
+    const c = new pg.Client({ connectionString: urlFor(project.adminUrl, project.dbName) });
     c.on("error", () => {});
     await c.connect();
     try { return await fn(c); } finally { await c.end().catch(() => {}); }

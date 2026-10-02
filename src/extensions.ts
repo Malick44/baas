@@ -10,11 +10,11 @@ import { urlFor } from "./provision.js";
 const PROTECTED = new Set(["plpgsql", "pgcrypto"]); // the platform's own schema depends on these
 
 export class ExtensionService {
-  constructor(private control: ControlPlane, private pm: PoolManager, private adminUrl: string) {}
+  constructor(private control: ControlPlane, private pm: PoolManager) {}
 
   private async withAdmin<T>(ref: string, fn: (c: pg.Client) => Promise<T>): Promise<T> {
     const project = await this.pm.active(ref);
-    const c = new pg.Client({ connectionString: urlFor(this.adminUrl, project.dbName) });
+    const c = new pg.Client({ connectionString: urlFor(project.adminUrl, project.dbName) });
     c.on("error", () => {});
     await c.connect();
     try { return await fn(c); } finally { await c.end().catch(() => {}); }

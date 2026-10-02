@@ -42,6 +42,11 @@ export class BackupService {
     });
   }
 
+  /** Run pg_dump / pg_restore (or another client tool) against a cluster. */
+  runTool(cmd: string, args: string[], adminUrl: string): Promise<void> {
+    return this.run(cmd, args, adminUrl);
+  }
+
   private file(ref: string, id: string) {
     return join(this.opts.dir, ref, `${id}.dump`);
   }
@@ -59,7 +64,7 @@ export class BackupService {
     await pool.query(`INSERT INTO backups (id, ref, kind, status, path, note) VALUES ($1, $2, $3, 'running', $4, $5)`, [id, ref, kind, path, note ?? null]);
     try {
       await mkdir(join(this.opts.dir, ref), { recursive: true, mode: 0o700 });
-      await this.run("pg_dump", ["-Fc", "-f", path, "-d", dbNameOf(ref)], this.control.adminUrl);
+      await this.run("pg_dump", ["-Fc", "-f", path, "-d", dbNameOf(ref)], await this.control.adminUrlFor(ref));
       const size = (await stat(path)).size;
       const hash = createHash("sha256");
       for await (const chunk of createReadStream(path)) hash.update(chunk);
@@ -134,7 +139,7 @@ export class BackupService {
     const live = dbNameOf(ref);
     const fresh = `${live}_restore`;
     const old = `${live}_old`;
-    const adminUrl = this.control.adminUrl;
+    const adminUrl = await this.control.adminUrlFor(ref);
     const admin = new pg.Client({ connectionString: adminUrl });
     admin.on("error", () => {});
     await admin.connect();

@@ -2930,6 +2930,8 @@ async function settings(body, p) {
           toast("Settings saved", "ok");
         } catch (ex) { toast(ex.message, "bad"); }
       } }, "Save"))),
+    h("div", { class: "card stack" }, h("h3", null, "Placement"),
+      h("p", { id: "placement", class: "muted" }, "Database cluster: ", h("strong", null, p.cluster || "main"), ". Moving a project to another cluster is an operator action (baas admin move).")),
     h("div", { class: "card stack" }, h("h3", null, "Plan"),
       h("div", { class: "row" }, h("select", { id: "set-plan", disabled: !owner }, Object.keys(plans).map((k) => h("option", { value: k, selected: k === p.plan }, k))),
         h("button", { id: "save-plan", disabled: !owner, onclick: async () => { try { await api("PATCH", `/v1/projects/${p.ref}`, { plan: document.getElementById("set-plan").value }); toast("Plan updated", "ok"); await refreshProject(); } catch (ex) { toast(ex.message, "bad"); } } }, "Change plan"),

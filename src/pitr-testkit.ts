@@ -41,3 +41,6 @@ export async function archivingCluster() {
     },
   };
 }
+
+/** A second (or third) ordinary cluster, for multi-cluster tests. */
+export const startCluster = archivingCluster;

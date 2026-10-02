@@ -1516,6 +1516,7 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await page.selectOption("#set-plan", "pro");
     await page.click("#save-plan");
     await toast("Plan updated");
+    assert.equal((await page.textContent("#placement"))!.replace(/\s+/g, " "), "Database cluster: main. Moving a project to another cluster is an operator action (baas admin move).");
     await shot("13-settings");
     await tab("overview");
     assert.equal((await page.locator("header.appbar .chip").first().textContent())!.trim(), "pro");

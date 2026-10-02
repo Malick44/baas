@@ -214,6 +214,40 @@ async function withClient<T>(url: string, fn: (c: pg.Client) => Promise<T>): Pro
 }
 
 /**
+ * The roles and the empty database a project needs on a cluster: shared NOLOGIN roles (idempotent), the project's own
+ * login role with bounded connections and timeouts, and a database only that role may connect to. Used for new projects
+ * and for copying a project to another cluster (with its existing password).
+ */
+export async function createProjectDatabase(adminUrl: string, ref: string, password: string): Promise<void> {
+  assertRef(ref);
+  const dbName = dbNameOf(ref);
+  const user = authenticatorOf(ref);
+  if (!/^[0-9a-f]{20,64}$/.test(password)) throw new Error("invalid database password");
+  await withClient(adminUrl, async (c) => {
+    for (const [role, extra] of [["anon", ""], ["authenticated", ""], ["service_role", "BYPASSRLS"]] as const) {
+      // Idempotent and safe under concurrent provisioning.
+      await c.query(
+        `DO $$ BEGIN
+           CREATE ROLE ${role} NOLOGIN NOINHERIT ${extra};
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$`,
+      );
+    }
+    await c.query(`CREATE ROLE "${user}" LOGIN NOINHERIT PASSWORD '${password}'`);
+    await c.query(`GRANT anon, authenticated, service_role TO "${user}"`);
+    // Noisy-neighbour guards: bounded connections and server-side timeouts for every session of this project.
+    await c.query(`ALTER ROLE "${user}" CONNECTION LIMIT ${CONNECTION_LIMIT}`);
+    await c.query(`ALTER ROLE "${user}" SET statement_timeout = '15s'`);
+    await c.query(`ALTER ROLE "${user}" SET idle_in_transaction_session_timeout = '15s'`);
+    await c.query(`ALTER ROLE "${user}" SET lock_timeout = '5s'`);
+    await c.query(`CREATE DATABASE "${dbName}"`);
+    await c.query(`REVOKE ALL ON DATABASE "${dbName}" FROM PUBLIC`);
+    await c.query(`GRANT CONNECT ON DATABASE "${dbName}" TO "${user}"`);
+    // Lets project admins create schemas in their own database (per-database privilege; no effect elsewhere).
+    await c.query(`GRANT CREATE ON DATABASE "${dbName}" TO service_role`);
+  });
+}
+
+/**
  * Create an isolated project on a shared cluster: its own database, its own JWT
  * secret and keys, and its own login role that can only connect to that database.
  * Shared NOLOGIN roles (anon, authenticated, service_role) carry privileges per
@@ -229,28 +263,7 @@ export async function provisionProject(adminUrl: string, ref?: string): Promise<
   const jwtSecret = newSecret();
 
   try {
-    await withClient(adminUrl, async (c) => {
-      for (const [role, extra] of [["anon", ""], ["authenticated", ""], ["service_role", "BYPASSRLS"]] as const) {
-        // Idempotent and safe under concurrent provisioning.
-        await c.query(
-          `DO $$ BEGIN
-             CREATE ROLE ${role} NOLOGIN NOINHERIT ${extra};
-           EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$`,
-        );
-      }
-      await c.query(`CREATE ROLE "${user}" LOGIN NOINHERIT PASSWORD '${password}'`);
-      await c.query(`GRANT anon, authenticated, service_role TO "${user}"`);
-      // Noisy-neighbour guards: bounded connections and server-side timeouts for every session of this project.
-      await c.query(`ALTER ROLE "${user}" CONNECTION LIMIT ${CONNECTION_LIMIT}`);
-      await c.query(`ALTER ROLE "${user}" SET statement_timeout = '15s'`);
-      await c.query(`ALTER ROLE "${user}" SET idle_in_transaction_session_timeout = '15s'`);
-      await c.query(`ALTER ROLE "${user}" SET lock_timeout = '5s'`);
-      await c.query(`CREATE DATABASE "${dbName}"`);
-      await c.query(`REVOKE ALL ON DATABASE "${dbName}" FROM PUBLIC`);
-      await c.query(`GRANT CONNECT ON DATABASE "${dbName}" TO "${user}"`);
-      // Lets project admins create schemas in their own database (per-database privilege; no effect elsewhere).
-      await c.query(`GRANT CREATE ON DATABASE "${dbName}" TO service_role`);
-    });
+    await createProjectDatabase(adminUrl, ref, password);
 
     await withClient(urlFor(adminUrl, dbName), async (c) => {
       await c.query(`CREATE SCHEMA IF NOT EXISTS auth; CREATE SCHEMA IF NOT EXISTS storage;

@@ -12,6 +12,9 @@ import { ExtensionService } from "./extensions.js";
 import { FunctionService } from "./functions.js";
 import { buildGateway } from "./gateway.js";
 import { mailerFrom, type Mailer } from "./mailer.js";
+import { ClusterMover } from "./clusters.js";
+import { Coordinator } from "./coordinator.js";
+import { PgLimits } from "./limits.js";
 import { PitrService, type PitrOptions } from "./pitr.js";
 import { smsFrom, type SmsSender, type TwilioConfig } from "./sms.js";
 import { migrate } from "./migrate.js";
@@ -91,20 +94,23 @@ export async function createPlatform(cfg: PlatformConfig) {
       return { fileSize: plan.fileSizeBytes, totalBytes: plan.storageBytes };
     },
   });
-  const usage = new UsageService(control, cfg.pgAdminUrl, storage);
+  const coordinator = new Coordinator(pool, cfg.controlUrl, { log: (m) => console.error(`[nodes] ${m}`) });
+  const limits = new PgLimits(pool);
+  const usage = new UsageService(control, cfg.pgAdminUrl, storage, Date.now, () => coordinator.nodeCount());
   const publicUrl = (ref: string) => `${cfg.publicScheme}://${ref}.${cfg.gatewayDomain}${cfg.publicPort ? `:${cfg.publicPort}` : ""}`;
   const functions = new FunctionService(control, { publicUrl, ...cfg.functions });
   const mailer = mailerFrom(cfg.mail);
   const auth = new AuthService(pm, {
-    adminUrl: cfg.pgAdminUrl, vault, mailer, sms: smsFrom(cfg.sms), publicUrl, secureCookies: cfg.publicScheme === "https",
+    adminUrl: cfg.pgAdminUrl, vault, mailer, limits, sms: smsFrom(cfg.sms), publicUrl, secureCookies: cfg.publicScheme === "https",
     log: (m) => console.error(`[auth] ${m}`), ...cfg.auth,
   });
-  const realtime = new RealtimeHub(pm, cfg.pgAdminUrl, { checkMs: cfg.realtimeCheckMs });
+  const realtime = new RealtimeHub(pm, { checkMs: cfg.realtimeCheckMs });
   const backups = new BackupService(control, { dir: cfg.backupDir, pgBinDir: cfg.pgBinDir });
+  const mover = new ClusterMover(control.clusters, pool, vault, backups, cfg.backupDir, (action, ref, orgId, meta) => control.audit("operator", orgId, action, ref, meta), (ref) => dir.forget(ref));
   const pitr = cfg.pitr ? new PitrService(control, backups, { pgBinDir: cfg.pgBinDir, ...cfg.pitr }) : undefined;
   const admin = new ProjectAdmin(pm);
-  const pipelines = new PipelineService(pool, control, pm, cfg.pgAdminUrl, vault, cfg.pipelines);
-  const extensions = new ExtensionService(control, pm, cfg.pgAdminUrl);
+  const pipelines = new PipelineService(pool, control, pm, vault, cfg.pipelines);
+  const extensions = new ExtensionService(control, pm);
   const llm = cfg.ai?.llm ?? (cfg.ai?.model ? new AnthropicLlm({ model: cfg.ai.model, effort: cfg.ai.effort, serverFallbacks: cfg.ai.serverFallbacks }) : undefined);
   const ai = new AiAssistant(control, pm, llm, { queryTimeoutMs: cfg.ai?.queryTimeoutMs, totalTimeoutMs: cfg.ai?.totalTimeoutMs });
 
@@ -113,12 +119,13 @@ export async function createPlatform(cfg: PlatformConfig) {
     alwaysAllow: [...(cfg.dashboardOrigins ?? []), ...(cfg.dashboardHost ? [`https://${cfg.dashboardHost}`] : [])],
   });
   const api: FastifyInstance = buildApi(control, cfg.bootstrapToken, {
-    admin, usage, backups, pitr, functions, ai, pipelines, extensions, auth, vault, mailer,
+    admin, usage, backups, pitr, mover, coordinator, limits, functions, ai, pipelines, extensions, auth, vault, mailer,
     dashboardUrl: cfg.dashboardUrl ?? (cfg.dashboardHost ? `https://${cfg.dashboardHost}` : cfg.dashboardOrigins?.[0]),
     gateway: { domain: cfg.gatewayDomain, scheme: cfg.publicScheme, port: cfg.publicPort },
     dashboardDir: cfg.dashboardDir ?? defaultDashboardDir, dashboardHost: cfg.dashboardHost,
   });
 
+  const platformState: { lastHousekeep?: { at: Date; report: Record<string, unknown> } } = {};
   let timer: NodeJS.Timeout | undefined;
   let pipelineTimer: NodeJS.Timeout | undefined;
 
@@ -146,20 +153,32 @@ export async function createPlatform(cfg: PlatformConfig) {
     await step("measured", () => usage.measure());
     await step("prunedHourly", () => usage.pruneHourly());
     await step("scheduledBackups", () => backups.runScheduled());
+    await step("movesReconciled", () => mover.reconcile());
+    await step("limitsPruned", () => limits.prune());
     if (pitr) await step("pitr", () => pitr.runScheduled());
     return report;
   }
 
   return {
-    cfg, pool, control, pm, dir, storage, usage, functions, realtime, backups, pitr, admin, ai, pipelines, extensions, auth, gateway, api, migrations, housekeep,
+    cfg, pool, control, pm, dir, storage, usage, functions, realtime, backups, pitr, mover, coordinator, limits, admin, ai, pipelines, extensions, auth, gateway, api, migrations, housekeep,
 
-    start(intervalMs = 10 * 60_000) {
+    /**
+     * Start the background work. With several nodes sharing a control database, usage counters flush on every node, but
+     * housekeeping and webhook delivery run only on the leader, so they do not run twice.
+     */
+    async start(intervalMs = 10 * 60_000, pipelineTickMs?: number) {
+      await coordinator.start();
       usage.start();
-      timer = setInterval(() => void housekeep().catch(() => {}), intervalMs);
+      timer = setInterval(() => {
+        if (!coordinator.isLeader()) return;
+        void housekeep().then((report) => { platformState.lastHousekeep = { at: new Date(), report }; }).catch(() => {});
+      }, intervalMs);
       timer.unref();
-      pipelineTimer = setInterval(() => void pipelines.tick().catch(() => {}), cfg.pipelines?.tickMs ?? 5_000);
+      pipelineTimer = setInterval(() => { if (coordinator.isLeader()) void pipelines.tick().catch(() => {}); }, pipelineTickMs ?? cfg.pipelines?.tickMs ?? 5_000);
       pipelineTimer.unref();
     },
+    /** What the periodic housekeeping last did on this node (only the leader runs it). */
+    get lastHousekeep() { return platformState.lastHousekeep; },
 
     async listen(ports: { api: number; gateway: number; host?: string }) {
       const host = ports.host ?? "0.0.0.0";
@@ -173,6 +192,7 @@ export async function createPlatform(cfg: PlatformConfig) {
       if (pipelineTimer) clearInterval(pipelineTimer);
       await gateway.close();
       await api.close();
+      await coordinator.stop();
       await usage.stop();
       await pm.end();
       await pool.end();

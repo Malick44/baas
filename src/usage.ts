@@ -30,11 +30,14 @@ export class UsageService {
   private buckets = new Map<string, { tokens: number; at: number }>();
   private today = new Map<string, { at: number; requests: number }>();
   private overDb = new Set<string>();
-  private logs = new Map<string, RequestLog[]>();
+  /** Requests not yet written to request_logs, so any node can show the logs of requests every node served. */
+  private pendingLogs: Array<RequestLog & { ref: string }> = [];
   private admin: pg.Pool;
   private timer?: NodeJS.Timeout;
+  private logTimer?: NodeJS.Timeout;
 
-  constructor(private control: ControlPlane, adminUrl: string, private storage?: StorageService, private now: () => number = Date.now) {
+  constructor(private control: ControlPlane, adminUrl: string, private storage?: StorageService, private now: () => number = Date.now,
+    /** How many nodes share the load; each enforces its share of the rate limit. */ private nodes: () => number = () => 1) {
     this.admin = new pg.Pool({ connectionString: adminUrl, max: 2 });
     this.admin.on("error", () => {});
   }
@@ -42,10 +45,14 @@ export class UsageService {
   start(flushMs = 10_000) {
     this.timer = setInterval(() => void this.flush().catch(() => {}), flushMs);
     this.timer.unref();
+    // Request logs go out sooner than counters, so what another node served shows up within a couple of seconds.
+    this.logTimer = setInterval(() => void this.flushLogs().catch(() => {}), Math.min(flushMs, 2_000));
+    this.logTimer.unref();
   }
 
   async stop() {
     if (this.timer) clearInterval(this.timer);
+    if (this.logTimer) clearInterval(this.logTimer);
     await this.flush().catch(() => {});
     await this.admin.end().catch(() => {});
   }
@@ -75,10 +82,13 @@ export class UsageService {
 
   async admit(ref: string, project: Resolved, req: FastifyRequest): Promise<void> {
     const plan = planOf(project.plan);
-    // Token bucket: `burst` requests at once, refilled at `rps` per second.
+    // Token bucket: `burst` requests at once, refilled at `rps` per second. With several nodes behind a load balancer each
+    // takes its share, so the total stays at the plan's limit when traffic is spread evenly (and is stricter when it is not).
+    const share = Math.max(1, this.nodes());
+    const burst = Math.max(1, plan.burst / share), rps = plan.rps / share;
     const t = this.now();
-    const b = this.buckets.get(ref) ?? { tokens: plan.burst, at: t };
-    b.tokens = Math.min(plan.burst, b.tokens + ((t - b.at) / 1000) * plan.rps);
+    const b = this.buckets.get(ref) ?? { tokens: burst, at: t };
+    b.tokens = Math.min(burst, b.tokens + ((t - b.at) / 1000) * rps);
     b.at = t;
     if (b.tokens < 1) {
       this.buckets.set(ref, b);
@@ -106,15 +116,36 @@ export class UsageService {
     if (status >= 500) b.serverErrors++;
     else if (status >= 400) b.clientErrors++;
     this.hourly.set(key, b);
-    const list = this.logs.get(ref) ?? [];
-    list.push({ at: new Date(this.now()).toISOString(), method: req.method, path: req.url.split("?")[0]!.slice(0, 200), status, ms });
-    if (list.length > 200) list.shift();
-    this.logs.set(ref, list);
-    if (this.logs.size > 2000) this.logs.delete(this.logs.keys().next().value!);
+    this.pendingLogs.push({ ref, at: new Date(this.now()).toISOString(), method: req.method, path: req.url.split("?")[0]!.slice(0, 200), status, ms });
+    if (this.pendingLogs.length > 5000) this.pendingLogs.splice(0, this.pendingLogs.length - 5000);
   }
 
-  logsFor(ref: string): RequestLog[] {
-    return [...(this.logs.get(ref) ?? [])].reverse();
+  /** Write waiting request logs (the newest 50 per project per round, which is plenty for a debugging aid) and keep 200 per project. */
+  private async flushLogs(only?: string): Promise<void> {
+    const mine = only === undefined ? this.pendingLogs : this.pendingLogs.filter((l) => l.ref === only);
+    if (!mine.length) return;
+    this.pendingLogs = only === undefined ? [] : this.pendingLogs.filter((l) => l.ref !== only);
+    const byRef = new Map<string, Array<RequestLog & { ref: string }>>();
+    for (const l of mine) byRef.set(l.ref, [...(byRef.get(l.ref) ?? []), l].slice(-50));
+    try {
+      for (const [ref, list] of byRef) {
+        await this.control.pool.query(
+          `INSERT INTO request_logs (ref, at, method, path, status, ms) SELECT $1, * FROM unnest($2::timestamptz[], $3::text[], $4::text[], $5::int[], $6::int[])`,
+          [ref, list.map((l) => l.at), list.map((l) => l.method), list.map((l) => l.path), list.map((l) => l.status), list.map((l) => Math.min(2_000_000_000, Math.round(l.ms)))],
+        );
+        await this.control.pool.query(`DELETE FROM request_logs WHERE ref = $1 AND id <= (SELECT id FROM request_logs WHERE ref = $1 ORDER BY id DESC OFFSET 200 LIMIT 1)`, [ref]);
+      }
+    } catch {
+      this.pendingLogs = [...mine, ...this.pendingLogs].slice(-5000); // try again next time
+    }
+  }
+
+  /** The newest 200 requests the project's data plane served, from every node. */
+  async logsFor(ref: string): Promise<RequestLog[]> {
+    await this.flushLogs(ref);
+    const r = await this.control.pool.query<{ at: Date; method: string; path: string; status: number; ms: number }>(
+      `SELECT at, method, path, status, ms FROM request_logs WHERE ref = $1 ORDER BY id DESC LIMIT 200`, [ref]);
+    return r.rows.map((x) => ({ at: x.at.toISOString(), method: x.method, path: x.path, status: x.status, ms: x.ms }));
   }
 
   private async flushHourly(): Promise<void> {
@@ -176,6 +207,7 @@ export class UsageService {
   /** Write buffered counters to the control database. */
   async flush(): Promise<void> {
     await this.flushHourly();
+    await this.flushLogs();
     const batch = [...this.pending.entries()].filter(([, c]) => c.requests || c.errors || c.egress);
     this.pending = new Map([...this.pending.entries()].filter(([ref]) => !batch.some(([r]) => r === ref)).map(([k, v]) => [k, v]));
     for (const [ref, c] of batch) {
@@ -199,10 +231,22 @@ export class UsageService {
 
   /** Measure database and storage size for every active project and refresh over-quota flags. */
   async measure(): Promise<void> {
-    const dbs = new Map((await this.admin.query<{ datname: string; bytes: string }>(`SELECT datname, pg_database_size(datname)::text AS bytes FROM pg_database WHERE datname LIKE 'proj\\_%'`)).rows.map((r) => [r.datname, Number(r.bytes)]));
-    const projects = (await this.control.pool.query<{ ref: string; db_name: string; plan: string }>(`SELECT ref, db_name, plan FROM projects WHERE status IN ('active', 'paused')`)).rows;
+    // Every cluster is asked, since projects are spread over them; a cluster that cannot be reached keeps its projects' last measurement.
+    const dbs = new Map<string, number>();
+    const down = new Set<string>();
+    for (const cl of await this.control.clusters.all()) {
+      const c = cl.id === "main" ? null : new pg.Client({ connectionString: cl.adminUrl, connectionTimeoutMillis: 5000 });
+      try {
+        let q: pg.QueryResult<{ datname: string; bytes: string }>;
+        if (c) { c.on("error", () => {}); await c.connect(); q = await c.query(`SELECT datname, pg_database_size(datname)::text AS bytes FROM pg_database WHERE datname LIKE 'proj\\_%'`); }
+        else q = await this.admin.query(`SELECT datname, pg_database_size(datname)::text AS bytes FROM pg_database WHERE datname LIKE 'proj\\_%'`);
+        for (const r of q.rows) dbs.set(`${cl.id}/${r.datname}`, Number(r.bytes));
+      } catch { down.add(cl.id); /* leave this cluster's projects as they were */ } finally { await c?.end().catch(() => {}); }
+    }
+    const projects = (await this.control.pool.query<{ ref: string; db_name: string; plan: string; cluster_id: string }>(`SELECT ref, db_name, plan, cluster_id FROM projects WHERE status IN ('active', 'paused')`)).rows;
     for (const p of projects) {
-      const dbBytes = dbs.get(p.db_name) ?? 0;
+      if (down.has(p.cluster_id)) continue;
+      const dbBytes = dbs.get(`${p.cluster_id}/${p.db_name}`) ?? 0;
       let storageBytes = 0;
       if (this.storage) storageBytes = await this.storage.totalBytes(p.ref).catch(() => 0);
       await this.control.pool.query(

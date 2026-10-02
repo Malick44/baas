@@ -17,19 +17,23 @@ BAAS_MASTER_KEY=$(openssl rand -hex 32)
 BAAS_BOOTSTRAP_TOKEN=$BOOT
 BAAS_PUBLIC_PORT=$GW_PORT
 ENV
+if [ "${SMOKE_NODES:-}" = 2 ]; then PUBLISHER=lb; else PUBLISHER=baas; fi   # whatever is in front publishes the ports
 cat > "$OVERRIDE" <<YML
 services:
-  baas:
+  $PUBLISHER:
     ports: !override
       - "127.0.0.1:$API_PORT:8080"
       - "127.0.0.1:$GW_PORT:8081"
 YML
 # SMOKE_PITR=1 also runs the stack with WAL archiving (docker-compose.pitr.yml) and restores to a moment.
+# SMOKE_NODES=2 runs two baas nodes behind a load balancer (docker-compose.nodes.yml) and kills the leader.
 PITR_FILE=()
+NODES_FILE=()
+[ "${SMOKE_NODES:-}" = 2 ] && NODES_FILE=(-f docker-compose.nodes.yml)
 EXTRA_FILE=()
 [ -n "${SMOKE_EXTRA_COMPOSE:-}" ] && EXTRA_FILE=(-f "$SMOKE_EXTRA_COMPOSE")   # for environments that need extra build settings (a proxy CA)
 [ "${SMOKE_PITR:-}" = 1 ] && PITR_FILE=(-f docker-compose.pitr.yml)
-compose() { docker compose --env-file "$ENVF" -f docker-compose.yml "${PITR_FILE[@]}" -f "$OVERRIDE" "${EXTRA_FILE[@]}" "$@"; }
+compose() { docker compose --env-file "$ENVF" -f docker-compose.yml "${PITR_FILE[@]}" "${NODES_FILE[@]}" -f "$OVERRIDE" "${EXTRA_FILE[@]}" "$@"; }
 
 cleanup() {
   status=$?
@@ -120,6 +124,40 @@ if [ "${SMOKE_PITR:-}" = 1 ]; then
   [ "$(jq -r .safety_backup <<<"$RESTORED")" != null ] || fail "restore answered: $RESTORED"; echo "ok  restore to $MOMENT"
   expect "rows after the moment are gone" 2 "$(sql "select count(*) from public.ledger" | jq -r '.results[0].rows[0][0]')"
   expect "the dropped table is back" 1 "$(sql "select count(*) from public.todos where title = 'from the smoke test'" | jq -r '.results[0].rows[0][0]')"
+fi
+
+if [ "${SMOKE_NODES:-}" = 2 ]; then
+  step "two nodes behind a load balancer"
+  op() { curl -fsS -H "x-bootstrap-token: $BOOT" "http://127.0.0.1:$API_PORT$1"; }
+  for _ in $(seq 1 30); do [ "$(op /v1/admin/nodes | jq length)" = 2 ] && break; sleep 2; done
+  NODES=$(op /v1/admin/nodes)
+  expect "two nodes are alive" 2 "$(jq length <<<"$NODES")"
+  expect "exactly one is the leader" 1 "$(jq '[.[] | select(.leader)] | length' <<<"$NODES")"
+  for i in 1 2 3 4 5 6; do expect "request $i through the balancer" 200 "$(gw GET /rest/v1/todos -H "apikey: $ANON" -H "authorization: Bearer $USER_TOKEN" -o /dev/null -w '%{http_code}')"; done
+
+  LEADER_HOST=$(jq -r '.[] | select(.leader) | .host' <<<"$NODES" | cut -d: -f1)
+  LEADER_SVC=""
+  for svc in baas baas2; do id=$(compose ps -q "$svc"); [ "${id:0:12}" = "$LEADER_HOST" ] && LEADER_SVC=$svc; done
+  [ -n "$LEADER_SVC" ] || fail "could not tell which service leads ($LEADER_HOST)"
+  echo "ok  $LEADER_SVC leads; stopping it"
+  compose stop "$LEADER_SVC" >/dev/null
+  SURVIVED=""
+  for _ in $(seq 1 45); do
+    N=$(op /v1/admin/nodes 2>/dev/null || echo '[]')
+    if [ "$(jq length <<<"$N")" = 1 ] && [ "$(jq -r '.[0].leader' <<<"$N")" = true ]; then SURVIVED=1; break; fi
+    sleep 2
+  done
+  [ -n "$SURVIVED" ] || fail "the surviving node did not take over: $N"; echo "ok  the other node took over leadership"
+  expect "the project is still served" 200 "$(gw GET /rest/v1/todos -H "apikey: $ANON" -H "authorization: Bearer $USER_TOKEN" -o /dev/null -w '%{http_code}')"
+  expect "writes still work" 201 "$(gw POST /rest/v1/todos -H "apikey: $ANON" -H "authorization: Bearer $USER_TOKEN" -H 'content-type: application/json' -d '{"title":"written with one node down"}' -o /dev/null -w '%{http_code}')"
+  compose start "$LEADER_SVC" >/dev/null
+  BACK=""
+  for _ in $(seq 1 45); do
+    N=$(op /v1/admin/nodes 2>/dev/null || echo '[]')
+    if [ "$(jq length <<<"$N")" = 2 ] && [ "$(jq '[.[] | select(.leader)] | length' <<<"$N")" = 1 ]; then BACK=1; break; fi
+    sleep 2
+  done
+  [ -n "$BACK" ] || fail "the stopped node did not rejoin: $N"; echo "ok  the stopped node rejoined as a follower"
 fi
 
 step "certificate check used by the TLS proxy"

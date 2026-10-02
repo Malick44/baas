@@ -27,6 +27,9 @@ const USAGE = `baas <command>
   db status [--dir baas/migrations]
   functions list | deploy <name> <file> [--no-verify-jwt] | delete <name> | logs <name>
   backups list | create [--note <text>] | restore <id>
+  admin clusters list | add <id> --url <postgres-admin-url> [--name <n>] [--max-projects <n>] | update <id> [--drain|--activate] [--max-projects <n>|--unlimited] [--url <u>] | remove <id>
+  admin nodes                             the running baas nodes and which one leads
+  admin move <ref> <cluster>              copy a project to another Postgres cluster (operator secret: BAAS_BOOTSTRAP_TOKEN)
   pitr status | base-backup | restore --to <time> [--yes]   restore the database to any moment (owner role; needs WAL archiving on the server)
   pipelines list | show <pipeline>        send row changes to a webhook (admin role); <pipeline> is a name or id
   pipelines create <name> --tables <a,b> --url <url> [--events insert,update,delete] [--no-rows] [--where <table.column:op:value>]...
@@ -55,7 +58,7 @@ function parseArgs(argv: string[]) {
     if (a.startsWith("--")) {
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith("--") && !["no-verify-jwt", "no-rows", "rows", "installed", "available", "no-where", "follow", "yes"].includes(key)) {
+      if (next !== undefined && !next.startsWith("--") && !["no-verify-jwt", "no-rows", "rows", "installed", "available", "no-where", "follow", "yes", "drain", "activate", "unlimited"].includes(key)) {
         if (key === "where") (multi.where ??= []).push(next);
         else flags[key] = next;
         i++;
@@ -100,6 +103,24 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
     } catch {
       data = text;
     }
+    if (!res.ok) throw new CliError(`${res.status}: ${data?.error ?? data?.message ?? res.statusText}`);
+    return data;
+  }
+
+  /** Operator-only calls: the bootstrap secret instead of an organisation token. */
+  async function operatorApi(method: string, path: string, body?: unknown): Promise<any> {
+    const c = await config();
+    const secret = (typeof flags["bootstrap-token"] === "string" && flags["bootstrap-token"]) || io.env.BAAS_BOOTSTRAP_TOKEN || "";
+    if (!secret) throw new CliError("this needs the operator secret: set BAAS_BOOTSTRAP_TOKEN (or pass --bootstrap-token)");
+    let res: Response;
+    try {
+      res = await f(`${c.url}${path}`, { method, headers: { "x-bootstrap-token": secret, ...(body !== undefined ? { "content-type": "application/json" } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    } catch (e) {
+      throw new CliError(`cannot reach ${c.url}: ${(e as Error).message}`);
+    }
+    const text = await res.text();
+    let data: any = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
     if (!res.ok) throw new CliError(`${res.status}: ${data?.error ?? data?.message ?? res.statusText}`);
     return data;
   }
@@ -266,6 +287,40 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           await api("POST", `/v1/projects/${ref}/backups/${rest[0]}/restore`);
           io.out(`Restored ${ref} from ${rest[0]}.`);
         } else throw new CliError("usage: baas backups list | create [--note <text>] | restore <id>");
+        return 0;
+      }
+      case "admin": {
+        if (sub === "clusters") {
+          const [action, id] = rest;
+          if (action === "list" || action === undefined) {
+            const rows = await operatorApi("GET", "/v1/admin/clusters");
+            io.out(table([["ID", "NAME", "HOST", "STATUS", "PROJECTS", "LIMIT"], ...rows.map((c: any) => [c.id, c.name, c.host, c.status, String(c.projects), String(c.max_projects ?? "none")])]));
+          } else if (action === "add" && id) {
+            if (typeof flags.url !== "string") throw new CliError("usage: baas admin clusters add <id> --url <postgres://superuser@host:5432/postgres> [--name <n>] [--max-projects <n>]");
+            const c = await operatorApi("POST", "/v1/admin/clusters", { id, admin_url: flags.url, name: typeof flags.name === "string" ? flags.name : undefined, max_projects: typeof flags["max-projects"] === "string" ? Number(flags["max-projects"]) : undefined });
+            io.out(`Added cluster ${c.id} (${c.host}).`);
+          } else if (action === "update" && id) {
+            const patch: Record<string, unknown> = {};
+            if (flags.drain === true) patch.status = "draining";
+            if (flags.activate === true) patch.status = "active";
+            if (typeof flags["max-projects"] === "string") patch.max_projects = Number(flags["max-projects"]);
+            if (flags.unlimited === true) patch.max_projects = null;
+            if (typeof flags.url === "string") patch.admin_url = flags.url;
+            if (typeof flags.name === "string") patch.name = flags.name;
+            if (!Object.keys(patch).length) throw new CliError("nothing to change: pass --drain, --activate, --max-projects <n>, --unlimited, --url or --name");
+            const c = await operatorApi("PATCH", `/v1/admin/clusters/${id}`, patch);
+            io.out(`Cluster ${c.id}: ${c.status}, ${c.projects} project(s), limit ${c.max_projects ?? "none"}.`);
+          } else if (action === "remove" && id) {
+            await operatorApi("DELETE", `/v1/admin/clusters/${id}`);
+            io.out(`Removed cluster ${id}.`);
+          } else throw new CliError("usage: baas admin clusters list | add <id> --url <url> | update <id> … | remove <id>");
+        } else if (sub === "nodes") {
+          const rows = await operatorApi("GET", "/v1/admin/nodes");
+          io.out(table([["NODE", "HOST", "ROLE", "SINCE"], ...rows.map((n: any) => [String(n.id).slice(0, 8), n.host, n.leader ? "leader" : "follower", String(n.started_at)])]));
+        } else if (sub === "move" && rest[0] && rest[1]) {
+          const r = await operatorApi("POST", `/v1/admin/projects/${rest[0]}/move`, { cluster: rest[1] });
+          io.out(`Moved ${rest[0]} from ${r.from} to ${r.to}.`);
+        } else throw new CliError("usage: baas admin clusters … | baas admin nodes | baas admin move <ref> <cluster>");
         return 0;
       }
       case "pitr": {

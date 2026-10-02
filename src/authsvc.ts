@@ -6,6 +6,7 @@ import { signJwt } from "./keys.js";
 import { DEFAULT_TEMPLATES, htmlFromText, NoMailer, renderTemplate, type Mailer, type TemplateKind } from "./mailer.js";
 import { matchStep, newSecret, otpauthUri, stepAt } from "./totp.js";
 import { isProvider, PROVIDERS, type OAuthProvider, type Profile } from "./oauth.js";
+import { MemoryLimits, type Limits } from "./limits.js";
 import { guardedJson, OidcClient, OidcError, profileFromClaims } from "./oidc.js";
 import { NoSms, type SmsSender } from "./sms.js";
 import { ALGS, newChallenge, verifyAssertion, verifyRegistration, WebAuthnError } from "./webauthn.js";
@@ -55,21 +56,17 @@ export const publicUser = (u: UserRow) => ({
   created_at: u.created_at, updated_at: u.updated_at, banned_until: u.banned_until,
 });
 
-/** Failed-login limiter per project+email so one project's guessing cannot lock out another's users. */
+/** Failed-login limiter per project+email so one project's guessing cannot lock out another's users. Shared across nodes through Limits. */
 class Attempts {
-  private m = new Map<string, { n: number; until: number }>();
-  check(key: string) {
-    const e = this.m.get(key);
-    if (e && e.until > Date.now() && e.n >= 10) throw new AuthError(429, "over_request_rate_limit", "Too many attempts, try again later");
+  constructor(private limits: Limits) {}
+  async check(key: string) {
+    if ((await this.limits.count(`attempts:${key}`)) >= 10) throw new AuthError(429, "over_request_rate_limit", "Too many attempts, try again later");
   }
-  fail(key: string) {
-    const e = this.m.get(key);
-    if (!e || e.until <= Date.now()) this.m.set(key, { n: 1, until: Date.now() + 15 * 60_000 });
-    else e.n++;
-    if (this.m.size > 20000) this.m.delete(this.m.keys().next().value!);
+  async fail(key: string) {
+    await this.limits.hit(`attempts:${key}`, 15 * 60_000);
   }
-  clear(key: string) {
-    this.m.delete(key);
+  async clear(key: string) {
+    await this.limits.clear(`attempts:${key}`);
   }
 }
 
@@ -107,6 +104,8 @@ export type AuthOptions = {
   /** Point a provider at a different server (a self-hosted GitHub, or a stand-in during tests). */
   providerOverrides?: Record<string, Partial<Pick<OAuthProvider, "authUrl" | "tokenUrl" | "userUrl" | "emailsUrl">>>;
   fetch?: typeof fetch;
+  /** Where failed-attempt counts and send cooldowns live. In memory by default; the platform shares them across nodes. */
+  limits?: Limits;
   /** Let custom OpenID Connect providers sit on private or local addresses (tests, or an identity provider inside your own network). */
   oidcAllowPrivate?: boolean;
   /** Sends the codes for phone sign-in. Without one, phone sign-in is off. */
@@ -151,17 +150,16 @@ export function redirectAllowed(settings: Record<string, unknown>, raw: unknown)
 
 export class AuthService {
   private slots = new HashSlots();
-  private attempts = new Attempts();
+  private attempts: Attempts;
+  private limits: Limits;
   private ready = new Set<string>();
-  private cooldown = new Map<string, number>();
-  private hourly = new Map<string, { n: number; until: number }>();
   private mailer: Mailer;
   private sms: SmsSender;
-  private smsCooldown = new Map<string, number>();
-  private smsHourly = new Map<string, { n: number; until: number }>();
   private oidc: OidcClient;
   constructor(private pm: PoolManager, private opts: AuthOptions = {}) {
     this.mailer = opts.mailer ?? new NoMailer();
+    this.limits = opts.limits ?? new MemoryLimits();
+    this.attempts = new Attempts(this.limits);
     this.sms = opts.sms ?? new NoSms();
     this.oidc = new OidcClient(opts.oidcAllowPrivate === true);
   }
@@ -177,7 +175,7 @@ export class AuthService {
   /** New projects have the email/provider tables from the start; older ones get them the first time they are needed. */
   private async ensure(ref: string, project: Resolved) {
     if (this.ready.has(ref) || !this.opts.adminUrl) return;
-    const c = new pg.Client({ connectionString: urlFor(this.opts.adminUrl, project.dbName) });
+    const c = new pg.Client({ connectionString: urlFor(project.adminUrl, project.dbName) });
     c.on("error", () => {});
     await c.connect();
     try {
@@ -274,16 +272,16 @@ export class AuthService {
     const email = typeof body.email === "string" ? body.email.toLowerCase() : "";
     const password = typeof body.password === "string" ? body.password : "";
     const key = `${ref}:${email}`;
-    this.attempts.check(key);
+    await this.attempts.check(key);
     const user = await this.db(ref, async (c) => (await c.query<UserRow>(`SELECT * FROM auth.users WHERE email = $1`, [email])).rows[0]);
     const ok = await this.slots.run(ref, () => verifyPassword(password, user?.encrypted_password ?? null)); // constant work for unknown emails
     if (!user || !ok) {
-      this.attempts.fail(key);
+      await this.attempts.fail(key);
       throw new AuthError(400, "invalid_credentials", "Invalid login credentials");
     }
     if (user.banned_until && user.banned_until > new Date()) throw new AuthError(400, "user_banned", "User is banned");
     if (!user.email_confirmed_at) throw new AuthError(400, "email_not_confirmed", "Email not confirmed");
-    this.attempts.clear(key);
+    await this.attempts.clear(key);
     await this.db(ref, (c) => c.query(`UPDATE auth.users SET last_sign_in_at = now() WHERE id = $1`, [user.id]));
     return this.session(ref, project, user);
   }
@@ -390,7 +388,7 @@ export class AuthService {
     const u = await this.sessionUser(ref, claims);
     await this.ensure(ref, project);
     const key = `mfa:${ref}:${factorId}`;
-    this.attempts.check(key);
+    await this.attempts.check(key);
     const bad = () => new AuthError(400, "mfa_verification_failed", "The code is wrong, or the challenge expired");
     if (typeof body.challenge_id !== "string" || !/^[0-9a-f-]{36}$/.test(body.challenge_id) || (typeof body.code !== "string" && body.webauthn === undefined)) throw bad();
     const f = await this.ownFactor(ref, u.id, factorId);
@@ -408,8 +406,8 @@ export class AuthService {
       return true;
     });
     // A wrong answer still spends the challenge (it commits above), so every guess needs a fresh challenge and the attempt limit below applies per factor.
-    if (!ok) { this.attempts.fail(key); throw bad(); }
-    this.attempts.clear(key);
+    if (!ok) { await this.attempts.fail(key); throw bad(); }
+    await this.attempts.clear(key);
     const sessionId = typeof claims.session_id === "string" && /^[0-9a-f-]{36}$/.test(claims.session_id) ? claims.session_id : randomUUID();
     await this.db(ref, (c) => c.query(`UPDATE auth.refresh_tokens SET revoked = true WHERE session_id = $1`, [sessionId]));
     return this.session(ref, project, u, sessionId, "aal2");
@@ -478,7 +476,7 @@ export class AuthService {
     const ch = await this.db(ref, async (c) => (await c.query<{ webauthn_challenge: string }>(
       `UPDATE auth.mfa_challenges SET verified_at = now() WHERE id = $1 AND factor_id = $2 AND verified_at IS NULL AND created_at > now() - interval '5 minutes' RETURNING webauthn_challenge`,
       [body.challenge_id, f.id])).rows[0]);
-    if (!ch?.webauthn_challenge) { this.attempts.fail(limiterKey); throw bad(); }
+    if (!ch?.webauthn_challenge) { await this.attempts.fail(limiterKey); throw bad(); }
     const expect = { challenge: ch.webauthn_challenge, rpId: rp.id, origins: rp.origins, requireUserVerification: rp.uv };
     try {
       if (wantType === "create") {
@@ -502,10 +500,10 @@ export class AuthService {
         if (!moved.rowCount) throw new WebAuthnError("this response was already used");
       }
     } catch (e) {
-      if (e instanceof WebAuthnError) { this.attempts.fail(limiterKey); throw bad(e.message); }
+      if (e instanceof WebAuthnError) { await this.attempts.fail(limiterKey); throw bad(e.message); }
       throw e;
     }
-    this.attempts.clear(limiterKey);
+    await this.attempts.clear(limiterKey);
     const sessionId = typeof claims.session_id === "string" && /^[0-9a-f-]{36}$/.test(claims.session_id) ? claims.session_id : randomUUID();
     await this.db(ref, (c) => c.query(`UPDATE auth.refresh_tokens SET revoked = true WHERE session_id = $1`, [sessionId]));
     return this.session(ref, project, u, sessionId, "aal2");
@@ -611,18 +609,13 @@ export class AuthService {
   }
 
   /** One email to an address per minute, and a ceiling per project, so the form cannot be used to flood anyone. */
-  private mailGate(ref: string, email: string) {
-    const now = Date.now();
-    const key = `${ref}:${email}`;
+  private async mailGate(ref: string, email: string) {
     const gap = this.opts.emailCooldownMs ?? 60_000;
-    if ((this.cooldown.get(key) ?? 0) > now) throw new AuthError(429, "over_email_send_rate_limit", `For security purposes, you can only request this once every ${Math.round(gap / 1000)} seconds`);
-    const h = this.hourly.get(ref);
     const cap = this.opts.maxEmailsPerHour ?? 100;
-    if (h && h.until > now && h.n >= cap) throw new AuthError(429, "over_email_send_rate_limit", "This project has sent too many emails this hour; try again later");
-    this.cooldown.set(key, now + gap);
-    if (this.cooldown.size > 20_000) this.cooldown.delete(this.cooldown.keys().next().value!);
-    if (!h || h.until <= now) this.hourly.set(ref, { n: 1, until: now + 3600_000 });
-    else h.n++;
+    // The hourly cap is looked at first and counted last, so a request turned away by the cooldown does not use it up.
+    if ((await this.limits.count(`email-hour:${ref}`)) >= cap) throw new AuthError(429, "over_email_send_rate_limit", "This project has sent too many emails this hour; try again later");
+    if ((await this.limits.hit(`email-cool:${ref}:${email}`, gap)).count > 1) throw new AuthError(429, "over_email_send_rate_limit", `For security purposes, you can only request this once every ${Math.round(gap / 1000)} seconds`);
+    await this.limits.hit(`email-hour:${ref}`, 3600_000);
   }
 
   private async sendToken(ref: string, project: Resolved, user: UserRow, type: "confirmation" | "recovery" | "magiclink", redirectTo: string | null) {
@@ -662,7 +655,7 @@ export class AuthService {
     this.requireMail();
     const email = this.emailOf(body.email);
     const redirect = this.redirectFor(project, redirectTo ?? body.redirect_to);
-    this.mailGate(ref, email);
+    await this.mailGate(ref, email);
     await this.ensure(ref, project);
     const user = await this.userByEmail(ref, email);
     if (user) await this.sendToken(ref, project, user, "recovery", redirect).catch((e) => this.opts.log?.(`recovery email to ${email} failed: ${(e as Error).message}`));
@@ -675,7 +668,7 @@ export class AuthService {
     this.requireMail();
     const email = this.emailOf(body.email);
     const redirect = this.redirectFor(project, redirectTo ?? body.redirect_to);
-    this.mailGate(ref, email);
+    await this.mailGate(ref, email);
     await this.ensure(ref, project);
     let user = await this.userByEmail(ref, email);
     if (!user) {
@@ -696,7 +689,7 @@ export class AuthService {
     if (body.type !== "signup") throw new AuthError(422, "validation_failed", 'type must be "signup"');
     const email = this.emailOf(body.email);
     const redirect = this.redirectFor(project, redirectTo ?? body.redirect_to);
-    this.mailGate(ref, email);
+    await this.mailGate(ref, email);
     await this.ensure(ref, project);
     const user = await this.userByEmail(ref, email);
     if (user && !user.email_confirmed_at) await this.sendToken(ref, project, user, "confirmation", redirect).catch((e) => this.opts.log?.(`confirmation email to ${email} failed: ${(e as Error).message}`));
@@ -717,17 +710,11 @@ export class AuthService {
     return s;
   }
 
-  private smsGate(ref: string, phone: string) {
-    const now = Date.now();
-    const key = `${ref}:${phone}`;
+  private async smsGate(ref: string, phone: string) {
     const gap = this.opts.smsCooldownMs ?? 60_000;
-    if ((this.smsCooldown.get(key) ?? 0) > now) throw new AuthError(429, "over_sms_send_rate_limit", `For security purposes, you can only request this once every ${Math.round(gap / 1000)} seconds`);
-    const h = this.smsHourly.get(ref);
-    if (h && h.until > now && h.n >= (this.opts.maxSmsPerHour ?? 30)) throw new AuthError(429, "over_sms_send_rate_limit", "This project has sent too many text messages this hour; try again later");
-    this.smsCooldown.set(key, now + gap);
-    if (this.smsCooldown.size > 20_000) this.smsCooldown.delete(this.smsCooldown.keys().next().value!);
-    if (!h || h.until <= now) this.smsHourly.set(ref, { n: 1, until: now + 3600_000 });
-    else h.n++;
+    if ((await this.limits.count(`sms-hour:${ref}`)) >= (this.opts.maxSmsPerHour ?? 30)) throw new AuthError(429, "over_sms_send_rate_limit", "This project has sent too many text messages this hour; try again later");
+    if ((await this.limits.hit(`sms-cool:${ref}:${phone}`, gap)).count > 1) throw new AuthError(429, "over_sms_send_rate_limit", `For security purposes, you can only request this once every ${Math.round(gap / 1000)} seconds`);
+    await this.limits.hit(`sms-hour:${ref}`, 3600_000);
   }
 
   private async userByPhone(ref: string, phone: string): Promise<UserRow | undefined> {
@@ -769,7 +756,7 @@ export class AuthService {
     if (body.password.length > 256) throw new AuthError(422, "weak_password", "Password is too long");
     const meta = body.data !== null && typeof body.data === "object" && !Array.isArray(body.data) ? (body.data as object) : {};
     await this.ensure(ref, project);
-    this.smsGate(ref, phone);
+    await this.smsGate(ref, phone);
     const user = await this.insertPhoneUser(ref, phone, body.password, meta);
     await this.sendCode(ref, project, user).catch((e) => this.opts.log?.(`text to ${phone} failed: ${(e as Error).message}`));
     return publicUser(user);
@@ -779,7 +766,7 @@ export class AuthService {
   async phoneOtp(ref: string, project: Resolved, body: Record<string, unknown>) {
     this.requireSms();
     const phone = this.phoneOf(body.phone);
-    this.smsGate(ref, phone);
+    await this.smsGate(ref, phone);
     await this.ensure(ref, project);
     let user = await this.userByPhone(ref, phone);
     if (!user) {
@@ -802,7 +789,7 @@ export class AuthService {
     if (typeof input.token !== "string" || !/^\d{6}$/.test(input.token)) throw gone();
     await this.ensure(ref, project);
     const key = `sms:${ref}:${phone}`;
-    this.attempts.check(key);
+    await this.attempts.check(key);
     const code = input.token;
     const uid = await this.db(ref, async (c) => {
       const u = (await c.query<{ id: string }>(`SELECT id FROM auth.users WHERE phone = $1`, [phone])).rows[0];
@@ -819,8 +806,8 @@ export class AuthService {
       await c.query(`UPDATE auth.phone_codes SET attempts = attempts + 1 WHERE id = $1`, [t.id]);
       return null;
     });
-    if (!uid) { this.attempts.fail(key); throw gone(); }
-    this.attempts.clear(key);
+    if (!uid) { await this.attempts.fail(key); throw gone(); }
+    await this.attempts.clear(key);
     const user = await this.db(ref, async (c) =>
       (await c.query<UserRow>(`UPDATE auth.users SET phone_confirmed_at = coalesce(phone_confirmed_at, now()), last_sign_in_at = now(), updated_at = now() WHERE id = $1 RETURNING *`, [uid])).rows[0],
     );
@@ -833,17 +820,17 @@ export class AuthService {
     const phone = this.phoneOf(body.phone);
     const password = typeof body.password === "string" ? body.password : "";
     const key = `${ref}:${phone}`;
-    this.attempts.check(key);
+    await this.attempts.check(key);
     await this.ensure(ref, project);
     const user = await this.userByPhone(ref, phone);
     const ok = await this.slots.run(ref, () => verifyPassword(password, user?.encrypted_password ?? null));
     if (!user || !ok) {
-      this.attempts.fail(key);
+      await this.attempts.fail(key);
       throw new AuthError(400, "invalid_credentials", "Invalid login credentials");
     }
     if (user.banned_until && user.banned_until > new Date()) throw new AuthError(400, "user_banned", "User is banned");
     if (!user.phone_confirmed_at) throw new AuthError(400, "phone_not_confirmed", "Phone not confirmed");
-    this.attempts.clear(key);
+    await this.attempts.clear(key);
     await this.db(ref, (c) => c.query(`UPDATE auth.users SET last_sign_in_at = now() WHERE id = $1`, [user.id]));
     return this.session(ref, project, user);
   }
@@ -861,7 +848,7 @@ export class AuthService {
       // A six-digit code is only meaningful with the address it was sent to, and only a few guesses are allowed per code.
       if (typeof input.token !== "string" || !/^\d{6}$/.test(input.token) || typeof input.email !== "string" || !EMAIL.test(input.email)) throw gone();
       const email = input.email.toLowerCase();
-      this.attempts.check(`code:${ref}:${email}`);
+      await this.attempts.check(`code:${ref}:${email}`);
       const code = input.token;
       const out = await this.db(ref, async (c) => {
         const u = (await c.query<{ id: string }>(`SELECT id FROM auth.users WHERE email = $1`, [email])).rows[0];
@@ -880,8 +867,8 @@ export class AuthService {
         await c.query(`UPDATE auth.one_time_tokens SET attempts = attempts + 1 WHERE id = $1`, [t.id]);
         return { ok: false as const };
       });
-      if (!out.ok) { this.attempts.fail(`code:${ref}:${email}`); throw gone(); }
-      this.attempts.clear(`code:${ref}:${email}`);
+      if (!out.ok) { await this.attempts.fail(`code:${ref}:${email}`); throw gone(); }
+      await this.attempts.clear(`code:${ref}:${email}`);
       row = out.row;
     } else {
       if (typeof input.token !== "string" || !/^[\w-]{20,100}$/.test(input.token)) throw gone();
