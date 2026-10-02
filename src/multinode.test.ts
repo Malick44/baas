@@ -5,6 +5,7 @@ import { MemoryMailer } from "./mailer.js";
 import { createPlatform, type Platform } from "./platform.js";
 import { BOOT, makePlatform } from "./platform-testkit.js";
 import { MemorySms } from "./sms.js";
+import { UsageService } from "./usage.js";
 
 const ADMIN = process.env.BAAS_TEST_PG_URL;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -132,27 +133,31 @@ describe("several baas processes on one control database", { skip: !ADMIN && "se
   });
 
   it("splits the rate limit between the nodes that are alive", async () => {
-    const hammer = async (n: Platform, p: { ref: string; anon: string }) => {
+    // A fixed clock makes the count exact: the free plan allows 40 requests at once, then 20 a second.
+    const p = await project("rate-split", "free");
+    const resolved = (await A.dir.get(p.ref))!;
+    const request = { method: "GET", url: "/rest/v1/" } as never;
+    const allowed = async (nodes: number) => {
+      const usage = new UsageService(A.control, ADMIN!, undefined, () => 1_000_000, () => nodes);
       let ok = 0;
-      for (let i = 0; i < 70; i++) if ((await via(n, p.ref, "GET", "/rest/v1/", { key: p.anon })).status !== 429) ok++;
+      for (let i = 0; i < 70; i++) { try { await usage.admit(p.ref, resolved, request); ok++; } catch (e) { assert.equal((e as { status: number }).status, 429); } }
       return ok;
     };
-    // A project on the free plan: 40 requests at once, then 20 a second.
-    const alone = await project("rate-alone", "free");
-    await B.coordinator.stop();
-    await A.coordinator.stop();
-    await A.coordinator.start();
-    assert.equal(A.coordinator.nodeCount(), 1);
-    const solo = await hammer(A, alone);
-    assert.ok(solo >= 38, `one node allows the plan's whole burst (${solo})`);
+    assert.equal(await allowed(1), 40, "one node allows the plan's whole burst");
+    assert.equal(await allowed(2), 20, "two nodes allow half each");
+    assert.equal(await allowed(3), 13, "three allow a third each");
+    assert.equal(await allowed(0), 40, "never divides by nothing");
 
-    const shared = await project("rate-shared", "free");
+    // And the coordinator feeds it the live count: two nodes beating means two.
+    await A.coordinator.start();
     await B.coordinator.start();
     await A.coordinator.beat();
+    await B.coordinator.beat();
     assert.equal(A.coordinator.nodeCount(), 2);
-    const half = await hammer(A, shared);
-    assert.ok(half >= 18 && half <= 32, `with two nodes each takes half (${half})`);
+    assert.equal(B.coordinator.nodeCount(), 2);
     await A.coordinator.stop();
+    await B.coordinator.beat();
+    assert.equal(B.coordinator.nodeCount(), 1, "a node that stopped no longer counts");
     await B.coordinator.stop();
   });
 
