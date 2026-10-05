@@ -6,6 +6,8 @@ const chunks = [];
 for await (const c of process.stdin) chunks.push(c);
 const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 
+// Some platforms inject child-process variables even when the parent passes an empty environment.
+for (const k of Object.keys(process.env)) delete process.env[k];
 for (const [k, v] of Object.entries(input.env)) process.env[k] = v;
 
 // Narrow what the function can reach before it is loaded. "open" keeps fetch unrestricted but still removes the escape hatches.

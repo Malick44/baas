@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,7 +20,8 @@ const GUARD = fileURLToPath(new URL("./egress-guard.mjs", import.meta.url));
 const MAX_STDOUT = 8 * 1024 * 1024;
 
 let rootPromise: Promise<string> | undefined;
-const root = () => (rootPromise ??= mkdtemp(join(tmpdir(), "baas-fn-")));
+// Node checks permissions against resolved paths, including macOS's /var -> /private/var symlink.
+const root = () => (rootPromise ??= mkdtemp(join(tmpdir(), "baas-fn-")).then((dir) => realpath(dir)));
 
 export type Invocation = {
   ref: string;
