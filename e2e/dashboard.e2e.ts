@@ -1250,7 +1250,8 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     await page.waitForSelector("#users");
     await tab("auth", "urls");
     await page.fill("#auth-cors", "");
-    await page.click("#save-urls");
+    // Wait for this save itself: the previous save's identical toast can still be showing.
+    await Promise.all([page.waitForResponse((r) => /\/settings$/.test(r.url()) && r.request().method() === "PATCH" && r.status() === 200), page.click("#save-urls")]);
     await toast("URL configuration saved");
     t.platform.dir.forget(ref);
     assert.equal((await preflight("https://elsewhere.example.com")).headers.get("access-control-allow-origin"), "*");
