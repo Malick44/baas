@@ -214,7 +214,7 @@ function logout() {
 }
 
 // ---------- shell: top bar, icon rail, section sidebar ----------
-const LOGO = () => svgEl("svg", { viewBox: "0 0 24 24", width: 22, height: 22, fill: "currentColor", "aria-hidden": "true" }, svgEl("path", { d: "M13.4 2L4 13.6h6.2L9.4 22 20 9.6h-6.6z" }));
+const LOGO = () => svgEl("svg", { viewBox: "0 0 64 64", width: 24, height: 24, fill: "none", stroke: "currentColor", "stroke-width": "7", "stroke-linecap": "round", "aria-hidden": "true" }, svgEl("path", { d: "M22 14v36" }), svgEl("circle", { cx: 35, cy: 37, r: 11 }));
 
 /** A "⋮" button that opens a small menu of actions next to it. `items` is [[label, handler, { danger, action }]]. */
 function rowMenu(items) {
@@ -338,18 +338,150 @@ function shell(...content) {
 }
 const mount = (node) => { clear($app); $app.append(node); };
 
+// What the Connect panel can show, by tab. Each entry gives the files (or one command) to copy for a choice of framework and variant.
+// Only the anon key and the project URL are ever put in a snippet; the service_role key stays a placeholder.
+const CONNECT_QUERY = `const { data, error } = await baas.from("todos").select("*");`;
+const connectClientFile = (path, envUrl, envKey) => ({
+  name: path,
+  code: `import { createClient } from "baas/client";\n\nexport const baas = createClient(\n  ${envUrl},\n  ${envKey},\n  { storage: typeof localStorage === "undefined" ? undefined : localStorage },\n);\n`,
+});
+const CONNECT_FRAMEWORKS = {
+  "Next.js": {
+    "App Router": (c) => ({
+      install: "npm install baas",
+      files: [
+        { name: ".env.local", code: `NEXT_PUBLIC_BAAS_URL=${c.url}\nNEXT_PUBLIC_BAAS_ANON_KEY=${c.anon}\n` },
+        connectClientFile("lib/baas.ts", "process.env.NEXT_PUBLIC_BAAS_URL!", "process.env.NEXT_PUBLIC_BAAS_ANON_KEY!"),
+        { name: "app/page.tsx", code: `import { baas } from "@/lib/baas";\n\nexport default async function Page() {\n  ${CONNECT_QUERY}\n  if (error) return <p>{error.message}</p>;\n  return <pre>{JSON.stringify(data, null, 2)}</pre>;\n}\n` },
+      ],
+    }),
+    "Pages Router": (c) => ({
+      install: "npm install baas",
+      files: [
+        { name: ".env.local", code: `NEXT_PUBLIC_BAAS_URL=${c.url}\nNEXT_PUBLIC_BAAS_ANON_KEY=${c.anon}\n` },
+        connectClientFile("lib/baas.ts", "process.env.NEXT_PUBLIC_BAAS_URL!", "process.env.NEXT_PUBLIC_BAAS_ANON_KEY!"),
+        { name: "pages/index.tsx", code: `import type { GetServerSideProps } from "next";\nimport { baas } from "@/lib/baas";\n\nexport const getServerSideProps: GetServerSideProps = async () => {\n  ${CONNECT_QUERY}\n  return { props: { rows: data ?? [], error: error?.message ?? null } };\n};\n\nexport default function Home({ rows }: { rows: unknown[] }) {\n  return <pre>{JSON.stringify(rows, null, 2)}</pre>;\n}\n` },
+      ],
+    }),
+  },
+  "React (Vite)": {
+    TypeScript: (c) => ({
+      install: "npm install baas",
+      files: [
+        { name: ".env.local", code: `VITE_BAAS_URL=${c.url}\nVITE_BAAS_ANON_KEY=${c.anon}\n` },
+        connectClientFile("src/lib/baas.ts", "import.meta.env.VITE_BAAS_URL", "import.meta.env.VITE_BAAS_ANON_KEY"),
+        { name: "src/App.tsx", code: `import { useEffect, useState } from "react";\nimport { baas } from "./lib/baas";\n\nexport default function App() {\n  const [rows, setRows] = useState<unknown[]>([]);\n  useEffect(() => {\n    baas.from("todos").select("*").then(({ data }) => setRows(data ?? []));\n  }, []);\n  return <pre>{JSON.stringify(rows, null, 2)}</pre>;\n}\n` },
+      ],
+    }),
+  },
+  "Vanilla JS": {
+    "Browser (ESM)": (c) => ({
+      install: "npm install baas",
+      files: [
+        { name: "index.js", code: `import { createClient } from "baas/client";\n\nconst baas = createClient("${c.url}", "${c.anon}", { storage: localStorage });\n\n${CONNECT_QUERY}\nconsole.log(data, error);\n` },
+      ],
+    }),
+  },
+};
+const CONNECT_SERVER = {
+  "Node.js": (c) => ({
+    install: "npm install baas",
+    files: [
+      { name: ".env", code: `BAAS_URL=${c.url}\nBAAS_SERVICE_KEY=<service_role key>\n` },
+      { name: "server.mjs", code: `import { createClient } from "baas/client";\n\n// The service_role key bypasses row-level security. Never ship it to a browser.\nconst baas = createClient(process.env.BAAS_URL, process.env.BAAS_SERVICE_KEY);\n\n${CONNECT_QUERY}\nconsole.log(data, error);\n` },
+    ],
+  }),
+  cURL: (c) => ({
+    files: [
+      { name: "REST", code: `curl "${c.url}/rest/v1/todos?select=*" \\\n  -H "apikey: ${c.anon}" \\\n  -H "authorization: Bearer ${c.anon}"\n` },
+      { name: "Functions", code: `curl -X POST "${c.url}/functions/v1/<function>" \\\n  -H "apikey: ${c.anon}" \\\n  -H "content-type: application/json" \\\n  -d '{}'\n` },
+    ],
+  }),
+  Python: (c) => ({
+    install: "pip install requests",
+    files: [
+      { name: "main.py", code: `import os, requests\n\nURL = "${c.url}"\n# The service_role key bypasses row-level security. Keep it on the server.\nKEY = os.environ["BAAS_SERVICE_KEY"]\n\nres = requests.get(\n    f"{URL}/rest/v1/todos",\n    params={"select": "*"},\n    headers={"apikey": KEY, "authorization": f"Bearer {KEY}"},\n)\nprint(res.json())\n` },
+    ],
+  }),
+};
+
+/** A prompt to paste into an AI coding tool: how to reach this project, with the public key only. */
+function connectPrompt(c, tab, framework, variant) {
+  const where = tab === "framework" ? `${framework} (${variant})` : `a ${framework} server`;
+  return [
+    `Connect ${where} to my baas project.`,
+    "",
+    `Project URL: ${c.url}`,
+    `anon (public) key: ${c.anon}`,
+    "",
+    "baas is Supabase-style. Use the bundled client: `npm install baas`, then `import { createClient } from \"baas/client\"`.",
+    `createClient(url, key) gives auth, \`.from("table").select()\` queries, storage, functions and realtime.`,
+    `HTTP routes: ${c.url}/rest/v1/<table>, ${c.url}/auth/v1/..., ${c.url}/functions/v1/<name>, ${c.url}/storage/v1/...`,
+    "Put the URL and anon key in environment variables, never the service_role key in browser code.",
+  ].join("\n");
+}
+
 async function connectDialog(p) {
-  const url = gwBase(p.ref);
-  await dialog("Connect to this project", () => h("div", { class: "stack" },
-    h("div", { class: "kv" },
-      h("span", { class: "k" }, "Project URL"), ...copyable(url),
-      h("span", { class: "k" }, "anon key"), ...copyable(S.keys.anon, { secret: true }),
-      h("span", { class: "k" }, "service_role key"), ...(S.keys.service_role ? copyable(S.keys.service_role, { secret: true }) : [h("span", { class: "muted" }, "Requires the admin role"), h("span")])),
-    h("h3", null, "Client"),
-    h("pre", null, `import { createClient } from "baas/client";\nconst baas = createClient("${url}", "<anon key>");\nawait baas.from("todos").select("*");`),
-    h("h3", null, "Environment"),
-    h("pre", null, `BAAS_URL=${url}\nBAAS_ANON_KEY=<anon key>`),
-    h("p", { class: "muted" }, "The service_role key bypasses row-level security. Keep it on servers only.")), { confirmLabel: "Close" });
+  const c = { url: gwBase(p.ref), anon: S.keys.anon };
+  const TABS = [["framework", "Framework", "Use a client library"], ["server", "Server", "Build APIs"]];
+  const view = { tab: "framework", framework: "Next.js", variant: "App Router", server: "Node.js" };
+  const body = h("div", { class: "stack connect-body" });
+  const copy = async (text) => { await navigator.clipboard?.writeText(text).catch(() => {}); toast("Copied"); };
+
+  const selectRow = (label, id, options, value, onChange) =>
+    h("label", { class: "connect-row" }, h("span", null, label),
+      h("select", { id, onchange: (e) => onChange(e.target.value) }, options.map((o) => h("option", { value: o, selected: o === value }, o))));
+
+  const codeBlock = (files) => {
+    let at = 0;
+    const pre = h("pre", { class: "connect-code" });
+    const tabs = h("div", { class: "connect-files", role: "tablist" });
+    const draw = () => {
+      pre.textContent = files[at].code;
+      clear(tabs);
+      files.forEach((f, i) => tabs.append(h("button", { type: "button", role: "tab", class: `connect-file${i === at ? " on" : ""}`, "aria-selected": String(i === at), onclick: () => { at = i; draw(); } }, f.name)));
+      tabs.append(h("button", { type: "button", class: "small connect-copy", onclick: () => copy(files[at].code) }, icon("copy", 13), " Copy"));
+    };
+    draw();
+    return h("div", { class: "connect-block" }, tabs, pre);
+  };
+
+  const step = (n, title, text, content) =>
+    h("li", { class: "connect-step" }, h("span", { class: "connect-n" }, n), h("div", { class: "connect-step-body" }, h("h4", null, title), h("p", { class: "muted" }, text), content));
+
+  const draw = () => {
+    clear(body);
+    const server = view.tab === "server";
+    const variants = server ? null : Object.keys(CONNECT_FRAMEWORKS[view.framework]);
+    if (!server && !variants.includes(view.variant)) view.variant = variants[0];
+    const plan = (server ? CONNECT_SERVER[view.server] : CONNECT_FRAMEWORKS[view.framework][view.variant])(c);
+
+    body.append(
+      h("div", { class: "connect-modes", role: "tablist" }, TABS.map(([id, label, hint]) =>
+        h("button", { type: "button", role: "tab", id: `connect-tab-${id}`, class: `connect-mode${view.tab === id ? " on" : ""}`, "aria-selected": String(view.tab === id), onclick: () => { view.tab = id; draw(); } }, h("strong", null, label), h("span", { class: "muted" }, hint)))),
+      h("div", { class: "stack" },
+        server
+          ? selectRow("Language", "connect-server", Object.keys(CONNECT_SERVER), view.server, (v) => { view.server = v; draw(); })
+          : [selectRow("Framework", "connect-framework", Object.keys(CONNECT_FRAMEWORKS), view.framework, (v) => { view.framework = v; draw(); }),
+             selectRow("Variant", "connect-variant", variants, view.variant, (v) => { view.variant = v; draw(); })]),
+      h("div", { class: "row between connect-steps-head" }, h("h3", null, "Follow these steps"),
+        h("button", { type: "button", id: "connect-prompt", class: "small", onclick: () => copy(connectPrompt(c, view.tab, server ? view.server : view.framework, view.variant)) }, icon("copy", 13), " Copy prompt")),
+      h("ol", { class: "connect-steps" },
+        plan.install && step(1, "Install packages", "Run this command to install the required dependencies.", codeBlock([{ name: "terminal", code: plan.install }])),
+        step(plan.install ? 2 : 1, server ? "Add the code" : "Add files", server ? "Call your project from your backend. Keep the service_role key out of anything a browser can load." : "Add environment variables and create the client, then query a table.", codeBlock(plan.files))));
+  };
+
+  await dialog("Connect to your project", () => {
+    draw();
+    return h("div", { class: "stack" },
+      h("p", { class: "muted" }, "Choose how you want to use baas."),
+      h("div", { class: "kv" },
+        h("span", { class: "k" }, "Project URL"), ...copyable(c.url),
+        h("span", { class: "k" }, "anon key"), ...copyable(c.anon, { secret: true }),
+        h("span", { class: "k" }, "service_role key"), ...(S.keys.service_role ? copyable(S.keys.service_role, { secret: true }) : [h("span", { class: "muted" }, "Requires the admin role"), h("span")])),
+      h("p", { class: "muted" }, "The service_role key bypasses row-level security. Keep it on servers only."),
+      body);
+  }, { confirmLabel: "Close", sheet: true });
 }
 
 // ---------- command palette ----------

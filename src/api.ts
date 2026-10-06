@@ -476,7 +476,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
   app.get("/v1/config", async () => ({ gateway: ops.gateway ?? null, member_email_reset: members.emailResetAvailable }));
   if (ops.dashboardDir) {
     const dir = ops.dashboardDir;
-    const types: Record<string, string> = { "index.html": "text/html; charset=utf-8", "app.js": "text/javascript; charset=utf-8", "style.css": "text/css; charset=utf-8" };
+    const types: Record<string, string> = { "index.html": "text/html; charset=utf-8", "app.js": "text/javascript; charset=utf-8", "style.css": "text/css; charset=utf-8", "logo.svg": "image/svg+xml" };
     const serve = async (file: string, reply: import("fastify").FastifyReply) => {
       if (!Object.hasOwn(types, file)) throw new HttpError(404, "not found");
       return reply
@@ -488,6 +488,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
         .send(await readFile(`${dir}/${file}`));
     };
     app.get("/", (_req, reply) => serve("index.html", reply));
+    app.get("/favicon.ico", (_req, reply) => serve("logo.svg", reply));
     app.get<{ Params: { file: string } }>("/dashboard/:file", (req, reply) => serve(req.params.file, reply));
   }
   return app;

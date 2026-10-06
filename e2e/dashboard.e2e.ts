@@ -160,6 +160,14 @@ describe("dashboard in a real browser", { skip: !ADMIN && "set BAAS_TEST_PG_URL"
     assert.equal(await page.locator("dialog .kv code").first().textContent(), `http://${ref}.localhost:${gwPort}`);
     await page.locator("dialog button:has-text('Reveal')").first().click();
     assert.match((await page.locator("dialog .kv code").nth(1).textContent()) ?? "", /^eyJ/);
+    // Tabs for each way to connect: the framework steps change with the choice, and the server tab shows plain HTTP calls.
+    assert.match((await page.textContent("dialog .connect-steps"))!, /Install packages/);
+    await page.selectOption("#connect-variant", "Pages Router");
+    assert.match((await page.textContent("dialog .connect-files"))!, /pages\/index\.tsx/);
+    await page.click("#connect-tab-server");
+    await page.selectOption("#connect-server", "cURL");
+    assert.match((await page.textContent("dialog pre.connect-code"))!, new RegExp(`${ref}\\.localhost:${gwPort}/rest/v1/todos`));
+    await page.click("#connect-tab-framework");
     await shot("03b-connect");
     await page.click("dialog button:has-text('Close')");
     await shot("03-overview");
