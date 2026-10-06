@@ -42,7 +42,10 @@ describe("dashboard accounts", { skip: !ADMIN && "set BAAS_TEST_PG_URL" }, () =>
     assert.equal((await t.api("GET", "/v1/me", { token: orgToken })).json.member, null, "an API token has no member");
     const s = await login("root@example.com", PW);
     assert.ok(new Date(s.json.expires_at).getTime() > Date.now() + 6 * 86_400_000);
-    assert.equal(JSON.stringify(s.json).includes("password"), false, "no hash in the response");
+    assert.equal(Object.hasOwn(s.json.member, "password_hash"), false, "no hash in the response");
+    assert.equal(Object.hasOwn(s.json.member, "password"), false, "no password in the response");
+    assert.equal(s.text.includes(PW), false, "password value is never returned");
+    assert.equal(s.json.member.must_change_password, false);
   });
 
   it("rejects wrong credentials identically for unknown and known addresses, and throttles guessing", async () => {
@@ -357,4 +360,3 @@ describe("member password reset and authenticator", { skip: !ADMIN && "set BAAS_
     });
   });
 });
-

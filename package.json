@@ -7,9 +7,10 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json && cp src/function-runner.mjs src/egress-guard.mjs dist/",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
+    "setup:users": "node scripts/setup-initial-users.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test src/*.test.ts",
-    "e2e": "node --import tsx --test --test-timeout=300000 e2e/dashboard.e2e.ts"
+    "e2e": "node --import tsx --test --test-timeout=300000 e2e/*.e2e.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.129.0",

@@ -23,9 +23,9 @@ const TICKET_TRIES = 5;
 const RESET_COOLDOWN_MS = 60_000;
 
 export type Session = { token: string; expires_at: string; member: MemberView };
-export type MemberView = { id: string; email: string; name: string | null; role: Role; mfa?: boolean };
+export type MemberView = { id: string; email: string; name: string | null; role: Role; must_change_password: boolean; mfa?: boolean };
 
-const view = (r: { id: string; email: string; name: string | null; role: Role }): MemberView => ({ id: r.id, email: r.email, name: r.name, role: r.role });
+const view = (r: { id: string; email: string; name: string | null; role: Role; must_change_password?: boolean }): MemberView => ({ id: r.id, email: r.email, name: r.name, role: r.role, must_change_password: r.must_change_password === true });
 
 function checkPassword(pw: unknown): string {
   if (typeof pw !== "string" || pw.length < MIN_PASSWORD || pw.length > 200) throw new HttpError(400, `password must be ${MIN_PASSWORD}-200 characters`);
@@ -77,7 +77,7 @@ export class Members {
     if (typeof email !== "string" || typeof password !== "string") throw new HttpError(400, "email and password are required");
     const key = email.trim().toLowerCase();
     if (await this.throttled(key)) throw new HttpError(429, "too many failed sign-ins; try again in a few minutes", { "retry-after": "900" });
-    const m = (await this.pool.query(`SELECT id, org_id, email, name, role, password_hash FROM members WHERE lower(email) = $1`, [key])).rows[0];
+    const m = (await this.pool.query(`SELECT id, org_id, email, name, role, password_hash, must_change_password FROM members WHERE lower(email) = $1`, [key])).rows[0];
     const ok = await verifyPassword(password, m?.password_hash ?? null);
     if (!m || !ok) {
       await this.fail(key);
@@ -101,7 +101,7 @@ export class Members {
     const t = (await this.pool.query(
       `UPDATE member_mfa_tickets SET attempts = attempts + 1 WHERE token_hash = $1 AND expires_at > now() AND attempts < $2 RETURNING id, member_id`, [hash(ticket), TICKET_TRIES])).rows[0];
     if (!t) throw new HttpError(401, "this sign-in has expired; start again");
-    const m = (await this.pool.query(`SELECT id, org_id, email, name, role FROM members WHERE id = $1`, [t.member_id])).rows[0];
+    const m = (await this.pool.query(`SELECT id, org_id, email, name, role, must_change_password FROM members WHERE id = $1`, [t.member_id])).rows[0];
     const key = m.email.toLowerCase();
     if (await this.throttled(key)) throw new HttpError(429, "too many failed sign-ins; try again in a few minutes", { "retry-after": "900" });
     if (!(await this.checkSecondFactor(t.member_id, code))) {
@@ -135,7 +135,7 @@ export class Members {
   async me(p: Principal): Promise<MemberView | null> {
     if (!p.memberId) return null;
     const r = await this.pool.query(
-      `SELECT m.id, m.email, m.name, m.role, EXISTS (SELECT 1 FROM member_factors f WHERE f.member_id = m.id AND f.status = 'verified') AS mfa FROM members m WHERE m.id = $1`, [p.memberId]);
+      `SELECT m.id, m.email, m.name, m.role, m.must_change_password, EXISTS (SELECT 1 FROM member_factors f WHERE f.member_id = m.id AND f.status = 'verified') AS mfa FROM members m WHERE m.id = $1`, [p.memberId]);
     return r.rows[0] ? { ...view(r.rows[0]), mfa: r.rows[0].mfa } : null;
   }
 
@@ -158,7 +158,7 @@ export class Members {
   async list(p: Principal) {
     ControlPlane.require(p, "admin");
     const members = (await this.pool.query(
-      `SELECT m.id, m.email, m.name, m.role, m.created_at, EXISTS (SELECT 1 FROM member_factors f WHERE f.member_id = m.id AND f.status = 'verified') AS mfa
+      `SELECT m.id, m.email, m.name, m.role, m.created_at, m.must_change_password, EXISTS (SELECT 1 FROM member_factors f WHERE f.member_id = m.id AND f.status = 'verified') AS mfa
          FROM members m WHERE m.org_id = $1 ORDER BY m.created_at`, [p.orgId])).rows;
     const invites = (await this.pool.query(
       `SELECT id, email, role, created_at, expires_at FROM invites WHERE org_id = $1 AND accepted_at IS NULL ORDER BY created_at`, [p.orgId])).rows;
@@ -260,11 +260,24 @@ export class Members {
   async changePassword(p: Principal, current: unknown, next: unknown) {
     if (!p.memberId) throw new HttpError(400, "only signed-in members have a password");
     const pw = checkPassword(next);
-    const row = (await this.pool.query(`SELECT password_hash FROM members WHERE id = $1`, [p.memberId])).rows[0];
-    if (typeof current !== "string" || !(await verifyPassword(current, row?.password_hash ?? null))) throw new HttpError(400, "current password is incorrect");
-    await this.pool.query(`UPDATE members SET password_hash = $1 WHERE id = $2`, [await hashPassword(pw), p.memberId]);
-    await this.pool.query(`UPDATE api_tokens SET revoked_at = now() WHERE member_id = $1 AND id <> $2 AND revoked_at IS NULL`, [p.memberId, p.tokenId]);
-    await this.control.audit(`member:${p.memberId}`, p.orgId, "member.password", p.memberId);
+    const c = await this.pool.connect();
+    const unguard = guard(c);
+    try {
+      await c.query("BEGIN");
+      const row = (await c.query(`SELECT password_hash FROM members WHERE id = $1 AND org_id = $2 FOR UPDATE`, [p.memberId, p.orgId])).rows[0];
+      if (typeof current !== "string" || !(await verifyPassword(current, row?.password_hash ?? null))) throw new HttpError(400, "current password is incorrect");
+      if (pw === current) throw new HttpError(400, "new password must differ from your current password");
+      await c.query(`UPDATE members SET password_hash = $1, must_change_password = false WHERE id = $2`, [await hashPassword(pw), p.memberId]);
+      await c.query(`UPDATE api_tokens SET revoked_at = now() WHERE member_id = $1 AND id <> $2 AND revoked_at IS NULL`, [p.memberId, p.tokenId]);
+      await c.query(`INSERT INTO audit_log (org_id, actor, action, target) VALUES ($1, $2, 'member.password', $3)`, [p.orgId, `member:${p.memberId}`, p.memberId]);
+      await c.query("COMMIT");
+    } catch (err) {
+      await c.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      unguard();
+      c.release();
+    }
   }
 
   /** An owner sets a new password for someone who has lost theirs, signing them out everywhere. */
@@ -272,7 +285,7 @@ export class Members {
     ControlPlane.require(p, "owner");
     const pw = checkPassword(next);
     await this.target(p, id);
-    await this.pool.query(`UPDATE members SET password_hash = $1 WHERE id = $2`, [await hashPassword(pw), id]);
+    await this.pool.query(`UPDATE members SET password_hash = $1, must_change_password = true WHERE id = $2`, [await hashPassword(pw), id]);
     await this.pool.query(`UPDATE api_tokens SET revoked_at = now() WHERE member_id = $1 AND revoked_at IS NULL`, [id]);
     await this.control.audit(p.memberId ? `member:${p.memberId}` : p.tokenId, p.orgId, "member.password_reset", id);
   }
@@ -302,14 +315,28 @@ export class Members {
     if (typeof token !== "string" || !token) throw new HttpError(400, "token is required");
     const pw = checkPassword(password);
     const hashed = await hashPassword(pw);
-    const r = (await this.pool.query(
-      `UPDATE member_resets SET used_at = now() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING member_id`, [hash(token)])).rows[0];
-    if (!r) throw new HttpError(400, "this link is invalid, expired or already used");
-    const m = (await this.pool.query(`UPDATE members SET password_hash = $1 WHERE id = $2 RETURNING org_id`, [hashed, r.member_id])).rows[0];
-    // A reset signs the account out everywhere; a second factor, if there is one, still applies at the next sign-in.
-    await this.pool.query(`UPDATE api_tokens SET revoked_at = now() WHERE member_id = $1 AND revoked_at IS NULL`, [r.member_id]);
-    await this.pool.query(`DELETE FROM member_resets WHERE member_id = $1`, [r.member_id]);
-    await this.control.audit(`member:${r.member_id}`, m.org_id, "member.password_reset_by_email", r.member_id);
+    const c = await this.pool.connect();
+    const unguard = guard(c);
+    try {
+      await c.query("BEGIN");
+      const r = (await c.query(
+        `UPDATE member_resets SET used_at = now() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING member_id`, [hash(token)])).rows[0];
+      if (!r) throw new HttpError(400, "this link is invalid, expired or already used");
+      const m = (await c.query(`SELECT org_id, password_hash, must_change_password FROM members WHERE id = $1 FOR UPDATE`, [r.member_id])).rows[0];
+      if (m.must_change_password && await verifyPassword(pw, m.password_hash)) throw new HttpError(400, "new password must differ from your temporary password");
+      await c.query(`UPDATE members SET password_hash = $1, must_change_password = false WHERE id = $2`, [hashed, r.member_id]);
+      // Email recovery replaces the temporary password too; existing MFA still applies.
+      await c.query(`UPDATE api_tokens SET revoked_at = now() WHERE member_id = $1 AND revoked_at IS NULL`, [r.member_id]);
+      await c.query(`DELETE FROM member_resets WHERE member_id = $1`, [r.member_id]);
+      await c.query(`INSERT INTO audit_log (org_id, actor, action, target) VALUES ($1, $2, 'member.password_reset_by_email', $3)`, [m.org_id, `member:${r.member_id}`, r.member_id]);
+      await c.query("COMMIT");
+    } catch (err) {
+      await c.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      unguard();
+      c.release();
+    }
   }
 
   // ---- authenticator app ----

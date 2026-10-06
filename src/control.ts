@@ -8,7 +8,7 @@ import { dbNameOf, dropProject, newRef, provisionProject, setProjectAccess, type
 import type { Vault } from "./vault.js";
 
 export class HttpError extends Error {
-  constructor(readonly status: number, message: string, readonly headers?: Record<string, string>) {
+  constructor(readonly status: number, message: string, readonly headers?: Record<string, string>, readonly code?: string) {
     super(message);
   }
 }
@@ -16,7 +16,7 @@ export class HttpError extends Error {
 export type Role = "developer" | "admin" | "owner";
 const RANK: Record<Role, number> = { developer: 1, admin: 2, owner: 3 };
 
-export type Principal = { tokenId: string; orgId: string; role: Role; /** Set when the token is a signed-in member's session. */ memberId?: string };
+export type Principal = { tokenId: string; orgId: string; role: Role; /** Set when the token is a signed-in member's session. */ memberId?: string; mustChangePassword?: boolean };
 export const RANKS = RANK;
 
 export type ProjectRow = {
@@ -115,7 +115,12 @@ export class ControlPlane {
   }
 
   static require(p: Principal, min: Role): void {
+    ControlPlane.requireReady(p);
     if (RANK[p.role] < RANK[min]) throw new HttpError(403, `requires ${min} role`);
+  }
+
+  static requireReady(p: Principal): void {
+    if (p.mustChangePassword) throw new HttpError(403, "change your temporary password before continuing", undefined, "password_change_required");
   }
 
   async audit(actor: string, orgId: string | null, action: string, target: string | null, meta: object = {}) {
@@ -163,14 +168,14 @@ export class ControlPlane {
 
   async authenticate(token: string): Promise<Principal | null> {
     // A member's session carries the member's current role, so changing or removing someone takes effect at once.
-    const r = await this.pool.query<{ id: string; org_id: string; role: Role; member_id: string | null }>(
-      `SELECT t.id, t.org_id, COALESCE(m.role, t.role) AS role, t.member_id
+    const r = await this.pool.query<{ id: string; org_id: string; role: Role; member_id: string | null; must_change_password: boolean | null }>(
+      `SELECT t.id, t.org_id, COALESCE(m.role, t.role) AS role, t.member_id, m.must_change_password
          FROM api_tokens t LEFT JOIN members m ON m.id = t.member_id
         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > now())`,
       [hashToken(token)],
     );
     const row = r.rows[0];
-    return row ? { tokenId: row.id, orgId: row.org_id, role: row.role, ...(row.member_id ? { memberId: row.member_id } : {}) } : null;
+    return row ? { tokenId: row.id, orgId: row.org_id, role: row.role, ...(row.member_id ? { memberId: row.member_id, mustChangePassword: row.must_change_password === true } : {}) } : null;
   }
 
   async whoami(p: Principal) {

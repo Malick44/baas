@@ -76,7 +76,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
   const app = Fastify({ logger: false });
 
   app.setErrorHandler((err: Error & { statusCode?: number }, _req, reply) => {
-    if (err instanceof HttpError) return reply.code(err.status).send({ error: err.message });
+    if (err instanceof HttpError) return reply.code(err.status).send({ error: err.message, ...(err.code ? { code: err.code } : {}) });
     if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ error: err.message });
     app.log.error(err);
     return reply.code(500).send({ error: "internal error" });
@@ -86,10 +86,11 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
 
   const bearer = (req: FastifyRequest) => /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
 
-  async function principal(req: FastifyRequest): Promise<Principal> {
+  async function principal(req: FastifyRequest, allowPasswordChange = false): Promise<Principal> {
     const t = bearer(req);
     const p = t ? await control.authenticate(t) : null;
     if (!p) throw new HttpError(401, "missing or invalid token");
+    if (!allowPasswordChange) ControlPlane.requireReady(p);
     return p;
   }
 
@@ -189,7 +190,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
     return reply.code(204).send();
   });
   app.post("/v1/auth/logout", async (req, reply) => {
-    await members.logout(await principal(req));
+    await members.logout(await principal(req, true));
     return reply.code(204).send();
   });
   app.post("/v1/auth/accept-invite", async (req, reply) => {
@@ -198,7 +199,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
   });
   app.post("/v1/me/password", async (req, reply) => {
     const b = body(req);
-    await members.changePassword(await principal(req), b.current_password, b.new_password);
+    await members.changePassword(await principal(req, true), b.current_password, b.new_password);
     return reply.code(204).send();
   });
   app.get("/v1/members", async (req) => members.list(await principal(req)));
@@ -307,7 +308,7 @@ export function buildApi(control: ControlPlane, bootstrapToken: string, ops: Api
   };
 
   app.get("/v1/me", async (req) => {
-    const p = await principal(req);
+    const p = await principal(req, true);
     return { ...(await control.whoami(p)), member: await members.me(p) };
   });
   app.get("/v1/plans", async () => Object.fromEntries(Object.entries(PLANS)));
