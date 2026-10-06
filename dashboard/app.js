@@ -169,6 +169,10 @@ async function api(method, path, body, { raw = false } = {}) {
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (data?.code === "password_change_required" && S.me?.member) {
+    S.me.member.must_change_password = true;
+    renderRequiredPassword();
+  }
   if (!res.ok) throw new Error(data?.error || data?.message || `${res.status} ${res.statusText}`);
   return raw ? { res, data } : data;
 }
@@ -384,7 +388,7 @@ function openPalette() {
   input.focus();
 }
 document.addEventListener("keydown", (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k" && S.token && !document.querySelector("dialog[open]")) { e.preventDefault(); openPalette(); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k" && S.token && !S.me?.member?.must_change_password && !document.querySelector("dialog[open]")) { e.preventDefault(); openPalette(); }
 });
 
 // ---------- login ----------
@@ -578,6 +582,45 @@ async function mfaDialog() {
   S.me = await api("GET", "/v1/me");
 }
 
+/** Every route, including a restored session or deep link, stops here until the password is replaced. */
+function renderRequiredPassword() {
+  document.querySelectorAll("dialog[open], .menu").forEach((el) => el.remove());
+  S.project = S.keys = null;
+  const err = h("div", { class: "notice bad", hidden: true, id: "required-password-error", role: "alert" });
+  const current = h("input", { id: "required-current", type: "password", autocomplete: "current-password", required: true });
+  const next = h("input", { id: "required-new", type: "password", autocomplete: "new-password", minlength: 8, maxlength: 200, required: true });
+  const again = h("input", { id: "required-confirm", type: "password", autocomplete: "new-password", required: true });
+  const submit = h("button", { class: "primary", id: "required-password-submit", type: "submit" }, "Change password and continue");
+  const form = h("form", { class: "stack", id: "required-password-form" },
+    h("h1", null, "Choose your own password"),
+    h("p", { class: "muted" }, "Replace your temporary password before using your account."),
+    h("p", null, S.me.member.email),
+    h("label", { class: "field" }, "Temporary password", current),
+    h("label", { class: "field" }, "New password", next, h("span", { class: "muted hint" }, "At least 8 characters. Use a different password.")),
+    h("label", { class: "field" }, "Repeat new password", again), err,
+    h("div", { class: "row" }, submit, h("button", { class: "linkish", type: "button", id: "required-password-signout", onclick: logout }, "Sign out")));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    err.hidden = true;
+    submit.disabled = true;
+    try {
+      if (next.value !== again.value) throw new Error("The new passwords do not match.");
+      if (next.value === current.value) throw new Error("Use a different password from your temporary password.");
+      await api("POST", "/v1/me/password", { current_password: current.value, new_password: next.value });
+      current.value = next.value = again.value = "";
+      S.me = await api("GET", "/v1/me");
+      toast("Password changed", "ok");
+      go("#/projects");
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.hidden = false;
+      submit.disabled = false;
+    }
+  });
+  mount(h("div", { class: "login" }, h("div", { class: "card" }, form)));
+  current.focus();
+}
+
 function passwordDialog() {
   return dialog("Change password", () => h("div", { class: "stack" },
     h("label", { class: "field" }, "Current password", h("input", { name: "current", id: "pw-current", type: "password", autocomplete: "current-password", required: true })),
@@ -669,7 +712,7 @@ async function roleDialog(m, done) {
 
 function resetDialog(m) {
   return dialog("Set a new password", () => h("div", { class: "stack" },
-    h("p", null, `Choose a temporary password for ${m.email} and tell them. They are signed out everywhere, and can change it from their account menu.`),
+    h("p", null, `Choose a temporary password for ${m.email} and tell them. They are signed out everywhere and must replace it the next time they sign in.`),
     h("input", { name: "password", id: "reset-password", type: "password", autocomplete: "new-password", required: true, minlength: 8 })), {
     confirmLabel: "Set password",
     onSubmit: async (fd) => { await api("POST", `/v1/members/${m.id}/password`, { password: fd.get("password") }); toast("Password set", "ok"); return true; },
@@ -2958,14 +3001,16 @@ async function route() {
     if (S.token) { try { S.me = await api("GET", "/v1/me"); } catch { S.token = null; } }
   }
   if (!S.token) return renderLogin();
-  if (!S.config) S.config = await fetch("/v1/config").then((r) => r.json());
   if (!S.me) S.me = await api("GET", "/v1/me");
+  if (S.me.member?.must_change_password) return renderRequiredPassword();
+  if (!S.config) S.config = await fetch("/v1/config").then((r) => r.json());
   const m = /^#\/p\/([a-z0-9]{20})\/([a-z]+)(?:\/([a-z]+))?/.exec(location.hash);
   try {
     if (location.hash === "#/team") { S.project = null; await renderTeam(); }
     else if (m) await renderProject(m[1], m[2], m[3]);
     else { S.project = null; await renderProjects(); }
   } catch (ex) {
+    if (S.me?.member?.must_change_password) return renderRequiredPassword();
     mount(shell(h("div", { class: "notice bad", id: "route-error" }, ex.message), h("p", null, h("a", { href: "#/projects" }, "Back to projects"))));
   }
 }

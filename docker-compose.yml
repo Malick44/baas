@@ -27,6 +27,14 @@ services:
       BAAS_PG_ADMIN_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
       BAAS_MASTER_KEY: ${BAAS_MASTER_KEY:?set BAAS_MASTER_KEY}
       BAAS_BOOTSTRAP_TOKEN: ${BAAS_BOOTSTRAP_TOKEN:?set BAAS_BOOTSTRAP_TOKEN}
+      # Optional one-time owner/admin setup. Existing installations are never changed.
+      BAAS_INITIAL_USERS_ENABLED: ${BAAS_INITIAL_USERS_ENABLED:-false}
+      BAAS_INITIAL_ORGANIZATION_NAME: ${BAAS_INITIAL_ORGANIZATION_NAME:-}
+      BAAS_INITIAL_ORGANIZATION_SLUG: ${BAAS_INITIAL_ORGANIZATION_SLUG:-}
+      BAAS_INITIAL_OWNER_EMAIL: ${BAAS_INITIAL_OWNER_EMAIL:-}
+      BAAS_INITIAL_OWNER_PASSWORD: ${BAAS_INITIAL_OWNER_PASSWORD:-}
+      BAAS_INITIAL_ADMIN_EMAIL: ${BAAS_INITIAL_ADMIN_EMAIL:-}
+      BAAS_INITIAL_ADMIN_PASSWORD: ${BAAS_INITIAL_ADMIN_PASSWORD:-}
       # Projects are served at http://<ref>.${BAAS_GATEWAY_DOMAIN}:${GATEWAY_PORT}. Browsers resolve *.localhost on their own;
       # for a real domain add a wildcard DNS record and terminate TLS in front (see README).
       BAAS_GATEWAY_DOMAIN: ${BAAS_GATEWAY_DOMAIN:-localhost}

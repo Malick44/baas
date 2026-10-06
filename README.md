@@ -12,7 +12,22 @@ docker compose up -d --build
 open http://localhost:8080      # dashboard
 ```
 
-Create the first organisation with the bootstrap secret. Include an owner email and password to get a dashboard account, or omit them and use the API token it returns:
+For an empty installation, you can prepare an initial owner and admin before starting BAAS:
+
+```bash
+npm run setup:users -- --output-env .env.local \
+  --organization-name "My Organization" --organization-slug my-org \
+  --owner-email owner@example.com --admin-email admin@example.com
+docker compose --env-file .env.local up -d --build
+```
+
+The setup command preserves existing env values and appends distinct, random temporary passwords under `BAAS_INITIAL_OWNER_PASSWORD` and `BAAS_INITIAL_ADMIN_PASSWORD`. It writes the file with mode `0600` and never prints passwords. Retrieve your password privately from that file, then sign in with your email. Both accounts must choose a different password before accessing projects, the team or API tokens; signing out is still available.
+
+The initializer creates the organization and both members in one transaction and does not mint an owner API token. It runs once, skips installations that already have an organization, and never recreates or resets accounts on restart, even if the initial organization is later deleted. Re-running the setup command preserves its original credentials. After both accounts have changed their passwords, disable `BAAS_INITIAL_USERS_ENABLED` and remove the initial password settings.
+
+For Node without Docker, load the env file explicitly, for example `node --env-file=.env.local dist/server.js`, with the database URL settings also supplied. If setup is interrupted, check that no setup process is still running before removing its `.env.local.initial-users.lock` file and retrying; an existing complete configuration is reused.
+
+Alternatively, create an organisation with the bootstrap secret. Include an owner email and password to get a dashboard account, or omit them and use the API token it returns:
 
 ```bash
 curl -XPOST localhost:8080/v1/organizations -H "x-bootstrap-token: $BAAS_BOOTSTRAP_TOKEN" \

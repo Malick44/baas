@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { createPlatform } from "./platform.js";
+import { initialMembersFromEnv } from "./initial-members.js";
 
 function need(name: string): string {
   const v = process.env[name];
@@ -13,6 +14,7 @@ const platform = await createPlatform({
   pgAdminUrl: need("BAAS_PG_ADMIN_URL"),
   masterKey: need("BAAS_MASTER_KEY"),
   bootstrapToken: need("BAAS_BOOTSTRAP_TOKEN"),
+  initialMembers: initialMembersFromEnv(process.env),
   storageDir: resolve(process.env.BAAS_STORAGE_DIR ?? "./data/storage"),
   s3: process.env.S3_BUCKET ? {
     endpoint: process.env.S3_ENDPOINT ?? "https://s3.amazonaws.com",
@@ -64,6 +66,7 @@ const platform = await createPlatform({
   purgeRetentionMs: Number(process.env.BAAS_PURGE_RETENTION_DAYS ?? 7) * 86_400_000,
 });
 if (platform.migrations.length) console.log(`applied migrations: ${platform.migrations.join(", ")}`);
+if (platform.initialMembers !== "disabled") console.log(`initial owner/admin setup: ${platform.initialMembers}`);
 
 platform.start().catch((e) => { console.error("could not start background work:", e); process.exit(1); });
 // Listen before the first housekeeping run: a base backup waits for the database to archive its WAL, and with the archive in the

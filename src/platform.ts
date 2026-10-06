@@ -22,6 +22,7 @@ import { PgLimits } from "./limits.js";
 import { PitrService, type PitrOptions } from "./pitr.js";
 import { smsFrom, type SmsSender, type TwilioConfig } from "./sms.js";
 import { migrate } from "./migrate.js";
+import { initializeMembers, type InitialMembers } from "./initial-members.js";
 import { PipelineService, type PipelineOptions } from "./pipelines.js";
 import { planOf } from "./plans.js";
 import { Directory, PoolManager } from "./pools.js";
@@ -36,6 +37,8 @@ export type PlatformConfig = {
   pgAdminUrl: string;
   masterKey: string;
   bootstrapToken: string;
+  /** Optional, one-time owner/admin accounts for an empty installation. */
+  initialMembers?: InitialMembers;
   storageDir: string;
   /** "postgres" keeps object bytes (and backups) in the control database instead of storageDir: no shared filesystem, no S3 account. Ignored when s3 is set. */
   storageBackend?: "disk" | "postgres";
@@ -95,6 +98,13 @@ export async function createPlatform(cfg: PlatformConfig) {
   const migrations = await migrate(pool);
   const vault = new Vault(cfg.masterKey);
   const control = new ControlPlane(pool, cfg.pgAdminUrl, vault);
+  let initialMembers;
+  try {
+    initialMembers = await initializeMembers(pool, cfg.initialMembers);
+  } catch (err) {
+    await pool.end();
+    throw err;
+  }
   const dir = new Directory(control);
   const pm = new PoolManager(dir, cfg.pgAdminUrl, { maxPools: 100, perPool: 5, queryTimeoutMs: cfg.queryTimeoutMs });
 
@@ -196,6 +206,7 @@ export async function createPlatform(cfg: PlatformConfig) {
   }
 
   return {
+    initialMembers,
     cfg, pool, control, pm, dir, storage, usage, functions, realtime, backups, pitr, mover, coordinator, limits, admin, ai, pipelines, extensions, auth, gateway, api, migrations, housekeep,
 
     /**
