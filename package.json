@@ -8,6 +8,7 @@
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
     "setup:users": "node scripts/setup-initial-users.mjs",
+    "create-org": "node scripts/create-org.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test src/*.test.ts",
     "e2e": "node --import tsx --test --test-timeout=300000 e2e/*.e2e.ts"
