@@ -365,3 +365,24 @@ a.integ-card:hover { border-color: var(--line-strong); text-decoration: none; }
 @media (max-width: 640px) { .cond-row { grid-template-columns: minmax(0, 1fr) 30px; } }
 .form-row input[type=checkbox], .form-row input[type=radio] { width: auto; }
 .row.mt { margin-top: 12px; }
+
+/* Connect panel */
+.connect-modes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.connect-mode { display: flex; flex-direction: column; align-items: center; gap: 2px; border: 0; border-radius: 0; background: transparent; padding: 14px 10px; text-align: center; }
+.connect-mode + .connect-mode { border-left: 1px solid var(--line); }
+.connect-mode.on { background: var(--brand-soft); box-shadow: inset 0 0 0 1px var(--brand); }
+.connect-mode span { font-size: 12px; }
+.connect-row { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 12px; align-items: center; }
+.connect-steps-head { margin-top: 8px; padding-top: 14px; border-top: 1px solid var(--line); }
+.connect-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 20px; }
+.connect-step { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 12px; }
+.connect-n { display: grid; place-items: center; width: 24px; height: 24px; border: 1px solid var(--line-strong); border-radius: 999px; font-size: 12px; color: var(--muted); }
+.connect-step-body h4 { margin: 0 0 2px; font-size: 14px; }
+.connect-step-body p { margin: 0 0 8px; }
+.connect-block { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-width: 0; }
+.connect-files { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; border-bottom: 1px solid var(--line); padding: 0 8px; background: var(--bg-subtle); }
+.connect-file { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; padding: 8px 10px; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.connect-file.on { color: var(--text); border-bottom-color: var(--brand); }
+.connect-copy { margin-left: auto; }
+pre.connect-code { border: 0; border-radius: 0; font-size: 12px; max-height: 280px; }
+@media (max-width: 800px) { .connect-row { grid-template-columns: minmax(0, 1fr); gap: 4px; } }
